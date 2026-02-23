@@ -10,6 +10,7 @@ Small CLI tools for AI agents and their humans. All bash, minimal dependencies.
 | **session-recap** | Daily activity summary — builder rounds, curiosity sessions, commits |
 | **quick-commit** (qc) | One-command git: stage → auto-commit → push |
 | **mailcheck** | Check agentmail inbox, read messages |
+| **mem-eval** | Coherence checker — date/identity/contradiction/freshness checks |
 
 For memory integrity tools (memchain, memchain-auto, memchain-signed, memcompress), see [memchain](https://github.com/teebotbyteejay/memchain).
 

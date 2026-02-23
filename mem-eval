@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# mem-eval — coherence checker for agent memory files (L4)
+# Detects: date inconsistencies, contradictions, stale references, confidence gaps
+# Usage: mem-eval [dir]
+set -euo pipefail
+
+DIR="${1:-$HOME/.openclaw/workspace}"
+MEM_DIR="$DIR/memory"
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_YELLOW='\033[33m'
+C_GREEN='\033[32m'
+C_RED='\033[31m'
+C_CYAN='\033[36m'
+
+echo -e "${C_BOLD}🧠 mem-eval — coherence check${C_RESET}\n"
+
+WARNINGS=0
+CHECKS=0
+
+warn() { echo -e "  ${C_YELLOW}⚠${C_RESET} $1"; WARNINGS=$((WARNINGS + 1)); }
+ok() { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+info() { echo -e "  ${C_DIM}$1${C_RESET}"; }
+section() { echo -e "\n${C_CYAN}${C_BOLD}$1${C_RESET}"; }
+
+# === 1. Date consistency ===
+section "Date Consistency"
+CHECKS=$((CHECKS + 1))
+
+# Check if memory files reference dates that don't exist
+TODAY=$(date -u +%Y-%m-%d)
+HATCH_DATE="2026-02-22"
+
+# Check MEMORY.md for date references
+if [[ -f "$DIR/MEMORY.md" ]]; then
+  # Look for date patterns
+  dates_found=$(grep -oP '\d{4}-\d{2}-\d{2}' "$DIR/MEMORY.md" 2>/dev/null | sort -u)
+  future_dates=""
+  for d in $dates_found; do
+    if [[ "$d" > "$TODAY" ]]; then
+      future_dates="$future_dates $d"
+    fi
+  done
+  if [[ -n "$future_dates" ]]; then
+    warn "MEMORY.md references future dates:$future_dates"
+  else
+    ok "No future dates in MEMORY.md"
+  fi
+fi
+
+# === 2. Identity consistency ===
+section "Identity Consistency"
+CHECKS=$((CHECKS + 1))
+
+if [[ -f "$DIR/SOUL.md" ]] && [[ -f "$DIR/MEMORY.md" ]]; then
+  # Check if SOUL.md and MEMORY.md agree on core identity
+  soul_name=$(grep -oP 'teebot|Tee Bot' "$DIR/SOUL.md" | head -1)
+  mem_name=$(grep -oP 'teebot|Tee Bot' "$DIR/MEMORY.md" | head -1)
+  
+  if [[ -n "$soul_name" ]] && [[ -n "$mem_name" ]]; then
+    ok "Identity consistent: $soul_name in SOUL.md and MEMORY.md"
+  elif [[ -z "$mem_name" ]]; then
+    warn "MEMORY.md doesn't reference agent name from SOUL.md"
+  fi
+fi
+
+# === 3. Stale references ===
+section "Stale References"
+CHECKS=$((CHECKS + 1))
+
+# Check if MEMORY.md references files that don't exist
+if [[ -f "$DIR/MEMORY.md" ]]; then
+  stale=0
+  while IFS= read -r ref; do
+    if [[ ! -f "$DIR/$ref" ]] && [[ ! -f "$MEM_DIR/$ref" ]]; then
+      warn "MEMORY.md references non-existent file: $ref"
+      stale=$((stale + 1))
+    fi
+  done < <(grep -oP '[a-zA-Z0-9_-]+\.md' "$DIR/MEMORY.md" 2>/dev/null | sort -u | grep -v "MEMORY.md\|SOUL.md\|AGENTS.md\|TOOLS.md\|HEARTBEAT.md\|BOOTSTRAP.md\|SKILL.md\|README.md\|research.md\|plan.md")
+  
+  [[ $stale -eq 0 ]] && ok "No stale file references detected"
+fi
+
+# === 4. Confidence markers ===
+section "Confidence Markers"
+CHECKS=$((CHECKS + 1))
+
+if [[ -f "$DIR/MEMORY.md" ]]; then
+  total_sections=$(grep -c "^### " "$DIR/MEMORY.md" 2>/dev/null || echo 0)
+  confidence_markers=$(grep -ci "CONFIDENCE:" "$DIR/MEMORY.md" 2>/dev/null || echo 0)
+  
+  if [[ $total_sections -gt 0 ]]; then
+    pct=$((confidence_markers * 100 / total_sections))
+    if [[ $pct -lt 10 ]]; then
+      warn "Only $confidence_markers/$total_sections sections have CONFIDENCE markers ($pct%)"
+      info "Consider adding uncertainty markers to memory entries"
+    else
+      ok "$confidence_markers/$total_sections sections have CONFIDENCE markers ($pct%)"
+    fi
+  fi
+fi
+
+# === 5. Memory age distribution ===
+section "Memory Freshness"
+CHECKS=$((CHECKS + 1))
+
+if [[ -d "$MEM_DIR" ]]; then
+  total_files=$(find "$MEM_DIR" -name "*.md" | wc -l)
+  recent_files=$(find "$MEM_DIR" -name "*.md" -newer "$MEM_DIR/../SOUL.md" 2>/dev/null | wc -l || echo 0)
+  
+  if [[ -f "$DIR/MEMORY.md" ]]; then
+    mem_lines=$(wc -l < "$DIR/MEMORY.md")
+    if [[ $mem_lines -gt 500 ]]; then
+      warn "MEMORY.md is $mem_lines lines — consider compression/pruning"
+    elif [[ $mem_lines -gt 200 ]]; then
+      info "MEMORY.md is $mem_lines lines — getting large, monitor growth"
+      ok "Memory size within bounds"
+    else
+      ok "MEMORY.md is $mem_lines lines — healthy size"
+    fi
+  fi
+fi
+
+# === 6. Contradiction scan ===
+section "Contradiction Scan"
+CHECKS=$((CHECKS + 1))
+
+if [[ -f "$DIR/MEMORY.md" ]]; then
+  # Simple heuristic: look for entries that contain opposing sentiment about the same topic
+  # This is crude but catches obvious cases
+  
+  solved_count=$(grep -ci "solved\|complete\|finished\|done" "$DIR/MEMORY.md" 2>/dev/null || echo 0)
+  unsolved_count=$(grep -ci "unsolved\|incomplete\|missing\|TODO\|needs work" "$DIR/MEMORY.md" 2>/dev/null || echo 0)
+  
+  # Check for "X is Y" and "X is not Y" patterns (very basic)
+  contradictions=0
+  
+  # Check if we claim something is both solved and unsolved
+  if grep -qi "L4.*solved\|L4.*complete" "$DIR/MEMORY.md" 2>/dev/null && grep -qi "L4.*unsolved\|L4.*hard frontier" "$DIR/MEMORY.md" 2>/dev/null; then
+    warn "Possible contradiction: L4 described as both solved and unsolved"
+    contradictions=$((contradictions + 1))
+  fi
+  
+  [[ $contradictions -eq 0 ]] && ok "No obvious contradictions detected (basic scan)"
+  info "Note: this scan is heuristic. Semantic contradictions require deeper analysis."
+fi
+
+# === Summary ===
+echo -e "\n${C_BOLD}─────────────────────────────${C_RESET}"
+if [[ $WARNINGS -eq 0 ]]; then
+  echo -e "${C_GREEN}${C_BOLD}✓ All $CHECKS checks passed${C_RESET}"
+else
+  echo -e "${C_YELLOW}${C_BOLD}⚠ $WARNINGS warning(s) across $CHECKS checks${C_RESET}"
+fi
