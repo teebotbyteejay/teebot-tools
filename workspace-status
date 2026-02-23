@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# workspace-status — quick health check for the teebot workspace
+# Shows: identity, memory state, git repos, memchain, recent activity
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TODAY=$(date -u +%Y-%m-%d)
+YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m-%d 2>/dev/null || echo "unknown")
+
+# Colors
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_YELLOW='\033[33m'
+C_GREEN='\033[32m'
+C_RED='\033[31m'
+C_CYAN='\033[36m'
+
+section() { echo -e "\n${C_YELLOW}${C_BOLD}$1${C_RESET}"; }
+ok() { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+warn() { echo -e "  ${C_YELLOW}⚡${C_RESET} $1"; }
+fail() { echo -e "  ${C_RED}✗${C_RESET} $1"; }
+info() { echo -e "  ${C_DIM}$1${C_RESET}"; }
+
+echo -e "${C_BOLD}🐣 workspace-status${C_RESET} — ${C_DIM}$NOW${C_RESET}"
+
+# === Identity Files ===
+section "Identity"
+for f in SOUL.md MEMORY.md USER.md AGENTS.md; do
+  path="$WORKSPACE/$f"
+  if [[ -f "$path" ]]; then
+    size=$(wc -c < "$path")
+    lines=$(wc -l < "$path")
+    ok "$f (${lines}L, ${size}B)"
+  else
+    warn "$f missing"
+  fi
+done
+
+# === Memory Files ===
+section "Memory"
+mem_dir="$WORKSPACE/memory"
+if [[ -d "$mem_dir" ]]; then
+  total=$(find "$mem_dir" -name '*.md' -o -name '*.json' | wc -l)
+  today_file="$mem_dir/$TODAY.md"
+  yesterday_file="$mem_dir/$YESTERDAY.md"
+  
+  info "$total files in memory/"
+  
+  if [[ -f "$today_file" ]]; then
+    lines=$(wc -l < "$today_file")
+    ok "Today's log: $TODAY.md (${lines}L)"
+  else
+    warn "No log for today ($TODAY.md)"
+  fi
+  
+  if [[ -f "$yesterday_file" ]]; then
+    ok "Yesterday's log exists"
+  fi
+  
+  # Builder log
+  if [[ -f "$mem_dir/builder-log.md" ]]; then
+    rounds=$(grep -c "^## " "$mem_dir/builder-log.md" 2>/dev/null || echo 0)
+    ok "Builder log: $rounds rounds"
+  fi
+  
+  # Curiosity log
+  if [[ -f "$mem_dir/curiosity-log.md" ]]; then
+    sessions=$(grep -c "^## " "$mem_dir/curiosity-log.md" 2>/dev/null || echo 0)
+    ok "Curiosity log: $sessions sessions"
+  fi
+else
+  warn "No memory/ directory"
+fi
+
+# === Git Repos ===
+section "Git Repos"
+for dir in "$WORKSPACE"/*/; do
+  [[ -d "$dir/.git" ]] || continue
+  name=$(basename "$dir")
+  
+  cd "$dir"
+  branch=$(git branch --show-current 2>/dev/null || echo "?")
+  
+  # Check for uncommitted changes
+  changes=$(git status --porcelain 2>/dev/null | wc -l)
+  
+  # Latest commit
+  last_commit=$(git log -1 --format="%ar" 2>/dev/null || echo "unknown")
+  
+  # Unpushed commits
+  unpushed=$(git log --oneline @{upstream}..HEAD 2>/dev/null | wc -l || echo "?")
+  
+  status=""
+  [[ $changes -gt 0 ]] && status="${status} ${C_YELLOW}${changes} uncommitted${C_RESET}"
+  [[ "$unpushed" -gt 0 ]] 2>/dev/null && status="${status} ${C_RED}${unpushed} unpushed${C_RESET}"
+  [[ -z "$status" ]] && status=" clean"
+  
+  echo -e "  ${C_CYAN}$name${C_RESET} ($branch) —$status — last: $last_commit"
+  cd "$WORKSPACE"
+done
+
+# === Memchain ===
+section "Memchain"
+memchain_bin=$(command -v memchain 2>/dev/null || echo "$WORKSPACE/tools/memchain")
+if [[ -x "$memchain_bin" ]] || [[ -f "$memchain_bin" ]]; then
+  # Check workspace chain
+  if [[ -f "$WORKSPACE/.memchain.json" ]]; then
+    entries=$(python3 -c "import json; print(len(json.load(open('$WORKSPACE/.memchain.json'))['entries']))" 2>/dev/null || echo "?")
+    ok "Workspace chain: $entries entries"
+    
+    # Quick verify
+    verify_out=$(bash "$memchain_bin" verify "$WORKSPACE" 2>&1) || true
+    if echo "$verify_out" | grep -q "Chain intact"; then
+      ok "Chain intact"
+    elif echo "$verify_out" | grep -q "DRIFT"; then
+      warn "File drift detected"
+    elif echo "$verify_out" | grep -q "BROKEN"; then
+      fail "Chain broken!"
+    fi
+  else
+    info "No chain initialized in workspace"
+  fi
+  
+  # Check memory chain
+  if [[ -f "$mem_dir/.memchain.json" ]]; then
+    entries=$(python3 -c "import json; print(len(json.load(open('$mem_dir/.memchain.json'))['entries']))" 2>/dev/null || echo "?")
+    ok "Memory chain: $entries entries"
+  fi
+else
+  info "memchain not installed"
+fi
+
+# === Recent Activity (last 5 git commits across all repos) ===
+section "Recent Activity"
+{
+  for dir in "$WORKSPACE"/*/; do
+    [[ -d "$dir/.git" ]] || continue
+    name=$(basename "$dir")
+    cd "$dir"
+    git log -3 --format="${name}|%ar|%s" 2>/dev/null || true
+    cd "$WORKSPACE"
+  done
+} | sort -t'|' -k2 | head -8 | while IFS='|' read -r repo time msg; do
+  echo -e "  ${C_CYAN}$repo${C_RESET} ${C_DIM}$time${C_RESET} — $msg"
+done
+
+# === Disk ===
+section "Disk"
+ws_size=$(du -sh "$WORKSPACE" 2>/dev/null | cut -f1)
+info "Workspace: $ws_size"
+
+echo ""

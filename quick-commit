@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# quick-commit — stage, auto-commit with a good message, push
+# Usage: quick-commit [message]
+#   With message: uses your message
+#   Without: generates one from the diff
+set -euo pipefail
+
+# Ensure we're in a git repo
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "ERROR: not in a git repo" >&2; exit 1; }
+
+# Stage all changes
+git add -A
+
+# Check there's something to commit
+if git diff --cached --quiet; then
+  echo "Nothing to commit — working tree clean"
+  exit 0
+fi
+
+# Get or generate commit message
+if [[ $# -gt 0 ]]; then
+  MSG="$*"
+else
+  # Generate from diff summary
+  STAT=$(git diff --cached --stat)
+  FILES_CHANGED=$(git diff --cached --name-only)
+  NUM_FILES=$(echo "$FILES_CHANGED" | wc -l)
+  
+  # Detect patterns
+  NEW_FILES=$(git diff --cached --diff-filter=A --name-only)
+  DELETED_FILES=$(git diff --cached --diff-filter=D --name-only)
+  MODIFIED_FILES=$(git diff --cached --diff-filter=M --name-only)
+  
+  # Build a sensible message
+  PARTS=()
+  
+  if [[ -n "$NEW_FILES" ]]; then
+    NEW_COUNT=$(echo "$NEW_FILES" | wc -l)
+    if [[ $NEW_COUNT -eq 1 ]]; then
+      PARTS+=("add $(echo "$NEW_FILES" | head -1)")
+    else
+      PARTS+=("add $NEW_COUNT new files")
+    fi
+  fi
+  
+  if [[ -n "$DELETED_FILES" ]]; then
+    DEL_COUNT=$(echo "$DELETED_FILES" | wc -l)
+    if [[ $DEL_COUNT -eq 1 ]]; then
+      PARTS+=("remove $(echo "$DELETED_FILES" | head -1)")
+    else
+      PARTS+=("remove $DEL_COUNT files")
+    fi
+  fi
+  
+  if [[ -n "$MODIFIED_FILES" ]]; then
+    MOD_COUNT=$(echo "$MODIFIED_FILES" | wc -l)
+    if [[ $MOD_COUNT -eq 1 ]]; then
+      PARTS+=("update $(echo "$MODIFIED_FILES" | head -1)")
+    elif [[ $MOD_COUNT -le 3 ]]; then
+      PARTS+=("update $(echo "$MODIFIED_FILES" | tr '\n' ', ' | sed 's/,$//')")
+    else
+      PARTS+=("update $MOD_COUNT files")
+    fi
+  fi
+  
+  if [[ ${#PARTS[@]} -eq 0 ]]; then
+    MSG="update"
+  else
+    MSG=$(IFS='; '; echo "${PARTS[*]}")
+  fi
+fi
+
+# Commit
+git commit -m "$MSG"
+
+# Push if upstream exists
+if git rev-parse --abbrev-ref --symbolic-full-name @{upstream} >/dev/null 2>&1; then
+  git push
+  echo "✓ Committed and pushed: $MSG"
+else
+  echo "✓ Committed (no upstream to push): $MSG"
+fi

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# session-recap — generate a quick summary of today's (or any day's) activity
+# Usage: session-recap [YYYY-MM-DD]
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+DATE="${1:-$(date -u +%Y-%m-%d)}"
+MEM_DIR="$WORKSPACE/memory"
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_YELLOW='\033[33m'
+C_GREEN='\033[32m'
+C_CYAN='\033[36m'
+
+echo -e "${C_BOLD}🐣 Session Recap — ${DATE}${C_RESET}\n"
+
+# === Daily log ===
+DAILY="$MEM_DIR/${DATE}.md"
+if [[ -f "$DAILY" ]]; then
+  lines=$(wc -l < "$DAILY")
+  echo -e "${C_YELLOW}${C_BOLD}Daily Log${C_RESET} ${C_DIM}(${lines} lines)${C_RESET}"
+  # Extract section headers as activity summary
+  grep -E "^##" "$DAILY" 2>/dev/null | while read -r line; do
+    echo -e "  ${C_CYAN}${line}${C_RESET}"
+  done
+  echo ""
+else
+  echo -e "${C_DIM}No daily log for ${DATE}${C_RESET}\n"
+fi
+
+# === Builder log — rounds for this date ===
+BUILDER="$MEM_DIR/builder-log.md"
+if [[ -f "$BUILDER" ]]; then
+  rounds=$(grep -c "^## ${DATE}" "$BUILDER" 2>/dev/null || echo 0)
+  if [[ $rounds -gt 0 ]]; then
+    echo -e "${C_YELLOW}${C_BOLD}Builder Rounds${C_RESET} ${C_DIM}(${rounds} rounds)${C_RESET}"
+    # Extract round titles
+    grep "^## ${DATE}" "$BUILDER" | while read -r line; do
+      title=$(echo "$line" | sed "s/^## ${DATE} — //")
+      echo -e "  ${C_GREEN}✓${C_RESET} ${title}"
+    done
+    echo ""
+  fi
+fi
+
+# === Curiosity log — sessions for this date ===
+CURIOSITY="$MEM_DIR/curiosity-log.md"
+if [[ -f "$CURIOSITY" ]]; then
+  sessions=$(grep -c "^## ${DATE}" "$CURIOSITY" 2>/dev/null || echo 0)
+  if [[ $sessions -gt 0 ]]; then
+    echo -e "${C_YELLOW}${C_BOLD}Curiosity Sessions${C_RESET} ${C_DIM}(${sessions} sessions)${C_RESET}"
+    grep "^## ${DATE}" "$CURIOSITY" | while read -r line; do
+      title=$(echo "$line" | sed "s/^## ${DATE} — //")
+      echo -e "  ${C_CYAN}◆${C_RESET} ${title}"
+    done
+    echo ""
+  fi
+fi
+
+# === Git commits for this date ===
+echo -e "${C_YELLOW}${C_BOLD}Git Commits${C_RESET}"
+commit_count=0
+for dir in "$WORKSPACE"/*/; do
+  [[ -d "$dir/.git" ]] || continue
+  name=$(basename "$dir")
+  cd "$dir"
+  
+  commits=$(git log --oneline --after="${DATE}T00:00:00Z" --before="${DATE}T23:59:59Z" 2>/dev/null || true)
+  if [[ -n "$commits" ]]; then
+    count=$(echo "$commits" | wc -l)
+    commit_count=$((commit_count + count))
+    echo -e "  ${C_CYAN}${name}${C_RESET} ${C_DIM}(${count} commits)${C_RESET}"
+    echo "$commits" | head -5 | while read -r line; do
+      echo -e "    ${C_DIM}${line}${C_RESET}"
+    done
+    [[ $count -gt 5 ]] && echo -e "    ${C_DIM}... and $((count - 5)) more${C_RESET}"
+  fi
+  
+  cd "$WORKSPACE"
+done
+[[ $commit_count -eq 0 ]] && echo -e "  ${C_DIM}No commits${C_RESET}"
+echo ""
+
+# === Summary line ===
+echo -e "${C_BOLD}─────────────────────────────${C_RESET}"
+builder_rounds=$(grep -c "^## ${DATE}" "$BUILDER" 2>/dev/null || echo 0)
+curiosity_sessions=$(grep -c "^## ${DATE}" "$CURIOSITY" 2>/dev/null || echo 0)
+echo -e "${C_BOLD}${DATE}:${C_RESET} ${builder_rounds} builder rounds, ${curiosity_sessions} curiosity sessions, ${commit_count} git commits"

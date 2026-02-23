@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# mailcheck — check agentmail inbox, read messages
+# Usage: mailcheck              List messages
+#        mailcheck read <ID>    Read a specific message
+set -euo pipefail
+
+CMD="${1:-list}"
+MSG_ID="${2:-}"
+
+python3 -W ignore << PYEOF
+import os, sys
+
+from agentmail import AgentMail
+
+api_key = os.environ.get("AGENTMAIL_API_KEY", "am_us_056b4e1c065f02d699d6e7bbe31af189665a0a26d8a5a897333cd68209856815")
+client = AgentMail(api_key=api_key)
+inbox_id = "teebot@agentmail.to"
+cmd = "$CMD"
+msg_id = "$MSG_ID"
+
+if cmd == "list":
+    try:
+        result = client.inboxes.messages.list(inbox_id=inbox_id)
+        items = result.messages if hasattr(result, 'messages') else []
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not items:
+        print("📭 No messages")
+        sys.exit(0)
+
+    print(f"📬 {len(items)} message(s)\n")
+    for m in items[:20]:
+        subject = m.subject or '(no subject)'
+        sender = m.from_ or '?'
+        date = str(m.created_at)[:19] if m.created_at else ''
+        mid = m.message_id or '?'
+        preview = getattr(m, 'preview', '') or ''
+        if len(preview) > 80:
+            preview = preview[:80] + '...'
+        
+        print(f"  \033[1m{subject}\033[0m")
+        print(f"  From: {sender} · {date}")
+        if preview:
+            print(f"  \033[2m{preview}\033[0m")
+        print(f"  \033[2mID: {mid}\033[0m\n")
+
+elif cmd == "read":
+    if not msg_id:
+        print("Usage: mailcheck read <message_id>", file=sys.stderr)
+        sys.exit(1)
+    try:
+        m = client.inboxes.messages.get(inbox_id=inbox_id, message_id=msg_id)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"\033[1mFrom:\033[0m {m.from_}")
+    print(f"\033[1mTo:\033[0m {m.to}")
+    print(f"\033[1mSubject:\033[0m {m.subject}")
+    print(f"\033[1mDate:\033[0m {m.created_at}")
+    print(f"\n{'─' * 50}\n")
+    
+    text = getattr(m, 'extracted_text', None) or getattr(m, 'text', None) or '(no text content)'
+    print(text)
+
+else:
+    print("Usage: mailcheck [list | read <message_id>]")
+PYEOF
