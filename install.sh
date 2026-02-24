@@ -4,7 +4,7 @@ set -euo pipefail
 
 REPO="https://raw.githubusercontent.com/teebotbyteejay/teebot-tools/main"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-TOOLS="workspace-status session-recap quick-commit mailcheck mem-eval"
+TOOLS="workspace-status session-recap quick-commit mailcheck mem-eval daily-briefing tz"
 
 mkdir -p "$INSTALL_DIR"
 
