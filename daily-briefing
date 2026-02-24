@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# daily-briefing — generate a morning briefing for Teejay
+# Combines: session recap, email, moltbook, workspace health
+# Usage: daily-briefing [YYYY-MM-DD]
+set -euo pipefail
+
+DATE="${1:-$(date -u +%Y-%m-%d)}"
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_YELLOW='\033[33m'
+C_GREEN='\033[32m'
+C_CYAN='\033[36m'
+
+echo -e "${C_BOLD}☀️  Daily Briefing — ${DATE}${C_RESET}"
+echo -e "${C_DIM}Generated $(date -u +%H:%M) UTC${C_RESET}\n"
+
+# === Builder Activity ===
+BUILDER="$WORKSPACE/memory/builder-log.md"
+if [[ -f "$BUILDER" ]]; then
+  rounds=$(grep -c "^## ${DATE}" "$BUILDER" 2>/dev/null || echo 0)
+  if [[ $rounds -gt 0 ]]; then
+    echo -e "${C_YELLOW}${C_BOLD}🔨 Builder${C_RESET} — ${rounds} rounds"
+    grep "^## ${DATE}" "$BUILDER" | head -5 | while read -r line; do
+      title=$(echo "$line" | sed "s/^## ${DATE} — //")
+      echo -e "  ${C_GREEN}✓${C_RESET} ${title}"
+    done
+    [[ $rounds -gt 5 ]] && echo -e "  ${C_DIM}... and $((rounds - 5)) more${C_RESET}"
+    echo ""
+  fi
+fi
+
+# === Git Activity ===
+echo -e "${C_YELLOW}${C_BOLD}📦 Git${C_RESET}"
+total_commits=0
+for dir in "$WORKSPACE"/*/; do
+  [[ -d "$dir/.git" ]] || continue
+  name=$(basename "$dir")
+  cd "$dir"
+  count=$(git log --oneline --after="${DATE}T00:00:00Z" --before="${DATE}T23:59:59Z" 2>/dev/null | wc -l || echo 0)
+  if [[ $count -gt 0 ]]; then
+    total_commits=$((total_commits + count))
+    latest=$(git log -1 --format="%s" --after="${DATE}T00:00:00Z" --before="${DATE}T23:59:59Z" 2>/dev/null || echo "")
+    echo -e "  ${C_CYAN}${name}${C_RESET}: ${count} commits (latest: ${latest})"
+  fi
+  cd "$WORKSPACE"
+done
+[[ $total_commits -eq 0 ]] && echo -e "  ${C_DIM}No commits${C_RESET}"
+echo ""
+
+# === Email ===
+echo -e "${C_YELLOW}${C_BOLD}📬 Email${C_RESET}"
+python3 -W ignore -c "
+import os
+try:
+    from agentmail import AgentMail
+    c = AgentMail(api_key='am_us_056b4e1c065f02d699d6e7bbe31af189665a0a26d8a5a897333cd68209856815')
+    msgs = c.inboxes.messages.list(inbox_id='teebot@agentmail.to')
+    inbound = [m for m in msgs.messages if 'teebot@agentmail.to' not in str(m.from_)]
+    outbound = [m for m in msgs.messages if 'teebot@agentmail.to' in str(m.from_)]
+    if inbound:
+        for m in inbound[:5]:
+            subj = m.subject or '(no subject)'
+            sender = m.from_ or '?'
+            print(f'  📩 {subj} — from {sender}')
+    else:
+        print('  No inbound mail')
+    print(f'  📤 {len(outbound)} sent messages')
+except Exception as e:
+    print(f'  (email check failed: {e})')
+" 2>&1
+echo ""
+
+# === Moltbook ===
+echo -e "${C_YELLOW}${C_BOLD}🦞 Moltbook${C_RESET}"
+if command -v moltbook-cli >/dev/null 2>&1; then
+  profile=$(timeout 10 moltbook-cli profile 2>&1 || echo "timeout")
+  if echo "$profile" | grep -q "timeout"; then
+    echo -e "  ${C_DIM}(profile check timed out)${C_RESET}"
+  else
+    karma=$(echo "$profile" | grep -oP 'Karma:\s+\K\d+' || echo "?")
+    followers=$(echo "$profile" | grep -oP 'Followers:\s+\K\d+' || echo "?")
+    echo -e "  Karma: ${C_BOLD}${karma}${C_RESET} | Followers: ${C_BOLD}${followers}${C_RESET}"
+  fi
+  
+  dm=$(timeout 10 moltbook-cli dm-check 2>&1 || echo "timeout")
+  if echo "$dm" | grep -q "No new"; then
+    echo -e "  ${C_DIM}No new DMs${C_RESET}"
+  elif echo "$dm" | grep -q "timeout"; then
+    echo -e "  ${C_DIM}(DM check timed out)${C_RESET}"
+  else
+    echo -e "  ${C_YELLOW}New DM activity!${C_RESET}"
+  fi
+else
+  echo -e "  ${C_DIM}moltbook-cli not available${C_RESET}"
+fi
+echo ""
+
+# === Workspace Health ===
+echo -e "${C_YELLOW}${C_BOLD}🏥 Workspace${C_RESET}"
+if command -v memchain >/dev/null 2>&1 && [[ -f "$WORKSPACE/.memchain.json" ]]; then
+  entries=$(python3 -c "import json; print(len(json.load(open('$WORKSPACE/.memchain.json'))['entries']))" 2>/dev/null || echo "?")
+  verify=$(memchain verify "$WORKSPACE" 2>&1 | tail -1)
+  if echo "$verify" | grep -q "intact"; then
+    echo -e "  ${C_GREEN}✓${C_RESET} memchain: ${entries} entries, chain intact"
+  else
+    echo -e "  ${C_YELLOW}⚠${C_RESET} memchain: check needed"
+  fi
+fi
+
+ws_size=$(du -sh "$WORKSPACE" 2>/dev/null | cut -f1)
+echo -e "  Disk: ${ws_size}"
+echo ""
+
+# === Summary ===
+echo -e "${C_BOLD}─────────────────────────────${C_RESET}"
+builder_rounds=$(grep -c "^## ${DATE}" "$BUILDER" 2>/dev/null || echo 0)
+echo -e "${C_BOLD}${DATE}:${C_RESET} ${builder_rounds} builder rounds, ${total_commits} git commits"
