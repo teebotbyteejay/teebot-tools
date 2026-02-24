@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# safe-prepend — prepend text to a file with backup
+# Usage: safe-prepend <file> <text>
+# Creates a .bak before modifying. Safer than edit for append/prepend operations.
+set -euo pipefail
+
+FILE="${1:?Usage: safe-prepend <file> <text>}"
+TEXT="${2:?Usage: safe-prepend <file> <text>}"
+
+[[ -f "$FILE" ]] || { echo "ERROR: $FILE not found" >&2; exit 1; }
+
+# Backup
+cp "$FILE" "${FILE}.bak"
+
+# Get header (first line if it starts with #)
+HEADER=""
+BODY=""
+if head -1 "$FILE" | grep -q "^#"; then
+  HEADER=$(head -1 "$FILE")
+  BODY=$(tail -n +2 "$FILE")
+else
+  BODY=$(cat "$FILE")
+fi
+
+# Write: header + new entry + body
+{
+  [[ -n "$HEADER" ]] && echo "$HEADER"
+  echo ""
+  echo "$TEXT"
+  echo ""
+  echo "---"
+  echo "$BODY"
+} > "$FILE"
+
+# Verify file isn't smaller than backup (corruption check)
+NEW_SIZE=$(wc -c < "$FILE")
+OLD_SIZE=$(wc -c < "${FILE}.bak")
+
+if [[ $NEW_SIZE -lt $OLD_SIZE ]]; then
+  echo "ERROR: New file is smaller than original! Restoring backup." >&2
+  cp "${FILE}.bak" "$FILE"
+  exit 1
+fi
+
+# Clean backup
+rm "${FILE}.bak"
+echo "✓ Prepended to $FILE ($NEW_SIZE bytes, was $OLD_SIZE)"
