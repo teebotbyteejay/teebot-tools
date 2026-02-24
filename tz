@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# tz — quick timezone display and converter
+# Usage: tz              Show current time in common zones
+#        tz <HH:MM> <FROM> <TO>  Convert time between zones
+# Zones: utc, est, pst, cet, ist, jst, gmt, ct (or full TZ names)
+set -euo pipefail
+
+# Zone aliases
+resolve_zone() {
+  case "${1,,}" in
+    utc|gmt)  echo "UTC" ;;
+    est|et)   echo "America/New_York" ;;
+    cst|ct)   echo "America/Chicago" ;;
+    mst|mt)   echo "America/Denver" ;;
+    pst|pt)   echo "America/Los_Angeles" ;;
+    cet)      echo "Europe/Berlin" ;;
+    gmt+0|uk) echo "Europe/London" ;;
+    ist)      echo "Asia/Kolkata" ;;
+    jst)      echo "Asia/Tokyo" ;;
+    kst)      echo "Asia/Seoul" ;;
+    cst-asia) echo "Asia/Shanghai" ;;
+    aest)     echo "Australia/Sydney" ;;
+    *)        echo "$1" ;;  # pass through full TZ names
+  esac
+}
+
+if [[ $# -eq 0 ]]; then
+  # Show current time in common zones
+  echo -e "\033[1m🕐 Current time\033[0m"
+  echo ""
+  for z in "UTC" "America/New_York:EST" "America/Chicago:CST" "America/Los_Angeles:PST" "Europe/London:GMT" "Europe/Berlin:CET" "Asia/Kolkata:IST" "Asia/Tokyo:JST"; do
+    tz_full="${z%%:*}"
+    label="${z##*:}"
+    time=$(TZ="$tz_full" date +"%H:%M %a %b %d")
+    printf "  \033[33m%-4s\033[0m %s\n" "$label" "$time"
+  done
+
+elif [[ $# -ge 3 ]]; then
+  # Convert: tz 14:30 est pst
+  TIME="$1"
+  FROM=$(resolve_zone "$2")
+  TO=$(resolve_zone "$3")
+  
+  # Parse time
+  HOUR="${TIME%%:*}"
+  MIN="${TIME##*:}"
+  
+  # Convert using date
+  RESULT=$(TZ="$TO" date -d "TZ=\"$FROM\" ${HOUR}:${MIN}" +"%H:%M %Z" 2>/dev/null) || {
+    # Fallback for systems without GNU date
+    echo "ERROR: conversion failed. Need GNU date." >&2
+    exit 1
+  }
+  
+  FROM_LABEL=$(TZ="$FROM" date +"%Z")
+  TO_LABEL=$(TZ="$TO" date +"%Z")
+  
+  echo -e "\033[33m${TIME}\033[0m ${FROM_LABEL} → \033[1m${RESULT}\033[0m"
+
+elif [[ $# -eq 1 ]]; then
+  # Show time in a specific zone
+  ZONE=$(resolve_zone "$1")
+  time=$(TZ="$ZONE" date +"%H:%M %Z %a %b %d")
+  echo -e "\033[33m${1}\033[0m → \033[1m${time}\033[0m"
+
+else
+  cat <<EOF
+tz — quick timezone display and converter
+
+Usage:
+  tz                    Show current time in common zones
+  tz <zone>             Show current time in a specific zone
+  tz <HH:MM> <from> <to>  Convert time between zones
+
+Zones: utc, est, cst, pst, cet, ist, jst, gmt, uk, kst, aest
+       (or full TZ names like America/New_York)
+
+Examples:
+  tz                    # show all zones
+  tz est                # show EST time
+  tz 14:30 utc est      # convert 14:30 UTC to EST
+  tz 9:00 pst jst       # convert 9:00 PST to JST
+EOF
+fi
