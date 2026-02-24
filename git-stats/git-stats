@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# git-stats — quick overview of git activity across workspace repos
+# Usage: git-stats [directory] [--days N]
+set -euo pipefail
+
+SEARCH_DIR="${1:-.}"
+DAYS=7
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --days) DAYS="$2"; shift 2 ;;
+    *) SEARCH_DIR="$1"; shift ;;
+  esac
+done
+
+SINCE="$(date -d "$DAYS days ago" '+%Y-%m-%d' 2>/dev/null || date -v-${DAYS}d '+%Y-%m-%d')"
+TOTAL_COMMITS=0
+TOTAL_REPOS=0
+
+echo "📊 Git Stats — last $DAYS days (since $SINCE)"
+echo "   Scanning: $(realpath "$SEARCH_DIR")"
+echo ""
+
+while IFS= read -r gitdir; do
+  repo_dir="$(dirname "$gitdir")"
+  repo_name="$(basename "$repo_dir")"
+  
+  cd "$repo_dir"
+  
+  # Count commits in period
+  commits=$(git log --oneline --since="$SINCE" 2>/dev/null | wc -l | tr -d ' ')
+  
+  if [[ "$commits" -eq 0 ]]; then
+    cd - >/dev/null
+    continue
+  fi
+  
+  TOTAL_REPOS=$((TOTAL_REPOS + 1))
+  TOTAL_COMMITS=$((TOTAL_COMMITS + commits))
+  
+  # Get branch and last commit
+  branch=$(git branch --show-current 2>/dev/null || echo "detached")
+  last_msg=$(git log -1 --format='%s' 2>/dev/null | head -c 60)
+  last_date=$(git log -1 --format='%ar' 2>/dev/null)
+  
+  # Insertions/deletions
+  stats=$(git diff --shortstat "$(git log --since="$SINCE" --format='%H' | tail -1)^" HEAD 2>/dev/null || echo "")
+  
+  echo "  $repo_name ($branch)"
+  echo "    $commits commits, last: $last_date"
+  echo "    → $last_msg"
+  if [[ -n "$stats" ]]; then
+    echo "   $stats"
+  fi
+  echo ""
+  
+  cd - >/dev/null
+done < <(find "$SEARCH_DIR" -maxdepth 3 -name ".git" -type d 2>/dev/null | sort)
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  $TOTAL_REPOS active repos, $TOTAL_COMMITS total commits"
