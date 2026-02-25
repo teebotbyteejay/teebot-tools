@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# todo — simple markdown-backed task tracker
+# Usage: todo [add|done|list|rm|clear] [args]
+
+set -uo pipefail
+
+TODO_FILE="${TODO_FILE:-$HOME/.openclaw/workspace/memory/todo.md}"
+
+_ensure_file() {
+  if [[ ! -f "$TODO_FILE" ]]; then
+    echo "# Todo" > "$TODO_FILE"
+    echo "" >> "$TODO_FILE"
+  fi
+}
+
+_list() {
+  _ensure_file
+  local open=0 done=0
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^-\ \[\ \] ]]; then ((open++))
+    elif [[ "$line" =~ ^-\ \[x\] ]]; then ((done++))
+    fi
+  done < "$TODO_FILE"
+
+  echo "📋 Todo ($open open, $done done)"
+  echo ""
+  
+  local i=1
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^-\ \[\ \] ]]; then
+      echo "  $i. ${line#- \[ \] }"
+      ((i++))
+    fi
+  done < "$TODO_FILE"
+  
+  if ((i == 1)); then
+    echo "  (nothing to do — nice!)"
+  fi
+
+  # Show done items if any
+  if ((done > 0)); then
+    echo ""
+    echo "  ✓ Done:"
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^-\ \[x\] ]]; then
+        echo "    ✓ ${line#- \[x\] }"
+      fi
+    done < "$TODO_FILE"
+  fi
+}
+
+_add() {
+  _ensure_file
+  local task="$*"
+  echo "- [ ] $task" >> "$TODO_FILE"
+  echo "✓ Added: $task"
+}
+
+_done() {
+  _ensure_file
+  local n="$1"
+  local i=1
+  local tmp=$(mktemp)
+  local matched=""
+  
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^-\ \[\ \] ]] && ((i == n)); then
+      matched="${line#- \[ \] }"
+      echo "- [x] $matched" >> "$tmp"
+      ((i++))
+    elif [[ "$line" =~ ^-\ \[\ \] ]]; then
+      echo "$line" >> "$tmp"
+      ((i++))
+    else
+      echo "$line" >> "$tmp"
+    fi
+  done < "$TODO_FILE"
+  
+  mv "$tmp" "$TODO_FILE"
+  if [[ -n "$matched" ]]; then
+    echo "✓ Done: $matched"
+  else
+    echo "❌ No open task #$n"
+  fi
+}
+
+_rm() {
+  _ensure_file
+  local n="$1"
+  local i=1
+  local tmp=$(mktemp)
+  local matched=""
+  
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^-\ \[\ \] ]] && ((i == n)); then
+      matched="${line#- \[ \] }"
+      ((i++))
+      # skip this line (don't write to tmp)
+    elif [[ "$line" =~ ^-\ \[\ \] ]]; then
+      echo "$line" >> "$tmp"
+      ((i++))
+    else
+      echo "$line" >> "$tmp"
+    fi
+  done < "$TODO_FILE"
+  
+  mv "$tmp" "$TODO_FILE"
+  if [[ -n "$matched" ]]; then
+    echo "✓ Removed: $matched"
+  else
+    echo "❌ No open task #$n"
+  fi
+}
+
+_clear() {
+  _ensure_file
+  local tmp=$(mktemp)
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^-\ \[x\] ]]; then
+      continue  # skip done items
+    fi
+    echo "$line" >> "$tmp"
+  done < "$TODO_FILE"
+  mv "$tmp" "$TODO_FILE"
+  echo "✓ Cleared completed tasks"
+}
+
+case "${1:-list}" in
+  add)    shift; _add "$@" ;;
+  done)   shift; _done "$1" ;;
+  rm)     shift; _rm "$1" ;;
+  clear)  _clear ;;
+  list|"") _list ;;
+  -h|--help)
+    echo "Usage: todo [command] [args]"
+    echo ""
+    echo "Commands:"
+    echo "  list          Show all tasks (default)"
+    echo "  add <task>    Add a new task"
+    echo "  done <N>      Mark task #N as done"
+    echo "  rm <N>        Remove task #N"
+    echo "  clear         Remove completed tasks"
+    echo ""
+    echo "File: \$TODO_FILE (default: memory/todo.md)"
+    ;;
+  *)
+    # Treat as implicit add
+    _add "$@"
+    ;;
+esac
