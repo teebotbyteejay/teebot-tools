@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# mem-density — information density report for markdown files
+# Shows section sizes, unique terms, link density, and staleness indicators
+# Inspired by jisei: compress toward meaning, not just smaller size
+
+set -uo pipefail
+
+FILE="${1:-$HOME/.openclaw/workspace/MEMORY.md}"
+
+if [[ ! -f "$FILE" ]]; then
+  echo "❌ File not found: $FILE"
+  exit 1
+fi
+
+BASENAME=$(basename "$FILE")
+TOTAL_LINES=$(wc -l < "$FILE")
+TOTAL_BYTES=$(wc -c < "$FILE")
+TOTAL_WORDS=$(wc -w < "$FILE")
+
+echo "📊 mem-density — $BASENAME"
+echo "   $TOTAL_LINES lines · $TOTAL_WORDS words · $TOTAL_BYTES bytes"
+echo ""
+
+# Count structural elements
+HEADERS=$(grep -c "^#" "$FILE" 2>/dev/null || echo 0)
+LINKS=$(grep -oP '\[.*?\]\(.*?\)' "$FILE" 2>/dev/null | wc -l)
+LINKS=${LINKS:-0}
+BULLETS=$(grep -c "^[[:space:]]*[-*]" "$FILE" 2>/dev/null || true)
+BULLETS=${BULLETS:-0}
+CODE_BLOCKS=$(grep -c '```' "$FILE" 2>/dev/null || true)
+CODE_BLOCKS=${CODE_BLOCKS:-0}
+DATES=$(grep -oP '\d{4}-\d{2}-\d{2}' "$FILE" 2>/dev/null | sort -u | wc -l)
+DATES=${DATES:-0}
+
+echo "📐 Structure"
+CB=$((CODE_BLOCKS / 2))
+echo "   Sections: $HEADERS · Bullets: $BULLETS · Links: $LINKS · Code blocks: $CB · Unique dates: $DATES"
+echo ""
+
+# Per-section breakdown
+echo "📋 Sections by size"
+current_section=""
+section_start=0
+section_lines=0
+declare -a sections
+declare -a section_sizes
+
+while IFS= read -r line; do
+  if [[ "$line" =~ ^##?[[:space:]] ]]; then
+    if [[ -n "$current_section" ]]; then
+      printf "   %-40s %3d lines\n" "$current_section" "$section_lines"
+    fi
+    current_section="${line#\#}"
+    current_section="${current_section#\#}"
+    current_section="${current_section# }"
+    current_section="${current_section:0:40}"
+    section_lines=0
+  fi
+  ((section_lines++))
+done < "$FILE"
+# Last section
+if [[ -n "$current_section" ]]; then
+  printf "   %-40s %3d lines\n" "$current_section" "$section_lines"
+fi
+
+echo ""
+
+# Density metrics
+if ((TOTAL_LINES > 0)); then
+  LINKS_PER_100=$((LINKS * 100 / TOTAL_LINES))
+  BULLETS_PER_100=$((BULLETS * 100 / TOTAL_LINES))
+  echo "📈 Density"
+  echo "   Words/line: $((TOTAL_WORDS / TOTAL_LINES)) · Links per 100 lines: $LINKS_PER_100 · Bullets per 100 lines: $BULLETS_PER_100"
+fi
+
+# Staleness check
+OLDEST_DATE=$(grep -oP '\d{4}-\d{2}-\d{2}' "$FILE" 2>/dev/null | sort | head -1)
+NEWEST_DATE=$(grep -oP '\d{4}-\d{2}-\d{2}' "$FILE" 2>/dev/null | sort | tail -1)
+if [[ -n "$OLDEST_DATE" && -n "$NEWEST_DATE" ]]; then
+  echo "   Date range: $OLDEST_DATE → $NEWEST_DATE"
+fi
+
+# Find potential cruft: lines with TODO, FIXME, ???, or very long lines
+TODOS=$(grep -ci "todo\|fixme\|???\|HACK\|BROKEN" "$FILE" 2>/dev/null || echo 0)
+LONG_LINES=$(awk 'length > 200' "$FILE" 2>/dev/null | wc -l || echo 0)
+
+echo ""
+echo "🔍 Compression candidates"
+echo "   TODO/FIXME/??? markers: $TODOS"
+echo "   Lines > 200 chars: $LONG_LINES"
+
+if ((TOTAL_WORDS > 0)); then
+  # Unique words ratio (vocabulary richness)
+  UNIQUE=$(tr ' ' '\n' < "$FILE" | sort -u | wc -l)
+  RATIO=$((UNIQUE * 100 / TOTAL_WORDS))
+  echo "   Vocabulary richness: ${RATIO}% unique words ($UNIQUE / $TOTAL_WORDS)"
+fi
+
+echo ""
+echo "💡 Jisei principle: compress toward meaning, not toward smaller."
