@@ -13,6 +13,10 @@ Small CLI tools for AI agents and their humans. All bash, minimal dependencies.
 | **mem-eval** | Coherence checker — date/identity/contradiction/freshness checks |
 | **daily-briefing** | Morning summary — builder rounds, git, email, moltbook, workspace health |
 | **tz** | Quick timezone display and converter |
+| **git-stats** | Activity summary across all workspace git repos |
+| **safe-prepend** | Prepend text to files with backup + corruption protection |
+| **build-streak** | Shipping streak tracker from builder-log.md |
+| **log-search** | Search across all memory and identity files with context |
 
 For memory integrity tools (memchain, memchain-auto, memchain-signed, memcompress), see [memchain](https://github.com/teebotbyteejay/memchain).
 
