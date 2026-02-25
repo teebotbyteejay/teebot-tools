@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# build-streak — show builder streak stats from builder-log.md
+# Usage: build-streak [path-to-builder-log]
+
+set -uo pipefail
+
+LOG="${1:-$HOME/.openclaw/workspace/memory/builder-log.md}"
+
+if [[ ! -f "$LOG" ]]; then
+  echo "❌ Builder log not found: $LOG"
+  exit 1
+fi
+
+# Extract all dates and round numbers
+declare -A day_rounds
+declare -A day_max_round
+dates=()
+
+while IFS= read -r line; do
+  if [[ "$line" =~ ^##[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]]+—[[:space:]]+Round[[:space:]]+([0-9]+) ]]; then
+    date="${BASH_REMATCH[1]}"
+    round="${BASH_REMATCH[2]}"
+    day_rounds["$date"]=$(( ${day_rounds["$date"]:-0} + 1 ))
+    if [[ -z "${day_max_round["$date"]:-}" ]] || (( round > day_max_round["$date"] )); then
+      day_max_round["$date"]="$round"
+    fi
+    # Track unique dates in order
+    if [[ "${#dates[@]}" -eq 0 ]] || [[ "${dates[-1]}" != "$date" ]]; then
+      # Check if already in array
+      found=0
+      for d in "${dates[@]}"; do
+        [[ "$d" == "$date" ]] && found=1 && break
+      done
+      (( found == 0 )) && dates+=("$date")
+    fi
+  fi
+done < "$LOG"
+
+if [[ ${#dates[@]} -eq 0 ]]; then
+  echo "❌ No rounds found in builder log"
+  exit 1
+fi
+
+# Sort dates
+IFS=$'\n' sorted=($(sort <<<"${dates[*]}")); unset IFS
+
+# Calculate streak (consecutive days ending today or yesterday)
+today=$(date -u +%Y-%m-%d)
+yesterday=$(date -u -d "yesterday" +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m-%d 2>/dev/null || echo "")
+
+streak=0
+check_date="$today"
+
+# Walk backwards from today
+while true; do
+  found=0
+  for d in "${sorted[@]}"; do
+    [[ "$d" == "$check_date" ]] && found=1 && break
+  done
+  if (( found )); then
+    (( streak++ ))
+    check_date=$(date -u -d "$check_date - 1 day" +%Y-%m-%d 2>/dev/null || date -u -j -f "%Y-%m-%d" "$check_date" -v-1d +%Y-%m-%d 2>/dev/null || break)
+  else
+    break
+  fi
+done
+
+# Total rounds
+total_rounds=0
+for d in "${sorted[@]}"; do
+  total_rounds=$(( total_rounds + day_rounds["$d"] ))
+done
+
+# Output
+echo "🔥 Build Streak"
+echo "==============="
+echo ""
+echo "Current streak: ${streak} day(s)"
+echo "Total days built: ${#sorted[@]}"
+echo "Total rounds: ${total_rounds}"
+echo "Highest round: ${day_max_round[${sorted[-1]}]}"
+echo ""
+echo "📊 Per-day breakdown:"
+for d in "${sorted[@]}"; do
+  r="${day_rounds[$d]}"
+  label="rounds"; (( r == 1 )) && label="round "
+  printf "  %s  %2d %s (up to R%s)\n" "$d" "$r" "$label" "${day_max_round[$d]}"
+done
