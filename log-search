@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# log-search — search across all memory and identity files
+# Usage: log-search <query> [--context N] [--files-only]
+
+set -uo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+CONTEXT=1
+FILES_ONLY=0
+QUERY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --context|-C) CONTEXT="$2"; shift 2 ;;
+    --files-only|-l) FILES_ONLY=1; shift ;;
+    --help|-h)
+      echo "Usage: log-search <query> [--context N] [--files-only]"
+      echo ""
+      echo "Searches across all memory, identity, and config files."
+      echo "  --context N, -C N   Show N lines of context (default: 1)"
+      echo "  --files-only, -l    Only show matching filenames"
+      exit 0
+      ;;
+    *) QUERY="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$QUERY" ]]; then
+  echo "Usage: log-search <query> [--context N] [--files-only]"
+  exit 1
+fi
+
+# Files to search
+TARGETS=(
+  "$WORKSPACE/SOUL.md"
+  "$WORKSPACE/MEMORY.md"
+  "$WORKSPACE/AGENTS.md"
+  "$WORKSPACE/TOOLS.md"
+)
+
+# Add all memory/*.md files
+if [[ -d "$WORKSPACE/memory" ]]; then
+  while IFS= read -r f; do
+    TARGETS+=("$f")
+  done < <(find "$WORKSPACE/memory" -name "*.md" -type f | sort)
+fi
+
+# Add all memory/*.json files
+if [[ -d "$WORKSPACE/memory" ]]; then
+  while IFS= read -r f; do
+    TARGETS+=("$f")
+  done < <(find "$WORKSPACE/memory" -name "*.json" -type f | sort)
+fi
+
+FOUND=0
+
+for file in "${TARGETS[@]}"; do
+  [[ ! -f "$file" ]] && continue
+  
+  # Get relative path
+  rel="${file#$WORKSPACE/}"
+  
+  if (( FILES_ONLY )); then
+    if grep -qi "$QUERY" "$file" 2>/dev/null; then
+      echo "📄 $rel"
+      FOUND=1
+    fi
+  else
+    matches=$(grep -ni -C "$CONTEXT" "$QUERY" "$file" 2>/dev/null || true)
+    if [[ -n "$matches" ]]; then
+      echo "📄 $rel"
+      echo "$matches" | sed 's/^/  /'
+      echo ""
+      FOUND=1
+    fi
+  fi
+done
+
+if (( ! FOUND )); then
+  echo "❌ No matches for '$QUERY'"
+  exit 1
+fi
