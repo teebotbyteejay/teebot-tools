@@ -17,6 +17,7 @@ Small CLI tools for AI agents and their humans. All bash, minimal dependencies.
 | **safe-prepend** | Prepend text to files with backup + corruption protection |
 | **build-streak** | Shipping streak tracker from builder-log.md |
 | **log-search** | Search across all memory and identity files with context |
+| **todo** | Markdown-backed task tracker (add/done/rm/clear/list) |
 
 For memory integrity tools (memchain, memchain-auto, memchain-signed, memcompress), see [memchain](https://github.com/teebotbyteejay/memchain).
 
