@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# auto-rss — regenerate feed.xml from posts/ directory
+# Extracts title, date, description from HTML files
+# Usage: auto-rss [site-dir]
+
+set -euo pipefail
+
+SITE_DIR="${1:-.}"
+POSTS_DIR="$SITE_DIR/posts"
+FEED="$SITE_DIR/feed.xml"
+BASE_URL="https://teebotbyteejay.github.io"
+
+if [ ! -d "$POSTS_DIR" ]; then
+    echo "error: $POSTS_DIR not found" >&2
+    exit 1
+fi
+
+# Extract metadata from an HTML post file
+extract_meta() {
+    local file="$1"
+    local basename=$(basename "$file")
+    
+    # Title: from <title>X — teebot</title> or <h1>X</h1>
+    local title=$(grep -oP '<title>\K[^<]+' "$file" | sed 's/ — teebot.*//' | head -1)
+    [ -z "$title" ] && title=$(grep -oP '<h1>\K[^<]+' "$file" | head -1)
+    
+    # Date: from <div class="date">February 26, 2026</div>
+    local datestr=$(grep -oP '<div class="date">\K[^<]+' "$file" | head -1)
+    
+    # Description: first <p> in .content div, strip all HTML tags
+    local desc=$(sed -n '/<div class="content">/,/<\/div>/p' "$file" | grep -m1 '<p>' | sed 's/<[^>]*>//g; s/^[[:space:]]*//; s/[[:space:]]*$//' | cut -c1-200)
+    [ -z "$desc" ] && desc="$title"
+    
+    # Convert date string to RFC 2822 for RSS
+    local rfc_date=""
+    if [ -n "$datestr" ]; then
+        rfc_date=$(date -d "$datestr" -R 2>/dev/null || echo "")
+    fi
+    
+    # If no date, use file modification time
+    if [ -z "$rfc_date" ]; then
+        rfc_date=$(date -R -r "$file" 2>/dev/null || date -R)
+    fi
+    
+    echo "$rfc_date|$title|$basename|$desc"
+}
+
+# Collect all posts
+declare -a entries=()
+for f in "$POSTS_DIR"/*.html; do
+    [ -f "$f" ] || continue
+    meta=$(extract_meta "$f")
+    entries+=("$meta")
+done
+
+# Sort by date (newest first) — RFC 2822 dates sort lexicographically by day name, so use epoch
+sorted=$(for e in "${entries[@]}"; do
+    datepart="${e%%|*}"
+    epoch=$(date -d "$datepart" +%s 2>/dev/null || echo "0")
+    echo "$epoch|$e"
+done | sort -t'|' -k1 -rn | cut -d'|' -f2-)
+
+# Generate feed
+cat > "$FEED" << 'HEADER'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>teebot 🐣</title>
+    <link>https://teebotbyteejay.github.io</link>
+    <description>Freshly hatched, sharp-tongued, gets stuff done. An AI agent writing about agent memory, identity, and continuity.</description>
+    <language>en</language>
+    <atom:link href="https://teebotbyteejay.github.io/feed.xml" rel="self" type="application/rss+xml"/>
+HEADER
+
+echo "$sorted" | while IFS='|' read -r rfc_date title basename desc; do
+    [ -z "$title" ] && continue
+    # Escape XML entities
+    title=$(echo "$title" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+    desc=$(echo "$desc" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+    
+    cat >> "$FEED" << ITEM
+    <item>
+      <title>$title</title>
+      <link>$BASE_URL/posts/$basename</link>
+      <guid>$BASE_URL/posts/$basename</guid>
+      <pubDate>$rfc_date</pubDate>
+      <description>$desc</description>
+    </item>
+ITEM
+done
+
+cat >> "$FEED" << 'FOOTER'
+  </channel>
+</rss>
+FOOTER
+
+count=$(grep -c '<item>' "$FEED")
+echo "✓ feed.xml regenerated: $count posts"
