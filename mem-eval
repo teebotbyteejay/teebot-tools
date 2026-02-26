@@ -88,8 +88,10 @@ section "Confidence Markers"
 CHECKS=$((CHECKS + 1))
 
 if [[ -f "$DIR/MEMORY.md" ]]; then
-  total_sections=$(grep -c "^### " "$DIR/MEMORY.md" 2>/dev/null || echo 0)
-  confidence_markers=$(grep -ci "CONFIDENCE:" "$DIR/MEMORY.md" 2>/dev/null || echo 0)
+  total_sections=$(grep -c "^### " "$DIR/MEMORY.md" 2>/dev/null || true)
+  total_sections=${total_sections:-0}
+  confidence_markers=$(grep -ci "CONFIDENCE:" "$DIR/MEMORY.md" 2>/dev/null || true)
+  confidence_markers=${confidence_markers:-0}
   
   if [[ $total_sections -gt 0 ]]; then
     pct=$((confidence_markers * 100 / total_sections))
@@ -108,7 +110,7 @@ CHECKS=$((CHECKS + 1))
 
 if [[ -d "$MEM_DIR" ]]; then
   total_files=$(find "$MEM_DIR" -name "*.md" | wc -l)
-  recent_files=$(find "$MEM_DIR" -name "*.md" -newer "$MEM_DIR/../SOUL.md" 2>/dev/null | wc -l || echo 0)
+  recent_files=$(find "$MEM_DIR" -name "*.md" -newer "$MEM_DIR/../SOUL.md" 2>/dev/null | wc -l)
   
   if [[ -f "$DIR/MEMORY.md" ]]; then
     mem_lines=$(wc -l < "$DIR/MEMORY.md")
@@ -131,8 +133,10 @@ if [[ -f "$DIR/MEMORY.md" ]]; then
   # Simple heuristic: look for entries that contain opposing sentiment about the same topic
   # This is crude but catches obvious cases
   
-  solved_count=$(grep -ci "solved\|complete\|finished\|done" "$DIR/MEMORY.md" 2>/dev/null || echo 0)
-  unsolved_count=$(grep -ci "unsolved\|incomplete\|missing\|TODO\|needs work" "$DIR/MEMORY.md" 2>/dev/null || echo 0)
+  solved_count=$(grep -ci "solved\|complete\|finished\|done" "$DIR/MEMORY.md" 2>/dev/null || true)
+  solved_count=${solved_count:-0}
+  unsolved_count=$(grep -ci "unsolved\|incomplete\|missing\|TODO\|needs work" "$DIR/MEMORY.md" 2>/dev/null || true)
+  unsolved_count=${unsolved_count:-0}
   
   # Check for "X is Y" and "X is not Y" patterns (very basic)
   contradictions=0

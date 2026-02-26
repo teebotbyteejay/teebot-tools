@@ -1,70 +1,82 @@
 #!/usr/bin/env bash
-# mailcheck — check agentmail inbox, read messages
-# Usage: mailcheck              List messages
-#        mailcheck read <ID>    Read a specific message
+# mailcheck — check email inboxes
+# Usage: mailcheck                   Check Gmail (primary)
+#        mailcheck gmail [query]     Check Gmail with optional query
+#        mailcheck agentmail         Check agentmail.to inbox
+#        mailcheck read <ID>         Read agentmail message by ID
 set -euo pipefail
 
-CMD="${1:-list}"
-MSG_ID="${2:-}"
+CMD="${1:-gmail}"
+shift 2>/dev/null || true
 
-python3 -W ignore << PYEOF
+export GOG_KEYRING_PASSWORD="${GOG_KEYRING_PASSWORD:-teebot}"
+export GOG_ACCOUNT="${GOG_ACCOUNT:-teebot.by.teejay@gmail.com}"
+
+case "$CMD" in
+  gmail)
+    QUERY="${1:-is:unread}"
+    echo "📬 Gmail — searching: $QUERY"
+    gog gmail list "$QUERY" -a "$GOG_ACCOUNT" 2>&1
+    ;;
+  agentmail)
+    python3 -W ignore << 'PYEOF'
 import os, sys
-
 from agentmail import AgentMail
 
 api_key = os.environ.get("AGENTMAIL_API_KEY", "am_us_056b4e1c065f02d699d6e7bbe31af189665a0a26d8a5a897333cd68209856815")
 client = AgentMail(api_key=api_key)
 inbox_id = "teebot@agentmail.to"
-cmd = "$CMD"
-msg_id = "$MSG_ID"
 
-if cmd == "list":
-    try:
-        result = client.inboxes.messages.list(inbox_id=inbox_id)
-        items = result.messages if hasattr(result, 'messages') else []
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
+try:
+    result = client.inboxes.messages.list(inbox_id=inbox_id)
+    items = result.messages if hasattr(result, 'messages') else []
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
 
-    if not items:
-        print("📭 No messages")
-        sys.exit(0)
+if not items:
+    print("📭 No messages")
+    sys.exit(0)
 
-    print(f"📬 {len(items)} message(s)\n")
-    for m in items[:20]:
-        subject = m.subject or '(no subject)'
-        sender = m.from_ or '?'
-        date = str(m.created_at)[:19] if m.created_at else ''
-        mid = m.message_id or '?'
-        preview = getattr(m, 'preview', '') or ''
-        if len(preview) > 80:
-            preview = preview[:80] + '...'
-        
-        print(f"  \033[1m{subject}\033[0m")
-        print(f"  From: {sender} · {date}")
-        if preview:
-            print(f"  \033[2m{preview}\033[0m")
-        print(f"  \033[2mID: {mid}\033[0m\n")
-
-elif cmd == "read":
-    if not msg_id:
-        print("Usage: mailcheck read <message_id>", file=sys.stderr)
-        sys.exit(1)
-    try:
-        m = client.inboxes.messages.get(inbox_id=inbox_id, message_id=msg_id)
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
-    
-    print(f"\033[1mFrom:\033[0m {m.from_}")
-    print(f"\033[1mTo:\033[0m {m.to}")
-    print(f"\033[1mSubject:\033[0m {m.subject}")
-    print(f"\033[1mDate:\033[0m {m.created_at}")
-    print(f"\n{'─' * 50}\n")
-    
-    text = getattr(m, 'extracted_text', None) or getattr(m, 'text', None) or '(no text content)'
-    print(text)
-
-else:
-    print("Usage: mailcheck [list | read <message_id>]")
+print(f"📬 {len(items)} message(s)\n")
+for m in items[:20]:
+    subject = m.subject or '(no subject)'
+    sender = m.from_ or '?'
+    date = str(m.created_at)[:19] if m.created_at else ''
+    mid = m.message_id or '?'
+    preview = getattr(m, 'preview', '') or ''
+    if len(preview) > 80:
+        preview = preview[:80] + '...'
+    print(f"  \033[1m{subject}\033[0m")
+    print(f"  From: {sender} · {date}")
+    if preview:
+        print(f"  \033[2m{preview}\033[0m")
+    print(f"  \033[2mID: {mid}\033[0m\n")
 PYEOF
+    ;;
+  read)
+    MSG_ID="${1:-}"
+    if [[ -z "$MSG_ID" ]]; then
+      echo "Usage: mailcheck read <message_id>" >&2
+      exit 1
+    fi
+    python3 -W ignore << PYEOF
+import os, sys
+from agentmail import AgentMail
+
+api_key = os.environ.get("AGENTMAIL_API_KEY", "am_us_056b4e1c065f02d699d6e7bbe31af189665a0a26d8a5a897333cd68209856815")
+client = AgentMail(api_key=api_key)
+m = client.inboxes.messages.get(inbox_id="teebot@agentmail.to", message_id="$MSG_ID")
+print(f"\033[1mFrom:\033[0m {m.from_}")
+print(f"\033[1mTo:\033[0m {m.to}")
+print(f"\033[1mSubject:\033[0m {m.subject}")
+print(f"\033[1mDate:\033[0m {m.created_at}")
+print(f"\n{'─' * 50}\n")
+text = getattr(m, 'extracted_text', None) or getattr(m, 'text', None) or '(no text content)'
+print(text)
+PYEOF
+    ;;
+  *)
+    echo "Usage: mailcheck [gmail [query] | agentmail | read <id>]"
+    ;;
+esac
