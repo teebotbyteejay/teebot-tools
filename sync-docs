@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# sync-docs — auto-update README.md and install.sh from actual tools in the repo
+# Usage: sync-docs [--dry-run]
+
+set -uo pipefail
+
+REPO="${REPO:-$HOME/.openclaw/workspace/teebot-tools}"
+DRY_RUN=0
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+
+cd "$REPO"
+
+# Discover all tool scripts (executable files, not install.sh/sync-docs/README etc)
+TOOLS=()
+for f in *; do
+  [[ -x "$f" && -f "$f" && "$f" != "install.sh" && "$f" != "sync-docs" && ! "$f" =~ \. ]] && TOOLS+=("$f")
+done
+
+COUNT=${#TOOLS[@]}
+TOOL_LIST=$(printf '%s ' "${TOOLS[@]}")
+
+echo "📦 sync-docs — found $COUNT tools"
+echo "   ${TOOL_LIST}"
+
+if ((DRY_RUN)); then
+  echo ""
+  echo "   (dry run — checking what needs updating)"
+fi
+
+# Check install.sh
+CURRENT_INSTALL=$(grep '^TOOLS=' install.sh 2>/dev/null | sed 's/TOOLS="//' | sed 's/"//')
+EXPECTED_INSTALL="${TOOL_LIST% }"
+
+INSTALL_CHANGED=0
+if [[ "$CURRENT_INSTALL" != "$EXPECTED_INSTALL" ]]; then
+  INSTALL_CHANGED=1
+  echo ""
+  echo "⚠️  install.sh TOOLS list out of date"
+  echo "   Current:  $CURRENT_INSTALL"
+  echo "   Expected: $EXPECTED_INSTALL"
+  if ((! DRY_RUN)); then
+    sed -i "s|^TOOLS=\".*\"|TOOLS=\"$EXPECTED_INSTALL\"|" install.sh
+    echo "   ✓ Updated install.sh"
+  fi
+fi
+
+# Check README table
+README_CHANGED=0
+for tool in "${TOOLS[@]}"; do
+  if ! grep -q "**$tool**" README.md 2>/dev/null; then
+    README_CHANGED=1
+    echo ""
+    echo "⚠️  $tool missing from README.md"
+    # Extract description from tool's --help or header comment
+    desc=$(sed -n '2s/^# //p' "$tool" 2>/dev/null || echo "")
+    [[ -z "$desc" ]] && desc="(no description)"
+    echo "   Description: $desc"
+    if ((! DRY_RUN)); then
+      # Append to table before the closing empty line
+      sed -i "/^$/i | **$tool** | ${desc} |" README.md 2>/dev/null || true
+      echo "   ✓ Added to README.md (may need manual formatting)"
+    fi
+  fi
+done
+
+if ((INSTALL_CHANGED == 0 && README_CHANGED == 0)); then
+  echo ""
+  echo "✓ Everything in sync!"
+fi
