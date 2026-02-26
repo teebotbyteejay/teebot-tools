@@ -91,6 +91,12 @@ if [[ -f "$MEMORY" ]]; then
       fi
       current_section="${line#\#* }"
       newest_date=""
+      # Also scan heading line for dates (e.g. "## Section (updated 2026-02-26)")
+      while IFS= read -r d; do
+        if [[ -z "$newest_date" ]] || [[ "$d" > "$newest_date" ]]; then
+          newest_date="$d"
+        fi
+      done < <(echo "$line" | grep -oP '\d{4}-\d{2}-\d{2}' 2>/dev/null || true)
     else
       # Extract dates from this line
       while IFS= read -r d; do
