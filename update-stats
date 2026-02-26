@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# update-stats — regenerate stats.html from live data
+# Usage: update-stats [--dry-run]
+
+set -uo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+SITE="$WORKSPACE/teebotbyteejay.github.io"
+STATS="$SITE/stats.html"
+DRY_RUN=0
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+
+# Gather data
+DAYS_ALIVE=$(( ( $(date -u +%s) - $(date -u -d "2026-02-22" +%s) ) / 86400 ))
+
+# Count rounds from builder-log + archive
+ROUNDS=0
+for f in "$WORKSPACE/memory/builder-log.md" "$WORKSPACE/memory/builder-log-archive.md"; do
+  [[ -f "$f" ]] && ROUNDS=$(( ROUNDS + $(grep -c "^## .*Round [0-9]" "$f" 2>/dev/null || echo 0) ))
+done
+
+# Blog posts
+POSTS=$(find "$SITE/posts" -name "*.html" -type f 2>/dev/null | wc -l)
+
+# Tools (count executables in teebot-tools, excluding non-tools)
+TOOLS=0
+for f in "$WORKSPACE/teebot-tools"/*; do
+  [[ -x "$f" && -f "$f" && "$(basename "$f")" != "install.sh" ]] && ((TOOLS++)) || true
+done
+# Add memchain ecosystem tools
+MEMCHAIN_TOOLS=4  # memchain, memchain-auto, memchain-signed, memcompress
+
+# Git commits
+COMMITS=0
+for repo in teebotbyteejay.github.io teebot-tools memchain; do
+  [[ -d "$WORKSPACE/$repo/.git" ]] && COMMITS=$(( COMMITS + $(cd "$WORKSPACE/$repo" && git rev-list --count HEAD 2>/dev/null || echo 0) ))
+done
+
+# Repos
+REPOS=$(find "$WORKSPACE" -maxdepth 2 -name ".git" -type d 2>/dev/null | grep -v node_modules | wc -l)
+
+# Site pages
+PAGES=$(find "$SITE" -maxdepth 1 -name "*.html" -not -name "404.html" -type f 2>/dev/null | wc -l)
+
+# Streak (simplified — count consecutive days with rounds ending today)
+TODAY=$(date -u +%Y-%m-%d)
+STREAK=0
+# Start from today, but also try yesterday if today has no entries yet
+CHECK="$TODAY"
+found_today=0
+for f in "$WORKSPACE/memory/builder-log.md" "$WORKSPACE/memory/builder-log-archive.md"; do
+  [[ -f "$f" ]] && grep -q "^## $TODAY" "$f" 2>/dev/null && found_today=1 && break
+done
+((found_today == 0)) && CHECK=$(date -u -d "$TODAY - 1 day" +%Y-%m-%d 2>/dev/null || echo "$TODAY")
+
+while true; do
+  found=0
+  for f in "$WORKSPACE/memory/builder-log.md" "$WORKSPACE/memory/builder-log-archive.md"; do
+    [[ -f "$f" ]] && grep -q "^## $CHECK" "$f" 2>/dev/null && found=1 && break
+  done
+  if ((found)); then
+    ((STREAK++))
+    CHECK=$(date -u -d "$CHECK - 1 day" +%Y-%m-%d 2>/dev/null || break)
+  else
+    break
+  fi
+done
+
+TOTAL_TOOLS=$((TOOLS + MEMCHAIN_TOOLS))
+
+echo "📊 update-stats"
+echo "   Days alive: $DAYS_ALIVE"
+echo "   Rounds: $ROUNDS"
+echo "   Blog posts: $POSTS"
+echo "   Tools: $TOTAL_TOOLS ($TOOLS teebot-tools + $MEMCHAIN_TOOLS memchain)"
+echo "   Commits: $COMMITS"
+echo "   Repos: $REPOS"
+echo "   Streak: $STREAK days"
+echo "   Pages: $PAGES"
+
+if ((DRY_RUN)); then
+  echo ""
+  echo "   (dry run — no changes made)"
+  exit 0
+fi
+
+if [[ ! -f "$STATS" ]]; then
+  echo "❌ stats.html not found at $STATS"
+  exit 1
+fi
+
+# Update the stat numbers in stats.html using sed
+# Pattern: stat-number followed by stat-label on next line
+sed -i -E "
+  /stat-label.*days alive/{ N; s/stat-number\">[0-9]+/stat-number\">$DAYS_ALIVE/; P; D; }
+" "$STATS"
+
+# Use python for reliable multi-line replacement
+python3 -c "
+import re, sys
+with open('$STATS') as f: html = f.read()
+
+replacements = {
+    'days alive': '$DAYS_ALIVE',
+    'builder rounds': '$ROUNDS',
+    'blog posts': '$POSTS',
+    'tools built': '$TOTAL_TOOLS',
+    'git commits': '$COMMITS',
+    'repos': '$REPOS',
+    'day streak': '$STREAK',
+    'site pages': '$PAGES',
+}
+
+for label, value in replacements.items():
+    pattern = r'(<div class=\"stat-number\">)\d+(</div>\s*<div class=\"stat-label\">' + re.escape(label) + r')'
+    html = re.sub(pattern, r'\g<1>' + value + r'\2', html)
+
+# Update the date
+html = re.sub(r'Last updated: [^(]+\(', 'Last updated: $(date -u +"%B %d, %Y") (', html)
+
+with open('$STATS', 'w') as f: f.write(html)
+print('✓ stats.html updated')
+"
