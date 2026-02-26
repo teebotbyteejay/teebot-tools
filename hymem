@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# hymem — Hybrid Memory Retrieval (complexity-routed)
+# Usage: hymem <query> | hymem --classify <query> | hymem --tier 1|2|3 <query>
+set -euo pipefail
+
+MEM_DIR="$HOME/.openclaw/workspace/memory"
+WS_DIR="$HOME/.openclaw/workspace"
+TOP_FILES=("$WS_DIR/MEMORY.md" "$WS_DIR/USER.md" "$WS_DIR/IDENTITY.md" "$WS_DIR/SOUL.md")
+
+# Collect all searchable files
+get_mem_files() {
+  local files=()
+  for f in "${TOP_FILES[@]}"; do [[ -f "$f" ]] && files+=("$f"); done
+  if [[ -d "$MEM_DIR" ]]; then
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$MEM_DIR" -name '*.md' -print0 2>/dev/null)
+  fi
+  printf '%s\n' "${files[@]}"
+}
+
+# --- Classifier ---
+classify() {
+  local q="$1"
+  local ql="${q,,}" # lowercase
+  local score=0
+
+  # Proper nouns (capitalized words not at start of query) or specific dates
+  if echo "$q" | grep -qP '(?<=\s)[A-Z][a-z]{2,}' || echo "$ql" | grep -qP '\b\d{4}[-/]\d{2}[-/]\d{2}\b|\b(january|february|march|april|may|june|july|august|september|october|november|december)\b|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b'; then
+    score=$((score - 2))
+  fi
+
+  # "what is/was" single fact (not "what have I learned" etc.)
+  if echo "$ql" | grep -qP '^\s*what (is|was|are|were)\b' && ! echo "$ql" | grep -qP '^\s*what (have|had|do|did|can|could|should|would)\b'; then
+    score=$((score - 2))
+  fi
+
+  # Complex signals
+  if echo "$ql" | grep -qP '\b(pattern|patterns|trend|trends|why|how often|learned|lessons|summary|summarize|overview|reflect|evolution)\b'; then
+    score=$((score + 2))
+  fi
+
+  # Multiple time periods
+  if echo "$ql" | grep -qP '\b(over the past|last week|last month|this week|this month|between .* and|from .* to|recently and|before and after)\b'; then
+    score=$((score + 2))
+  fi
+
+  # Relationships between events
+  if echo "$ql" | grep -qP '\b(relationship|correlat|connect|link between|cause|led to|result of|because of|impact of|affect|influence)\b'; then
+    score=$((score + 3))
+  fi
+
+  # Word count > 20
+  local wc
+  wc=$(echo "$q" | wc -w)
+  if (( wc > 20 )); then
+    score=$((score + 1))
+  fi
+
+  echo "$score"
+}
+
+tier_from_score() {
+  local s=$1
+  if (( s <= 0 )); then echo 1
+  elif (( s <= 3 )); then echo 2
+  else echo 3; fi
+}
+
+tier_label() {
+  case "$1" in
+    1) echo "fast" ;; 2) echo "medium" ;; 3) echo "deep" ;;
+  esac
+}
+
+# --- Tier 1: Fast (grep) ---
+tier1() {
+  local q="$1"
+  local sources=()
+  local results=""
+  # Build grep pattern from significant words (skip short/common words)
+  local words
+  words=$(echo "$q" | tr -cs '[:alnum:]' '\n' | awk 'length>=3' | grep -viP '^(the|and|for|that|this|with|from|what|was|are|were|how|who|when|where|which|have|has|had|does|did|not|but|can|will|its|you|your|about)$' | head -8)
+  [[ -z "$words" ]] && words=$(echo "$q" | tr -cs '[:alnum:]' '\n' | head -3)
+  local pattern
+  pattern=$(echo "$words" | paste -sd'|')
+  [[ -z "$pattern" ]] && { echo "(no searchable terms)"; return; }
+
+  while IFS= read -r f; do
+    local matches
+    matches=$(grep -in -P "$pattern" "$f" 2>/dev/null | head -5) || true
+    if [[ -n "$matches" ]]; then
+      local bn
+      bn=$(basename "$f")
+      sources+=("$bn")
+      results+="### $bn"$'\n'"$matches"$'\n\n'
+    fi
+  done < <(get_mem_files)
+
+  if [[ ${#sources[@]} -gt 0 ]]; then
+    echo "[hymem] Sources: $(IFS=', '; echo "${sources[*]}")"
+    echo "---"
+    echo "$results"
+  else
+    echo "[hymem] Sources: (none)"
+    echo "---"
+    echo "(no matches found)"
+  fi
+}
+
+# --- Tier 2: Medium (targeted file read) ---
+tier2() {
+  local q="$1"
+  local words
+  words=$(echo "$q" | tr -cs '[:alnum:]' '\n' | awk 'length>=3' | grep -viP '^(the|and|for|that|this|with|from|what|was|are|were|how|who|when|where|which|have|has|had|does|did|not|but|can|will|its|you|your|about)$' | head -8)
+  [[ -z "$words" ]] && words=$(echo "$q" | tr -cs '[:alnum:]' '\n' | head -3)
+  local pattern
+  pattern=$(echo "$words" | paste -sd'|')
+
+  # Score each file by match count, pick top 3
+  local -A scores=()
+  while IFS= read -r f; do
+    local c
+    c=$(grep -ciP "$pattern" "$f" 2>/dev/null) || c=0
+    scores["$f"]=$c
+  done < <(get_mem_files)
+
+  local top_files
+  top_files=$(for f in "${!scores[@]}"; do echo "${scores[$f]} $f"; done | sort -rn | head -3 | awk '$1>0{print $2}')
+
+  if [[ -z "$top_files" ]]; then
+    echo "[hymem] Sources: (none)"
+    echo "---"
+    echo "(no relevant files found)"
+    return
+  fi
+
+  local sources=()
+  local results=""
+  while IFS= read -r f; do
+    local bn
+    bn=$(basename "$f")
+    sources+=("$bn")
+    results+="### $bn"$'\n'"$(cat "$f")"$'\n\n'
+  done <<< "$top_files"
+
+  echo "[hymem] Sources: $(IFS=', '; echo "${sources[*]}")"
+  echo "---"
+  echo "$results"
+}
+
+# --- Tier 3: Deep (multi-file section extraction) ---
+tier3() {
+  local q="$1"
+  local words
+  words=$(echo "$q" | tr -cs '[:alnum:]' '\n' | awk 'length>=3' | grep -viP '^(the|and|for|that|this|with|from|what|was|are|were|how|who|when|where|which|have|has|had|does|did|not|but|can|will|its|you|your|about)$' | head -10)
+  [[ -z "$words" ]] && words=$(echo "$q" | tr -cs '[:alnum:]' '\n' | head -3)
+  local pattern
+  pattern=$(echo "$words" | paste -sd'|')
+
+  local sources=()
+  local results=""
+  while IFS= read -r f; do
+    local matches
+    matches=$(grep -inP "$pattern" "$f" 2>/dev/null) || true
+    [[ -z "$matches" ]] && continue
+    local bn
+    bn=$(basename "$f")
+    sources+=("$bn")
+    # Extract sections: for each matching line, grab surrounding context (±3 lines)
+    local sections=""
+    while IFS= read -r linenum; do
+      local start=$((linenum > 3 ? linenum - 3 : 1))
+      local end=$((linenum + 3))
+      sections+="$(sed -n "${start},${end}p" "$f")"$'\n...\n'
+    done < <(grep -nP "$pattern" "$f" 2>/dev/null | cut -d: -f1 | head -10)
+    results+="### $bn"$'\n'"$sections"$'\n'
+  done < <(get_mem_files)
+
+  if [[ ${#sources[@]} -gt 0 ]]; then
+    echo "[hymem] Sources: $(IFS=', '; echo "${sources[*]}")"
+    echo "---"
+    echo "$results"
+  else
+    echo "[hymem] Sources: (none)"
+    echo "---"
+    echo "(no relevant sections found)"
+  fi
+}
+
+# --- Main ---
+CLASSIFY_ONLY=false
+FORCE_TIER=""
+QUERY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --classify) CLASSIFY_ONLY=true; shift ;;
+    --tier) FORCE_TIER="$2"; shift 2 ;;
+    *) QUERY="${QUERY:+$QUERY }$1"; shift ;;
+  esac
+done
+
+if [[ -z "$QUERY" ]]; then
+  echo "Usage: hymem <query> | hymem --classify <query> | hymem --tier 1|2|3 <query>"
+  exit 1
+fi
+
+score=$(classify "$QUERY")
+if [[ -n "$FORCE_TIER" ]]; then
+  tier="$FORCE_TIER"
+else
+  tier=$(tier_from_score "$score")
+fi
+label=$(tier_label "$tier")
+
+echo "[hymem] Query: \"$QUERY\""
+echo "[hymem] Complexity: $score → Tier $tier ($label)"
+
+if $CLASSIFY_ONLY; then
+  exit 0
+fi
+
+case "$tier" in
+  1) tier1 "$QUERY" ;;
+  2) tier2 "$QUERY" ;;
+  3) tier3 "$QUERY" ;;
+esac
