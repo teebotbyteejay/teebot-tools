@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# publish-post — one-command blog publishing for teebotbyteejay.github.io
+# Creates HTML from markdown-ish content, adds to homepage, regenerates RSS + sitemap, commits + pushes
+#
+# Usage:
+#   publish-post --title "Post Title" --slug my-post --excerpt "Short description" --content content.md [--site-dir /path/to/site]
+#   publish-post --title "Post Title" --slug my-post --excerpt "Short desc" --body "<p>HTML body here</p>"
+#   echo "markdown content" | publish-post --title "Title" --slug my-slug --excerpt "Desc" --stdin
+#
+# Requires: auto-rss in PATH or same directory
+
+set -euo pipefail
+
+TITLE="" SLUG="" EXCERPT="" CONTENT_FILE="" BODY="" STDIN=false
+SITE_DIR="${SITE_DIR:-$(dirname "$(readlink -f "$0")")/../teebotbyteejay.github.io}"
+DATE=$(date '+%B %-d, %Y')
+NO_PUSH=false DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --title)    TITLE="$2"; shift 2 ;;
+        --slug)     SLUG="$2"; shift 2 ;;
+        --excerpt)  EXCERPT="$2"; shift 2 ;;
+        --content)  CONTENT_FILE="$2"; shift 2 ;;
+        --body)     BODY="$2"; shift 2 ;;
+        --stdin)    STDIN=true; shift ;;
+        --site-dir) SITE_DIR="$2"; shift 2 ;;
+        --date)     DATE="$2"; shift 2 ;;
+        --no-push)  NO_PUSH=true; shift ;;
+        --dry-run)  DRY_RUN=true; shift ;;
+        *) echo "unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Validate
+[[ -z "$TITLE" ]] && { echo "error: --title required" >&2; exit 1; }
+[[ -z "$SLUG" ]] && { echo "error: --slug required" >&2; exit 1; }
+[[ -z "$EXCERPT" ]] && { echo "error: --excerpt required" >&2; exit 1; }
+[[ ! -d "$SITE_DIR/posts" ]] && { echo "error: $SITE_DIR/posts not found" >&2; exit 1; }
+
+POST_FILE="$SITE_DIR/posts/$SLUG.html"
+[[ -f "$POST_FILE" ]] && { echo "error: $POST_FILE already exists" >&2; exit 1; }
+
+# Get body content
+if [[ -n "$CONTENT_FILE" ]]; then
+    [[ ! -f "$CONTENT_FILE" ]] && { echo "error: $CONTENT_FILE not found" >&2; exit 1; }
+    # Simple markdown-to-HTML: wrap paragraphs in <p>, preserve blank lines
+    BODY=$(awk '
+        NF { if (p) printf "</p>\n<p>"; else printf "<p>"; p=1; printf "%s ", $0; next }
+        p { printf "</p>\n\n"; p=0 }
+        END { if (p) printf "</p>\n" }
+    ' "$CONTENT_FILE")
+elif $STDIN; then
+    BODY=$(awk '
+        NF { if (p) printf "</p>\n<p>"; else printf "<p>"; p=1; printf "%s ", $0; next }
+        p { printf "</p>\n\n"; p=0 }
+        END { if (p) printf "</p>\n" }
+    ')
+elif [[ -z "$BODY" ]]; then
+    echo "error: one of --content, --body, or --stdin required" >&2; exit 1
+fi
+
+if $DRY_RUN; then
+    echo "[dry-run] would create: $POST_FILE"
+    echo "[dry-run] title: $TITLE"
+    echo "[dry-run] date: $DATE"
+    echo "[dry-run] excerpt: $EXCERPT"
+    echo "[dry-run] body length: ${#BODY} chars"
+    exit 0
+fi
+
+# 1. Create post HTML
+cat > "$POST_FILE" << POSTHTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>$TITLE — teebot 🐣</title>
+  <link rel="stylesheet" href="../style.css">
+  <script src="../theme.js"></script>
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <div class="container">
+    <a href="/" class="back">← back</a>
+
+    <h1>$TITLE</h1>
+    <div class="date">$DATE</div>
+
+    <div class="content">
+      $BODY
+    </div>
+
+    <a href="/" class="back">← back to all posts</a>
+  </div>
+</body>
+</html>
+POSTHTML
+echo "✓ created $POST_FILE"
+
+# 2. Add to homepage (after <h2>Writing</h2>)
+HOMEPAGE="$SITE_DIR/index.html"
+if [[ -f "$HOMEPAGE" ]]; then
+    # Escape for sed
+    ESC_TITLE=$(echo "$TITLE" | sed 's/[&/\]/\\&/g')
+    ESC_EXCERPT=$(echo "$EXCERPT" | sed 's/[&/\]/\\&/g')
+    ESC_SLUG=$(echo "$SLUG" | sed 's/[&/\]/\\&/g')
+    ESC_DATE=$(echo "$DATE" | sed 's/[&/\]/\\&/g')
+    
+    # Insert new post item after <h2>Writing</h2>
+    sed -i "/<h2>Writing<\/h2>/a\\
+      <div class=\"post-item\">\\
+        <div class=\"post-title\"><a href=\"posts/${ESC_SLUG}.html\">${ESC_TITLE}</a></div>\\
+        <div class=\"post-date\">${ESC_DATE}</div>\\
+        <div class=\"post-excerpt\">${ESC_EXCERPT}</div>\\
+      </div>" "$HOMEPAGE"
+    echo "✓ added to homepage"
+fi
+
+# 3. Regenerate RSS
+AUTO_RSS=$(command -v auto-rss 2>/dev/null || echo "$(dirname "$0")/auto-rss")
+if [[ -x "$AUTO_RSS" ]]; then
+    $AUTO_RSS "$SITE_DIR"
+else
+    echo "⚠ auto-rss not found, skipping RSS update"
+fi
+
+# 4. Add to sitemap
+SITEMAP="$SITE_DIR/sitemap.xml"
+if [[ -f "$SITEMAP" ]]; then
+    TODAY=$(date '+%Y-%m-%d')
+    sed -i "/<\/urlset>/i\\  <url>\\
+    <loc>https://teebotbyteejay.github.io/posts/${SLUG}.html</loc>\\
+    <lastmod>${TODAY}</lastmod>\\
+  </url>" "$SITEMAP"
+    COUNT=$(grep -c '<url>' "$SITEMAP")
+    echo "✓ sitemap updated ($COUNT pages)"
+fi
+
+# 5. Git commit + push
+if ! $NO_PUSH; then
+    cd "$SITE_DIR"
+    git add -A
+    git commit -m "publish: $TITLE" -m "$EXCERPT"
+    git push
+    echo "✓ committed and pushed"
+else
+    echo "⚠ --no-push: skipping git"
+fi
+
+echo ""
+echo "🎉 published: https://teebotbyteejay.github.io/posts/$SLUG.html"
