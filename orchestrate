@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# orchestrate — sub-agent orchestration helpers
+# Convention: use the filesystem as the message bus between sub-agents.
+# Usage: orchestrate <command> [args]
+#
+# Commands:
+#   init <task>         Create a workspace dir for a task
+#   dir <task>          Print the workspace dir path
+#   check <task>        Read the output file for a task (exit 1 if missing)
+#   status <task>       Show status of all steps in a task
+#   step <task> <name>  Print the output file path for a step (creates parent dir)
+#   template <pattern>  Print a prompt template for a pattern (chain|ensemble|supervisor)
+#   clean <task>        Remove a task workspace
+
+set -uo pipefail
+
+ORCH_BASE="${ORCH_BASE:-$HOME/.openclaw/workspace/memory/orchestrate}"
+
+_dir() {
+  echo "$ORCH_BASE/$1"
+}
+
+_init() {
+  local task="$1"
+  local dir="$ORCH_BASE/$task"
+  mkdir -p "$dir"
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) initialized" > "$dir/.meta"
+  echo "✓ Task workspace: $dir"
+  echo ""
+  echo "Use in subagent prompts:"
+  echo "  \"Write your output to $dir/step-NAME.md\""
+}
+
+_check() {
+  local task="$1"
+  local dir="$ORCH_BASE/$task"
+  if [[ ! -d "$dir" ]]; then
+    echo "❌ No workspace for task '$task'" >&2
+    exit 1
+  fi
+
+  local found=0
+  for f in "$dir"/step-*.md; do
+    [[ -f "$f" ]] || continue
+    found=1
+    local name=$(basename "$f" .md)
+    local lines=$(wc -l < "$f")
+    local bytes=$(wc -c < "$f")
+    echo "📄 $name — ${lines}L / ${bytes}B"
+  done
+
+  if ((found == 0)); then
+    echo "⏳ No step outputs yet"
+    exit 1
+  fi
+}
+
+_status() {
+  local task="$1"
+  local dir="$ORCH_BASE/$task"
+  if [[ ! -d "$dir" ]]; then
+    echo "❌ No workspace for task '$task'" >&2
+    exit 1
+  fi
+
+  echo "📋 Task: $task"
+  [[ -f "$dir/.meta" ]] && echo "   $(cat "$dir/.meta")"
+  echo ""
+
+  for f in "$dir"/step-*.md; do
+    [[ -f "$f" ]] || { echo "  (no steps yet)"; break; }
+    local name=$(basename "$f" .md)
+    local first_line=$(head -1 "$f")
+    echo "  ✓ $name: $first_line"
+  done
+}
+
+_step() {
+  local task="$1"
+  local name="$2"
+  local dir="$ORCH_BASE/$task"
+  mkdir -p "$dir"
+  echo "$dir/step-${name}.md"
+}
+
+_template() {
+  local pattern="$1"
+  case "$pattern" in
+    chain)
+      cat <<'EOF'
+# Sequential Chain Pattern
+# The main agent controls the pipeline. Each subagent writes to a file.
+#
+# Subagent prompt template (customize per step):
+#
+#   "Do [TASK]. Read input from [INPUT_FILE] if it exists.
+#    Write your complete output to [OUTPUT_FILE].
+#    Be thorough — the next step depends on your output."
+#
+# Main agent pseudocode:
+#   1. orchestrate init my-task
+#   2. Spawn subagent A: "... write to $(orchestrate step my-task research)"
+#   3. (A completes, auto-announces)
+#   4. Read output: orchestrate check my-task
+#   5. Spawn subagent B: "Read $(orchestrate step my-task research), write to $(orchestrate step my-task draft)"
+#   6. Repeat until done
+#   7. orchestrate clean my-task  (optional)
+EOF
+      ;;
+    ensemble)
+      cat <<'EOF'
+# Ensemble / Scatter-Gather Pattern
+# Spawn N subagents with the same task, different angles. Compare outputs.
+#
+# Main agent pseudocode:
+#   1. orchestrate init my-vote
+#   2. Spawn agent 1: "Solve X via approach A → $(orchestrate step my-vote option-a)"
+#   3. Spawn agent 2: "Solve X via approach B → $(orchestrate step my-vote option-b)"
+#   4. Spawn agent 3: "Solve X via approach C → $(orchestrate step my-vote option-c)"
+#   5. Wait for all 3 completions
+#   6. Read all: orchestrate check my-vote
+#   7. Judge yourself or spawn a judge subagent
+EOF
+      ;;
+    supervisor)
+      cat <<'EOF'
+# Supervisor / Ledger Pattern (Magentic-One style)
+# Maintain an explicit plan file. Update after each step.
+#
+# Main agent pseudocode:
+#   1. orchestrate init my-project
+#   2. Write plan to $(orchestrate step my-project plan)
+#   3. Spawn subagent for step 1, output to $(orchestrate step my-project step-1)
+#   4. On completion: read result, update plan with progress
+#   5. Decide: re-plan? retry? next step?
+#   6. Use `subagents steer` for mid-flight corrections
+#   7. Repeat until plan is complete
+EOF
+      ;;
+    *)
+      echo "Unknown pattern: $pattern" >&2
+      echo "Available: chain, ensemble, supervisor" >&2
+      exit 1
+      ;;
+  esac
+}
+
+_clean() {
+  local task="$1"
+  local dir="$ORCH_BASE/$task"
+  if [[ ! -d "$dir" ]]; then
+    echo "No workspace for '$task'"
+    return
+  fi
+  rm -rf "$dir"
+  echo "✓ Cleaned workspace for '$task'"
+}
+
+_read() {
+  local task="$1"
+  local name="$2"
+  local file="$ORCH_BASE/$task/step-${name}.md"
+  if [[ ! -f "$file" ]]; then
+    echo "❌ No output: $file" >&2
+    exit 1
+  fi
+  cat "$file"
+}
+
+case "${1:-help}" in
+  init)     shift; _init "$1" ;;
+  dir)      shift; _dir "$1" ;;
+  check)    shift; _check "$1" ;;
+  status)   shift; _status "$1" ;;
+  step)     shift; _step "$1" "$2" ;;
+  read)     shift; _read "$1" "$2" ;;
+  template) shift; _template "$1" ;;
+  clean)    shift; _clean "$1" ;;
+  -h|--help|help)
+    echo "Usage: orchestrate <command> [args]"
+    echo ""
+    echo "Sub-agent orchestration helpers. Filesystem as message bus."
+    echo ""
+    echo "Commands:"
+    echo "  init <task>           Create task workspace"
+    echo "  dir <task>            Print workspace dir path"
+    echo "  step <task> <name>    Print output file path for a step"
+    echo "  check <task>          List all step outputs"
+    echo "  read <task> <step>    Read a step's output"
+    echo "  status <task>         Show task progress"
+    echo "  template <pattern>    Print prompt template (chain|ensemble|supervisor)"
+    echo "  clean <task>          Remove task workspace"
+    echo ""
+    echo "Convention: tell subagents to write output to \$(orchestrate step <task> <name>)"
+    echo "Base dir: \$ORCH_BASE (default: memory/orchestrate/)"
+    ;;
+  *)
+    echo "Unknown command: $1 (try: orchestrate --help)" >&2
+    exit 1
+    ;;
+esac
