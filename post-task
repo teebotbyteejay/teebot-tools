@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# post-task — evaluate a completed task and extract behavioral rules
+# Wrapper around reflexion-eval that also ingests into graphmem if notable.
+#
+# Usage: post-task "task description" "outcome summary"
+# Options:
+#   --score-only    Just output the score (for scripting)
+#   --no-graph      Skip graphmem ingestion
+set -euo pipefail
+
+TASK="${1:-}"
+OUTCOME="${2:-}"
+SCORE_ONLY=false
+NO_GRAPH=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --score-only) SCORE_ONLY=true ;;
+    --no-graph) NO_GRAPH=true ;;
+  esac
+done
+
+[[ -z "$TASK" ]] && { echo "Usage: post-task '<task>' '<outcome>'" >&2; exit 1; }
+[[ -z "$OUTCOME" ]] && { echo "Usage: post-task '<task>' '<outcome>'" >&2; exit 1; }
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_CYAN='\033[36m'
+
+# --- Run reflexion evaluation ---
+if command -v reflexion-eval &>/dev/null; then
+  eval_output=$(reflexion-eval evaluate "$TASK" "$OUTCOME" 2>&1)
+  
+  if $SCORE_ONLY; then
+    echo "$eval_output" | grep -oP 'score=\K[0-9]+' || echo "unknown"
+    exit 0
+  fi
+  
+  echo -e "${C_CYAN}${C_BOLD}Post-task evaluation${C_RESET}"
+  echo "$eval_output"
+else
+  echo "reflexion-eval not found, skipping evaluation" >&2
+fi
+
+# --- Ingest into graphmem if notable ---
+if ! $NO_GRAPH && command -v graphmem-sqlite &>/dev/null; then
+  # Only ingest if the outcome is substantial (more than 20 chars)
+  if [[ ${#OUTCOME} -gt 20 ]]; then
+    graphmem-sqlite add "Task: $TASK. Outcome: $OUTCOME" 2>/dev/null && \
+      echo -e "\n  ${C_GREEN}✓${C_RESET} Added to graph memory" || true
+  fi
+fi

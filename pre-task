@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# pre-task — gather context before spawning a task/sub-agent
+# Pulls reflexion rules + graphmem context for a task description.
+# Output: markdown block suitable for injecting into a task prompt.
+#
+# Usage: pre-task "build a CLI tool for X"
+set -euo pipefail
+
+TASK="${1:-}"
+[[ -z "$TASK" ]] && { echo "Usage: pre-task '<task description>'" >&2; exit 1; }
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'; C_CYAN='\033[36m'
+
+output=""
+
+# --- Reflexion Rules ---
+if command -v reflexion-eval &>/dev/null; then
+  rules=$(reflexion-eval match "$TASK" 2>/dev/null | grep -v "^$" | grep -v "matched$" | grep -v "^Matching" || true)
+  if [[ -n "$rules" && ! "$rules" =~ "0 rules matched" ]]; then
+    output+="## Learned Rules (from prior experience)
+$rules
+
+"
+  fi
+fi
+
+# --- Graph Memory Context ---
+if command -v graphmem-sqlite &>/dev/null; then
+  # Use full task description for semantic search
+  graph_results=$(graphmem-sqlite search "$TASK" 2>/dev/null | head -8 || true)
+  if [[ -n "$graph_results" && ! "$graph_results" =~ "No results" ]]; then
+    output+="## Relevant Memory (graph)
+$graph_results
+
+"
+  fi
+fi
+
+# --- Output ---
+if [[ -n "$output" ]]; then
+  echo -e "${C_CYAN}${C_BOLD}Pre-task context for:${C_RESET} $TASK"
+  echo ""
+  echo "$output"
+else
+  echo -e "${C_DIM}No prior context found for this task.${C_RESET}"
+fi

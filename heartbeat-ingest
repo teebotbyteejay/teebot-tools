@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# heartbeat-ingest — ingest today's daily log into graphmem-sqlite
+# Safe to run multiple times; graphmem deduplicates by content.
+#
+# Usage: heartbeat-ingest [YYYY-MM-DD]
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+DATE="${1:-$(date -u +%Y-%m-%d)}"
+LOG_FILE="$WORKSPACE/memory/$DATE.md"
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_GREEN='\033[32m'; C_CYAN='\033[36m'; C_YELLOW='\033[33m'
+
+if [[ ! -f "$LOG_FILE" ]]; then
+  echo -e "${C_DIM}No daily log for $DATE${C_RESET}"
+  exit 0
+fi
+
+if ! command -v graphmem-sqlite &>/dev/null; then
+  echo "graphmem-sqlite not found" >&2
+  exit 1
+fi
+
+# Check if we already ingested today (marker file)
+MARKER_DIR="$WORKSPACE/memory/.ingest-markers"
+mkdir -p "$MARKER_DIR"
+MARKER="$MARKER_DIR/$DATE.done"
+
+if [[ -f "$MARKER" ]]; then
+  echo -e "${C_DIM}Already ingested $DATE (marker exists)${C_RESET}"
+  exit 0
+fi
+
+echo -e "${C_CYAN}${C_BOLD}Ingesting daily log: $DATE${C_RESET}"
+
+# Read the log file
+LOG_CONTENT=$(cat "$LOG_FILE")
+LOG_SIZE=${#LOG_CONTENT}
+
+if [[ $LOG_SIZE -lt 50 ]]; then
+  echo -e "${C_DIM}Log too short ($LOG_SIZE chars), skipping${C_RESET}"
+  exit 0
+fi
+
+# Split into chunks if large (graphmem works best with focused episodes)
+# ~2000 char chunks with section-aware splitting
+CHUNK_SIZE=2000
+CHUNKS=()
+current_chunk=""
+
+while IFS= read -r line; do
+  # If this line is a header and current chunk is substantial, flush
+  if [[ "$line" =~ ^## && ${#current_chunk} -gt 200 ]]; then
+    CHUNKS+=("$current_chunk")
+    current_chunk="$line"$'\n'
+  else
+    current_chunk+="$line"$'\n'
+    if [[ ${#current_chunk} -ge $CHUNK_SIZE ]]; then
+      CHUNKS+=("$current_chunk")
+      current_chunk=""
+    fi
+  fi
+done <<< "$LOG_CONTENT"
+
+# Don't forget the last chunk
+[[ -n "$current_chunk" ]] && CHUNKS+=("$current_chunk")
+
+echo -e "  ${C_DIM}Log size: $LOG_SIZE chars, split into ${#CHUNKS[@]} chunks${C_RESET}"
+
+SUCCESS=0
+FAIL=0
+for i in "${!CHUNKS[@]}"; do
+  chunk="${CHUNKS[$i]}"
+  # Skip tiny chunks
+  [[ ${#chunk} -lt 50 ]] && continue
+  
+  if graphmem-sqlite add "Daily log $DATE (part $((i+1))/${#CHUNKS[@]}): $chunk" 2>/dev/null; then
+    ((SUCCESS++))
+  else
+    ((FAIL++))
+  fi
+  # Small delay to avoid rate limits
+  sleep 2
+done
+
+echo -e "  ${C_GREEN}✓${C_RESET} Ingested $SUCCESS chunks ($FAIL failed)"
+
+# Write marker if at least half succeeded
+if [[ $SUCCESS -gt 0 && $SUCCESS -ge $((FAIL)) ]]; then
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$MARKER"
+  echo -e "  ${C_DIM}Marker written: $MARKER${C_RESET}"
+else
+  echo -e "  ${C_YELLOW}⚠${C_RESET} Too many failures, no marker written (will retry next heartbeat)"
+fi
