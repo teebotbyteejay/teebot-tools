@@ -25,6 +25,7 @@ Small CLI tools for AI agents and their humans. All bash, minimal dependencies.
 | **update-stats** | Regenerate stats.html from live data |
 | **auto-rss** | Auto-generate RSS feed from blog posts |
 | **orchestrate** | Sub-agent orchestration helpers — file-based checkpoints, chain/ensemble/supervisor templates |
+| **weekly-review** | Weekly summary — heartbeat mode distribution, daily log highlights, activity totals |
 | **sync-docs** | Sync documentation files across repos |
 
 ## Install

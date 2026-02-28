@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# weekly-review — weekly summary from heartbeat modes + daily memory logs
+# Usage: weekly-review [YYYY-MM-DD]  (any date in the target week, defaults to today)
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+MEM_DIR="$WORKSPACE/memory"
+HEARTBEAT="$MEM_DIR/heartbeat-state.json"
+
+# Determine week boundaries (Mon-Sun) from reference date
+REF_DATE="${1:-$(date -u +%Y-%m-%d)}"
+DOW=$(date -u -d "$REF_DATE" +%u 2>/dev/null || date -u -j -f "%Y-%m-%d" "$REF_DATE" +%u 2>/dev/null)
+WEEK_START=$(date -u -d "$REF_DATE - $((DOW - 1)) days" +%Y-%m-%d 2>/dev/null || date -u -j -f "%Y-%m-%d" "$REF_DATE" -v-"$((DOW - 1))"d +%Y-%m-%d 2>/dev/null)
+WEEK_END=$(date -u -d "$WEEK_START + 6 days" +%Y-%m-%d 2>/dev/null || date -u -j -f "%Y-%m-%d" "$WEEK_START" -v+6d +%Y-%m-%d 2>/dev/null)
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_YELLOW='\033[33m'
+C_GREEN='\033[32m'
+C_CYAN='\033[36m'
+C_MAGENTA='\033[35m'
+
+echo -e "${C_BOLD}📅 Weekly Review — ${WEEK_START} → ${WEEK_END}${C_RESET}\n"
+
+# === Section 1: Heartbeat Mode Distribution ===
+echo -e "${C_YELLOW}${C_BOLD}🫀 Heartbeat Modes${C_RESET}"
+
+if [[ -f "$HEARTBEAT" ]]; then
+  # Extract modes within the week range
+  declare -A mode_counts
+  total_beats=0
+
+  while IFS= read -r mode; do
+    mode_counts["$mode"]=$(( ${mode_counts["$mode"]:-0} + 1 ))
+    total_beats=$((total_beats + 1))
+  done < <(python3 -c "
+import json, sys
+with open('$HEARTBEAT') as f:
+    data = json.load(f)
+for h in data.get('history', []):
+    t = h.get('time', '')[:10]
+    if '$WEEK_START' <= t <= '$WEEK_END':
+        print(h.get('mode', 'unknown'))
+" 2>/dev/null)
+
+  if (( total_beats > 0 )); then
+    echo -e "  Total beats: ${C_BOLD}${total_beats}${C_RESET}"
+    # Sort by count descending
+    for mode in $(for k in "${!mode_counts[@]}"; do echo "${mode_counts[$k]} $k"; done | sort -rn | awk '{print $2}'); do
+      count="${mode_counts[$mode]}"
+      pct=$((count * 100 / total_beats))
+      bar=""
+      bar_len=$((pct / 5))
+      for ((i=0; i<bar_len; i++)); do bar+="█"; done
+      printf "  ${C_CYAN}%-12s${C_RESET} %3d (%2d%%) %s\n" "$mode" "$count" "$pct" "$bar"
+    done
+  else
+    echo -e "  ${C_DIM}No heartbeat data for this week${C_RESET}"
+  fi
+else
+  echo -e "  ${C_DIM}heartbeat-state.json not found${C_RESET}"
+fi
+
+echo ""
+
+# === Section 2: Daily Memory Summaries ===
+echo -e "${C_YELLOW}${C_BOLD}📝 Daily Logs${C_RESET}"
+
+days_with_logs=0
+current="$WEEK_START"
+while [[ "$current" < "$WEEK_END" ]] || [[ "$current" == "$WEEK_END" ]]; do
+  daily="$MEM_DIR/${current}.md"
+  dow_name=$(date -u -d "$current" +%a 2>/dev/null || date -u -j -f "%Y-%m-%d" "$current" +%a 2>/dev/null)
+
+  if [[ -f "$daily" ]]; then
+    lines=$(wc -l < "$daily")
+    words=$(wc -w < "$daily")
+    days_with_logs=$((days_with_logs + 1))
+    echo -e "  ${C_GREEN}${dow_name} ${current}${C_RESET} ${C_DIM}(${lines}L / ${words}W)${C_RESET}"
+    # Show section headers as highlights
+    grep -E "^##" "$daily" 2>/dev/null | head -5 | while read -r line; do
+      echo -e "    ${C_CYAN}${line}${C_RESET}"
+    done
+  else
+    echo -e "  ${C_DIM}${dow_name} ${current} — no log${C_RESET}"
+  fi
+
+  current=$(date -u -d "$current + 1 day" +%Y-%m-%d 2>/dev/null || date -u -j -f "%Y-%m-%d" "$current" -v+1d +%Y-%m-%d 2>/dev/null)
+done
+
+echo ""
+
+# === Section 3: Builder + Curiosity Totals ===
+BUILDER="$MEM_DIR/builder-log.md"
+CURIOSITY="$MEM_DIR/curiosity-log.md"
+
+echo -e "${C_YELLOW}${C_BOLD}⚡ Activity Totals${C_RESET}"
+
+builder_total=0
+curiosity_total=0
+commit_total=0
+
+current="$WEEK_START"
+while [[ "$current" < "$WEEK_END" ]] || [[ "$current" == "$WEEK_END" ]]; do
+  if [[ -f "$BUILDER" ]]; then
+    r=$(grep -c "^## ${current}" "$BUILDER" 2>/dev/null || true)
+    builder_total=$((builder_total + r))
+  fi
+  if [[ -f "$CURIOSITY" ]]; then
+    c=$(grep -c "^## ${current}" "$CURIOSITY" 2>/dev/null || true)
+    curiosity_total=$((curiosity_total + c))
+  fi
+  current=$(date -u -d "$current + 1 day" +%Y-%m-%d 2>/dev/null || date -u -j -f "%Y-%m-%d" "$current" -v+1d +%Y-%m-%d 2>/dev/null)
+done
+
+# Git commits across repos
+current="$WEEK_START"
+for dir in "$WORKSPACE"/*/; do
+  [[ -d "$dir/.git" ]] || continue
+  c=$(cd "$dir" && git log --oneline --after="${WEEK_START}T00:00:00Z" --before="${WEEK_END}T23:59:59Z" 2>/dev/null | wc -l || echo 0)
+  commit_total=$((commit_total + c))
+done
+
+echo -e "  Builder rounds:     ${C_BOLD}${builder_total}${C_RESET}"
+echo -e "  Curiosity sessions: ${C_BOLD}${curiosity_total}${C_RESET}"
+echo -e "  Git commits:        ${C_BOLD}${commit_total}${C_RESET}"
+echo -e "  Days with logs:     ${C_BOLD}${days_with_logs}/7${C_RESET}"
+
+echo ""
+echo -e "${C_BOLD}─────────────────────────────${C_RESET}"
+echo -e "${C_MAGENTA}${C_BOLD}Summary:${C_RESET} ${builder_total} builds, ${curiosity_total} curiosity, ${commit_total} commits across ${days_with_logs} active days"
