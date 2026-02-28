@@ -86,10 +86,11 @@ done
 
 echo -e "  ${C_GREEN}✓${C_RESET} Ingested $SUCCESS chunks ($FAIL failed)"
 
-# Write marker if at least half succeeded
-if [[ $SUCCESS -gt 0 && $SUCCESS -ge $((FAIL)) ]]; then
+# Write marker if any chunks succeeded
+if [[ $SUCCESS -gt 0 ]]; then
   date -u +%Y-%m-%dT%H:%M:%SZ > "$MARKER"
   echo -e "  ${C_DIM}Marker written: $MARKER${C_RESET}"
 else
-  echo -e "  ${C_YELLOW}⚠${C_RESET} Too many failures, no marker written (will retry next heartbeat)"
+  echo -e "  ${C_YELLOW}⚠${C_RESET} All chunks failed, no marker written (will retry next heartbeat)"
+  exit 1
 fi
