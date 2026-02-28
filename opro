@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+# opro — Prompt Self-Optimization tool
+# Measures performance, manages prompt variants, applies/rolls back changes.
+# No API keys needed — pure file manipulation + jq.
+#
+# Usage:
+#   opro measure                      Calculate composite performance score
+#   opro baseline                     Snapshot current prompt files as baseline
+#   opro suggest                      Generate suggested prompt diff from signals
+#   opro status                       Show current state, baselines, scores
+#   opro apply <patch-file> --confirm Apply a patch (with backup)
+#   opro rollback                     Revert to baseline
+#   opro history                      Show variant history
+#   opro --help                       Show this help
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+MEMORY="$WORKSPACE/memory"
+OPRO_DIR="$MEMORY/opro-variants"
+BASELINES_DIR="$OPRO_DIR/baselines"
+PATCHES_DIR="$OPRO_DIR/patches"
+STATE_FILE="$OPRO_DIR/opro-state.json"
+SCORES_FILE="$OPRO_DIR/opro-scores.jsonl"
+VARIANTS_FILE="$OPRO_DIR/variants.jsonl"
+RULES_FILE="$MEMORY/reflexion-rules.json"
+EVALS_DIR="$MEMORY/reflexion-evals"
+
+# Prompt files we optimize
+PROMPT_FILES=("AGENTS.md" "SOUL.md" "HEARTBEAT.md")
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_YELLOW='\033[33m'; C_GREEN='\033[32m'; C_RED='\033[31m'; C_CYAN='\033[36m'
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+die() { echo -e "${C_RED}✗${C_RESET} $1" >&2; exit 1; }
+info() { echo -e "  ${C_DIM}$1${C_RESET}"; }
+ok() { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+warn() { echo -e "  ${C_YELLOW}⚠${C_RESET} $1"; }
+section() { echo -e "\n${C_CYAN}${C_BOLD}$1${C_RESET}"; }
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+ensure_dirs() {
+  mkdir -p "$BASELINES_DIR" "$PATCHES_DIR"
+}
+
+ensure_state() {
+  ensure_dirs
+  if [[ ! -f "$STATE_FILE" ]]; then
+    cat > "$STATE_FILE" <<'EOF'
+{
+  "active_variant": null,
+  "activated_at": null,
+  "baseline_sessions": 0,
+  "baseline_avg_score": 0,
+  "variant_sessions": 0,
+  "variant_scores": [],
+  "min_sessions_for_eval": 5
+}
+EOF
+  fi
+  [[ -f "$SCORES_FILE" ]] || touch "$SCORES_FILE"
+  [[ -f "$VARIANTS_FILE" ]] || touch "$VARIANTS_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# measure — Calculate composite performance score
+# ---------------------------------------------------------------------------
+cmd_measure() {
+  ensure_state
+  command -v jq &>/dev/null || die "jq required"
+
+  local task_scores=()
+  local task_count=0
+  local success_count=0
+  local total_score=0
+
+  # Read reflexion eval files from last 7 days
+  if [[ -d "$EVALS_DIR" ]]; then
+    local cutoff
+    cutoff=$(date -u -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-7d +%Y-%m-%d 2>/dev/null || echo "2000-01-01")
+
+    while IFS= read -r evalfile; do
+      [[ -f "$evalfile" ]] || continue
+      local score outcome
+      score=$(jq -r '.score // 0' "$evalfile" 2>/dev/null || echo 0)
+      outcome=$(jq -r '.outcome // "unknown"' "$evalfile" 2>/dev/null || echo "unknown")
+      task_count=$((task_count + 1))
+      total_score=$((total_score + score))
+      if [[ "$outcome" == "success" ]] || [[ "$score" -ge 70 ]]; then
+        success_count=$((success_count + 1))
+      fi
+    done < <(find "$EVALS_DIR" -name '*.json' -newer <(touch -d "$cutoff" /tmp/.opro_cutoff && echo /tmp/.opro_cutoff) 2>/dev/null || find "$EVALS_DIR" -name '*.json' -mtime -7 2>/dev/null || true)
+  fi
+
+  # Calculate components
+  local task_completion=0 correction_rate=0 subagent_success=0 brevity_score=80 proactive_value=50
+
+  if [[ "$task_count" -gt 0 ]]; then
+    task_completion=$((total_score / task_count))
+    subagent_success=$((success_count * 100 / task_count))
+  else
+    task_completion=50
+    subagent_success=50
+  fi
+
+  # Read reflexion rules quality signal
+  local rule_count=0 high_confidence_rules=0
+  if [[ -f "$RULES_FILE" ]]; then
+    rule_count=$(jq '.rules | length' "$RULES_FILE" 2>/dev/null || echo 0)
+    high_confidence_rules=$(jq '[.rules[] | select(.confidence >= 70)] | length' "$RULES_FILE" 2>/dev/null || echo 0)
+  fi
+
+  # Composite score: 0.35*task + 0.25*(1-correction) + 0.20*subagent + 0.10*brevity + 0.10*proactive
+  # correction_rate stays 0 for now (no session log parsing yet)
+  local no_correction=$((100 - correction_rate))
+  local composite
+  composite=$(echo "scale=1; 0.35 * $task_completion + 0.25 * $no_correction + 0.20 * $subagent_success + 0.10 * $brevity_score + 0.10 * $proactive_value" | bc)
+
+  local timestamp
+  timestamp=$(now_iso)
+
+  local result
+  result=$(jq -n \
+    --arg ts "$timestamp" \
+    --argjson tc "$task_count" \
+    --argjson task_comp "$task_completion" \
+    --argjson corr "$correction_rate" \
+    --argjson sa "$subagent_success" \
+    --argjson brev "$brevity_score" \
+    --argjson proact "$proactive_value" \
+    --arg comp "$composite" \
+    --argjson rules "$rule_count" \
+    --argjson hc_rules "$high_confidence_rules" \
+    '{
+      timestamp: $ts,
+      tasks_evaluated: $tc,
+      components: {
+        task_completion: $task_comp,
+        correction_rate: $corr,
+        subagent_success: $sa,
+        brevity_score: $brev,
+        proactive_value: $proact
+      },
+      composite_score: ($comp | tonumber),
+      reflexion_rules: $rules,
+      high_confidence_rules: $hc_rules
+    }')
+
+  echo "$result"
+  echo "$result" | jq -c . >> "$SCORES_FILE"
+  ok "Score recorded: $composite (from $task_count tasks)"
+}
+
+# ---------------------------------------------------------------------------
+# baseline — Snapshot current prompt files
+# ---------------------------------------------------------------------------
+cmd_baseline() {
+  ensure_state
+  local timestamp
+  timestamp=$(now_iso)
+  local count=0
+
+  for f in "${PROMPT_FILES[@]}"; do
+    local src="$WORKSPACE/$f"
+    if [[ -f "$src" ]]; then
+      cp "$src" "$BASELINES_DIR/${f}.baseline"
+      count=$((count + 1))
+      info "Saved $f → baselines/${f}.baseline"
+    else
+      warn "$f not found at $src, skipping"
+    fi
+  done
+
+  # Update state
+  jq --arg ts "$timestamp" '.baseline_created = $ts' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+
+  ok "Baseline saved ($count files) at $timestamp"
+}
+
+# ---------------------------------------------------------------------------
+# suggest — Generate suggested diff from reflexion signals
+# ---------------------------------------------------------------------------
+cmd_suggest() {
+  ensure_state
+  command -v jq &>/dev/null || die "jq required"
+
+  if [[ ! -f "$RULES_FILE" ]]; then
+    die "No reflexion rules found at $RULES_FILE"
+  fi
+
+  section "Analyzing reflexion rules for prompt improvement signals..."
+
+  # Get high-confidence rules (≥50) sorted by confidence desc
+  local rules_summary
+  rules_summary=$(jq -r '
+    [.rules[] | select(.confidence >= 50)] |
+    sort_by(-.confidence) |
+    .[:10] |
+    .[] |
+    "- [\(.confidence)] \(.trigger) → \(.action)"
+  ' "$RULES_FILE" 2>/dev/null || echo "No qualifying rules")
+
+  if [[ "$rules_summary" == "No qualifying rules" ]] || [[ -z "$rules_summary" ]]; then
+    warn "No rules with confidence ≥ 50 found. Need more reflexion-eval data."
+    echo "Run more tasks and evaluate them with reflexion-eval first."
+    return 0
+  fi
+
+  echo -e "\n${C_BOLD}Top rules signaling prompt gaps:${C_RESET}"
+  echo "$rules_summary"
+
+  # Get recent scores if any
+  local recent_score="none"
+  if [[ -s "$SCORES_FILE" ]]; then
+    recent_score=$(tail -1 "$SCORES_FILE" | jq -r '.composite_score // "none"' 2>/dev/null || echo "none")
+  fi
+
+  # Identify which prompt file to target based on rule patterns
+  local target_file="AGENTS.md"
+  local rule_texts
+  rule_texts=$(jq -r '[.rules[] | select(.confidence >= 50)] | .[:10] | .[].action' "$RULES_FILE" 2>/dev/null || echo "")
+
+  # Simple heuristic: if rules mention personality/tone → SOUL.md, heartbeat/proactive → HEARTBEAT.md, else AGENTS.md
+  if echo "$rule_texts" | grep -qi -E 'tone|personality|voice|empathy|emotion'; then
+    target_file="SOUL.md"
+  elif echo "$rule_texts" | grep -qi -E 'heartbeat|proactive|periodic|check|schedule'; then
+    target_file="HEARTBEAT.md"
+  fi
+
+  info "Target file: $target_file"
+
+  # Generate a suggestion based on rules (no LLM — deterministic template)
+  local variant_id="opro-v$(date +%Y%m%d%H%M%S)"
+  local patch_file="$PATCHES_DIR/${variant_id}.patch"
+  local rationale_lines=""
+  local suggestion_lines=""
+
+  # Build suggestion from top rules
+  while IFS= read -r rule_action; do
+    [[ -z "$rule_action" ]] && continue
+    suggestion_lines="${suggestion_lines}+# Rule-derived: ${rule_action}\n"
+    rationale_lines="${rationale_lines}  - ${rule_action}\n"
+  done < <(jq -r '[.rules[] | select(.confidence >= 50)] | sort_by(-.confidence) | .[:5] | .[].action' "$RULES_FILE" 2>/dev/null)
+
+  if [[ -z "$suggestion_lines" ]]; then
+    warn "Could not generate suggestions from current rules."
+    return 0
+  fi
+
+  # Create patch file
+  local current_file="$WORKSPACE/$target_file"
+  if [[ ! -f "$current_file" ]]; then
+    die "$target_file not found"
+  fi
+
+  # Find a good insertion point (after first section header)
+  local insert_after
+  insert_after=$(grep -n '^##' "$current_file" | tail -1 | cut -d: -f1 || echo "1")
+
+  # Build a unified diff style patch
+  cat > "$patch_file" <<PATCH
+--- a/$target_file
++++ b/$target_file
+@@ Append after existing content @@
++
++## OPRO-Derived Guidelines ($variant_id)
++# Auto-suggested from reflexion rules with confidence ≥ 50
++# Review and approve before applying.
+$(echo -e "$suggestion_lines")
+PATCH
+
+  # Record variant
+  local variant_record
+  variant_record=$(jq -n \
+    --arg id "$variant_id" \
+    --arg ts "$(now_iso)" \
+    --arg tf "$target_file" \
+    --arg rat "Derived from top reflexion rules: $(echo -e "$rationale_lines" | head -3 | tr '\n' ' ')" \
+    --arg status "candidate" \
+    --arg pf "$patch_file" \
+    '{id: $id, created: $ts, target_file: $tf, rationale: $rat, status: $status, patch_file: $pf, scores_before: [], scores_after: []}')
+
+  echo "$variant_record" | jq -c . >> "$VARIANTS_FILE"
+
+  section "Suggested variant: $variant_id"
+  echo -e "Target: ${C_BOLD}$target_file${C_RESET}"
+  echo -e "Patch:  ${C_BOLD}$patch_file${C_RESET}\n"
+  cat "$patch_file"
+  echo ""
+  ok "Variant saved. Review the patch, then apply with: opro apply $patch_file --confirm"
+}
+
+# ---------------------------------------------------------------------------
+# status — Show current state
+# ---------------------------------------------------------------------------
+cmd_status() {
+  ensure_state
+
+  section "OPRO Status"
+
+  # State
+  if [[ -f "$STATE_FILE" ]]; then
+    local active
+    active=$(jq -r '.active_variant // "none"' "$STATE_FILE")
+    local activated
+    activated=$(jq -r '.activated_at // "n/a"' "$STATE_FILE")
+    local baseline_created
+    baseline_created=$(jq -r '.baseline_created // "never"' "$STATE_FILE")
+
+    echo -e "  Active variant:   ${C_BOLD}${active}${C_RESET}"
+    echo -e "  Activated at:     $activated"
+    echo -e "  Baseline created: $baseline_created"
+  fi
+
+  # Baselines
+  section "Baselines"
+  for f in "${PROMPT_FILES[@]}"; do
+    if [[ -f "$BASELINES_DIR/${f}.baseline" ]]; then
+      local ts
+      ts=$(stat -c %y "$BASELINES_DIR/${f}.baseline" 2>/dev/null | cut -d. -f1 || stat -f %Sm "$BASELINES_DIR/${f}.baseline" 2>/dev/null || echo "unknown")
+      echo -e "  ${C_GREEN}✓${C_RESET} ${f}.baseline ($ts)"
+    else
+      echo -e "  ${C_DIM}✗ ${f}.baseline (not found)${C_RESET}"
+    fi
+  done
+
+  # Recent scores
+  section "Recent Scores"
+  if [[ -s "$SCORES_FILE" ]]; then
+    tail -5 "$SCORES_FILE" | while IFS= read -r line; do
+      local ts score
+      ts=$(echo "$line" | jq -r '.timestamp // "?"' 2>/dev/null)
+      score=$(echo "$line" | jq -r '.composite_score // "?"' 2>/dev/null)
+      echo -e "  $ts  score=${C_BOLD}$score${C_RESET}"
+    done
+  else
+    info "No scores recorded yet. Run: opro measure"
+  fi
+
+  # Variants
+  section "Variants"
+  if [[ -s "$VARIANTS_FILE" ]]; then
+    local count
+    count=$(wc -l < "$VARIANTS_FILE")
+    echo -e "  Total variants: $count"
+    echo ""
+    tail -5 "$VARIANTS_FILE" | while IFS= read -r line; do
+      local id status tf
+      id=$(echo "$line" | jq -r '.id // "?"' 2>/dev/null)
+      status=$(echo "$line" | jq -r '.status // "?"' 2>/dev/null)
+      tf=$(echo "$line" | jq -r '.target_file // "?"' 2>/dev/null)
+      echo -e "  ${id}  [${status}]  → ${tf}"
+    done
+  else
+    info "No variants yet. Run: opro suggest"
+  fi
+
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# apply <patch-file> --confirm — Apply a patch
+# ---------------------------------------------------------------------------
+cmd_apply() {
+  local patch_file="${1:-}"
+  local confirm="${2:-}"
+
+  [[ -z "$patch_file" ]] && die "Usage: opro apply <patch-file> --confirm"
+  [[ "$confirm" != "--confirm" ]] && die "Safety: must pass --confirm flag to apply patches.\n  opro apply $patch_file --confirm"
+  [[ ! -f "$patch_file" ]] && die "Patch file not found: $patch_file"
+
+  ensure_state
+
+  # Check no active variant
+  local active
+  active=$(jq -r '.active_variant // "none"' "$STATE_FILE")
+  if [[ "$active" != "none" ]] && [[ "$active" != "null" ]]; then
+    die "Variant '$active' is already active. Rollback first: opro rollback"
+  fi
+
+  # Determine target file from patch
+  local target_file
+  target_file=$(grep '^--- a/' "$patch_file" | head -1 | sed 's|^--- a/||')
+  [[ -z "$target_file" ]] && die "Cannot determine target file from patch"
+
+  local src="$WORKSPACE/$target_file"
+  [[ ! -f "$src" ]] && die "Target file not found: $src"
+
+  # Ensure baseline exists
+  if [[ ! -f "$BASELINES_DIR/${target_file}.baseline" ]]; then
+    info "No baseline for $target_file, creating one now..."
+    cp "$src" "$BASELINES_DIR/${target_file}.baseline"
+  fi
+
+  # Extract the additions from the patch (lines starting with +, not +++)
+  local additions
+  additions=$(grep '^+' "$patch_file" | grep -v '^+++' | sed 's/^+//')
+
+  if [[ -z "$additions" ]]; then
+    die "No additions found in patch"
+  fi
+
+  # Append to target file
+  echo "" >> "$src"
+  echo "$additions" >> "$src"
+
+  # Extract variant ID from patch filename
+  local variant_id
+  variant_id=$(basename "$patch_file" .patch)
+
+  # Update state
+  jq --arg vid "$variant_id" --arg ts "$(now_iso)" \
+    '.active_variant = $vid | .activated_at = $ts | .variant_sessions = 0 | .variant_scores = []' \
+    "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+
+  # Update variant status in variants.jsonl
+  if [[ -s "$VARIANTS_FILE" ]]; then
+    local tmp="$VARIANTS_FILE.tmp"
+    while IFS= read -r line; do
+      local lid
+      lid=$(echo "$line" | jq -r '.id // ""' 2>/dev/null)
+      if [[ "$lid" == "$variant_id" ]]; then
+        echo "$line" | jq --arg s "active" '.status = $s'
+      else
+        echo "$line"
+      fi
+    done < "$VARIANTS_FILE" > "$tmp"
+    mv "$tmp" "$VARIANTS_FILE"
+  fi
+
+  ok "Applied $variant_id to $target_file"
+  ok "Baseline preserved at baselines/${target_file}.baseline"
+  info "Run 'opro status' to monitor. Run 'opro rollback' to revert."
+}
+
+# ---------------------------------------------------------------------------
+# rollback — Revert to baseline
+# ---------------------------------------------------------------------------
+cmd_rollback() {
+  ensure_state
+
+  local active
+  active=$(jq -r '.active_variant // "none"' "$STATE_FILE")
+
+  local restored=0
+
+  for f in "${PROMPT_FILES[@]}"; do
+    local baseline="$BASELINES_DIR/${f}.baseline"
+    local target="$WORKSPACE/$f"
+    if [[ -f "$baseline" ]]; then
+      cp "$baseline" "$target"
+      restored=$((restored + 1))
+      info "Restored $f from baseline"
+    fi
+  done
+
+  if [[ "$restored" -eq 0 ]]; then
+    die "No baselines found. Nothing to rollback."
+  fi
+
+  # Update variant status
+  if [[ "$active" != "none" ]] && [[ "$active" != "null" ]] && [[ -s "$VARIANTS_FILE" ]]; then
+    local tmp="$VARIANTS_FILE.tmp"
+    while IFS= read -r line; do
+      local lid
+      lid=$(echo "$line" | jq -r '.id // ""' 2>/dev/null)
+      if [[ "$lid" == "$active" ]]; then
+        echo "$line" | jq --arg s "rolled_back" '.status = $s'
+      else
+        echo "$line"
+      fi
+    done < "$VARIANTS_FILE" > "$tmp"
+    mv "$tmp" "$VARIANTS_FILE"
+  fi
+
+  # Reset state
+  jq '.active_variant = null | .activated_at = null | .variant_sessions = 0 | .variant_scores = []' \
+    "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+
+  ok "Rolled back to baseline ($restored files restored)"
+  [[ "$active" != "none" ]] && [[ "$active" != "null" ]] && info "Variant '$active' marked as rolled_back"
+}
+
+# ---------------------------------------------------------------------------
+# history — Show variant history
+# ---------------------------------------------------------------------------
+cmd_history() {
+  ensure_state
+
+  section "Variant History"
+
+  if [[ ! -s "$VARIANTS_FILE" ]]; then
+    info "No variants yet."
+    return 0
+  fi
+
+  echo ""
+  printf "  %-24s %-14s %-14s %s\n" "ID" "STATUS" "TARGET" "CREATED"
+  printf "  %-24s %-14s %-14s %s\n" "------------------------" "--------------" "--------------" "-------------------"
+
+  while IFS= read -r line; do
+    local id status tf created
+    id=$(echo "$line" | jq -r '.id // "?"' 2>/dev/null)
+    status=$(echo "$line" | jq -r '.status // "?"' 2>/dev/null)
+    tf=$(echo "$line" | jq -r '.target_file // "?"' 2>/dev/null)
+    created=$(echo "$line" | jq -r '.created // "?"' 2>/dev/null)
+    printf "  %-24s %-14s %-14s %s\n" "$id" "$status" "$tf" "$created"
+  done < "$VARIANTS_FILE"
+
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<'USAGE'
+opro — Prompt Self-Optimization tool
+
+Usage:
+  opro measure                      Calculate composite performance score
+  opro baseline                     Snapshot current prompt files as baseline
+  opro suggest                      Generate suggested prompt diff from signals
+  opro status                       Show current state, baselines, scores
+  opro apply <patch-file> --confirm Apply a patch (with backup)
+  opro rollback                     Revert to baseline
+  opro history                      Show variant history
+  opro --help                       Show this help
+
+Storage: memory/opro-variants/
+  variants.jsonl   — All variant records (append-only)
+  opro-state.json  — Current test state
+  opro-scores.jsonl — Per-session scores
+  baselines/       — Prompt file backups
+  patches/         — Variant patches (unified diff)
+USAGE
+}
+
+case "${1:-}" in
+  measure)   shift; cmd_measure "$@" ;;
+  baseline)  shift; cmd_baseline "$@" ;;
+  suggest)   shift; cmd_suggest "$@" ;;
+  status)    shift; cmd_status "$@" ;;
+  apply)     shift; cmd_apply "$@" ;;
+  rollback)  shift; cmd_rollback "$@" ;;
+  history)   shift; cmd_history "$@" ;;
+  --help|-h) usage ;;
+  *)         usage; exit 1 ;;
+esac
