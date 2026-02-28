@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# self-moa — Mixture of Agents orchestration tool
+# Manages file protocol for multi-agent task runs + judging framework.
+# No API keys needed — pure file manipulation + jq.
+#
+# Usage:
+#   self-moa run "<task>" [--agents N] [--strategy pick-best|merge]
+#   self-moa judge <run-id>           Compare worker outputs, generate judge prompt
+#   self-moa status                   Show recent runs and win rates
+#   self-moa history                  List past runs with scores
+#   self-moa show <run-id>            Show details of a specific run
+#   self-moa --help                   Show this help
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+MEMORY="$WORKSPACE/memory"
+MOA_DIR="$MEMORY/self-moa-runs"
+RUNS_FILE="$MOA_DIR/runs.jsonl"
+
+DEFAULT_AGENTS=3
+DEFAULT_STRATEGY="pick-best"
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_YELLOW='\033[33m'; C_GREEN='\033[32m'; C_RED='\033[31m'; C_CYAN='\033[36m'
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+die() { echo -e "${C_RED}✗${C_RESET} $1" >&2; exit 1; }
+info() { echo -e "  ${C_DIM}$1${C_RESET}"; }
+ok() { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+warn() { echo -e "  ${C_YELLOW}⚠${C_RESET} $1"; }
+section() { echo -e "\n${C_CYAN}${C_BOLD}$1${C_RESET}"; }
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+ensure_dirs() {
+  mkdir -p "$MOA_DIR"
+  [[ -f "$RUNS_FILE" ]] || touch "$RUNS_FILE"
+}
+
+gen_run_id() {
+  echo "moa-$(date -u +%Y%m%d-%H%M%S)-$(head -c4 /dev/urandom | xxd -p)"
+}
+
+# ---------------------------------------------------------------------------
+# run — Create a new MoA run
+# ---------------------------------------------------------------------------
+cmd_run() {
+  ensure_dirs
+  local task="" agents=$DEFAULT_AGENTS strategy=$DEFAULT_STRATEGY
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --agents) agents="$2"; shift 2 ;;
+      --strategy) strategy="$2"; shift 2 ;;
+      -*) die "Unknown flag: $1" ;;
+      *)
+        [[ -z "$task" ]] && task="$1" || die "Unexpected argument: $1"
+        shift ;;
+    esac
+  done
+
+  [[ -n "$task" ]] || die "Usage: self-moa run \"<task>\" [--agents N] [--strategy pick-best|merge]"
+  [[ "$strategy" == "pick-best" || "$strategy" == "merge" ]] || die "Strategy must be pick-best or merge"
+  [[ "$agents" =~ ^[0-9]+$ && "$agents" -ge 2 && "$agents" -le 10 ]] || die "Agents must be 2-10"
+
+  local run_id
+  run_id=$(gen_run_id)
+  local run_dir="$MOA_DIR/$run_id"
+  mkdir -p "$run_dir"
+
+  # Write task
+  cat > "$run_dir/task.md" <<EOF
+# MoA Task
+
+$task
+EOF
+
+  # Create placeholder worker files
+  for i in $(seq 1 "$agents"); do
+    cat > "$run_dir/worker-${i}.md" <<EOF
+# Worker $i Output
+<!-- Status: pending -->
+<!-- Write your output below -->
+EOF
+  done
+
+  # Log to runs.jsonl
+  local entry
+  entry=$(jq -nc \
+    --arg id "$run_id" \
+    --arg task "$task" \
+    --arg strategy "$strategy" \
+    --argjson agents "$agents" \
+    --arg created "$(now_iso)" \
+    --arg status "pending" \
+    '{id:$id, task:$task, strategy:$strategy, agents:$agents, created:$created, status:$status}')
+  echo "$entry" >> "$RUNS_FILE"
+
+  section "🧠 MoA Run Created"
+  ok "Run ID: ${C_BOLD}$run_id${C_RESET}"
+  info "Task: $task"
+  info "Workers: $agents | Strategy: $strategy"
+  info "Dir: $run_dir"
+
+  echo ""
+  section "📋 Worker Spawn Instructions"
+  echo -e "  Spawn ${C_BOLD}$agents${C_RESET} sub-agents with these instructions:"
+  echo ""
+  for i in $(seq 1 "$agents"); do
+    echo -e "  ${C_CYAN}Worker $i:${C_RESET}"
+    echo "    Read $run_dir/task.md"
+    echo "    Write your complete output to $run_dir/worker-${i}.md"
+    echo ""
+  done
+  echo -e "  After all workers complete, run: ${C_BOLD}self-moa judge $run_id${C_RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# judge — Generate judge prompt from worker outputs
+# ---------------------------------------------------------------------------
+cmd_judge() {
+  ensure_dirs
+  local run_id="${1:-}"
+  [[ -n "$run_id" ]] || die "Usage: self-moa judge <run-id>"
+
+  local run_dir="$MOA_DIR/$run_id"
+  [[ -d "$run_dir" ]] || die "Run not found: $run_id"
+  [[ -f "$run_dir/task.md" ]] || die "No task.md in $run_dir"
+
+  # Find worker files
+  local workers=()
+  for f in "$run_dir"/worker-*.md; do
+    [[ -f "$f" ]] && workers+=("$f")
+  done
+  [[ ${#workers[@]} -ge 2 ]] || die "Need at least 2 worker outputs"
+
+  # Check for pending workers
+  local pending=0
+  for f in "${workers[@]}"; do
+    if grep -q '<!-- Status: pending -->' "$f" 2>/dev/null; then
+      ((pending++))
+    fi
+  done
+  [[ $pending -eq 0 ]] || warn "$pending worker(s) still pending"
+
+  # Get strategy from runs.jsonl
+  local strategy
+  strategy=$(grep "\"$run_id\"" "$RUNS_FILE" | jq -r '.strategy // "pick-best"' | tail -1)
+
+  # Build judge prompt
+  local task
+  task=$(cat "$run_dir/task.md")
+
+  section "⚖️  Judge Prompt for $run_id"
+  echo ""
+  cat <<JUDGE_PROMPT
+You are a judge evaluating ${#workers[@]} agent outputs for the same task.
+
+## Task
+$task
+
+## Strategy: $strategy
+$(if [[ "$strategy" == "pick-best" ]]; then
+  echo "Score each output 1-10 on correctness, completeness, and clarity. Pick the best one."
+else
+  echo "Score each output 1-10, then synthesize the best parts of all outputs into a merged result."
+fi)
+
+## Worker Outputs
+
+JUDGE_PROMPT
+
+  local i=1
+  for f in "${workers[@]}"; do
+    echo "### Worker $i"
+    echo '```'
+    cat "$f"
+    echo '```'
+    echo ""
+    ((i++))
+  done
+
+  cat <<JUDGE_INSTRUCTIONS
+
+## Instructions
+1. Score each worker output 1-10 on: correctness, completeness, clarity
+2. Write your final result to: $run_dir/final.md
+3. Write verdict metadata to: $run_dir/verdict.json
+
+verdict.json schema:
+{
+  "taskId": "$run_id",
+  "winner": "<worker number>",
+  "strategy": "$strategy",
+  "confidence": <0.0-1.0>,
+  "reasoning": "<brief explanation>",
+  "scores": {"1": <score>, "2": <score>, ...}
+}
+JUDGE_INSTRUCTIONS
+}
+
+# ---------------------------------------------------------------------------
+# complete — Record a completed run (called after judge finishes)
+# ---------------------------------------------------------------------------
+cmd_complete() {
+  ensure_dirs
+  local run_id="${1:-}"
+  [[ -n "$run_id" ]] || die "Usage: self-moa complete <run-id>"
+
+  local run_dir="$MOA_DIR/$run_id"
+  [[ -f "$run_dir/verdict.json" ]] || die "No verdict.json found — run judge first"
+
+  # Update status in runs.jsonl
+  local tmp
+  tmp=$(mktemp)
+  while IFS= read -r line; do
+    if echo "$line" | jq -e --arg id "$run_id" '.id == $id' >/dev/null 2>&1; then
+      local winner confidence
+      winner=$(jq -r '.winner' "$run_dir/verdict.json")
+      confidence=$(jq -r '.confidence' "$run_dir/verdict.json")
+      echo "$line" | jq -c --arg s "complete" --arg w "$winner" --arg c "$confidence" --arg t "$(now_iso)" \
+        '.status=$s | .winner=$w | .confidence=($c|tonumber) | .completed=$t'
+    else
+      echo "$line"
+    fi
+  done < "$RUNS_FILE" > "$tmp"
+  mv "$tmp" "$RUNS_FILE"
+
+  ok "Run $run_id marked complete"
+  info "Winner: worker-$(jq -r '.winner' "$run_dir/verdict.json")"
+  info "Confidence: $(jq -r '.confidence' "$run_dir/verdict.json")"
+}
+
+# ---------------------------------------------------------------------------
+# status — Show recent runs and stats
+# ---------------------------------------------------------------------------
+cmd_status() {
+  ensure_dirs
+
+  section "🧠 Self-MoA Status"
+
+  local total completed pending
+  total=$(grep -c . "$RUNS_FILE" 2>/dev/null || true)
+  total=${total:-0}
+  completed=$(grep -c '"complete"' "$RUNS_FILE" 2>/dev/null || true)
+  completed=${completed:-0}
+  pending=$((total - completed))
+
+  echo ""
+  info "Total runs: $total"
+  info "Completed:  $completed"
+  info "Pending:    $pending"
+
+  if [[ "$total" -eq 0 ]]; then
+    echo ""
+    info "No runs yet. Start with: self-moa run \"<task>\""
+    return
+  fi
+
+  # Show recent runs
+  echo ""
+  section "📋 Recent Runs"
+  tail -5 "$RUNS_FILE" | while IFS= read -r line; do
+    local id status task created
+    id=$(echo "$line" | jq -r '.id')
+    status=$(echo "$line" | jq -r '.status')
+    task=$(echo "$line" | jq -r '.task' | head -c 60)
+    created=$(echo "$line" | jq -r '.created')
+
+    local status_icon
+    case "$status" in
+      complete) status_icon="${C_GREEN}✓${C_RESET}" ;;
+      pending)  status_icon="${C_YELLOW}⏳${C_RESET}" ;;
+      *)        status_icon="${C_DIM}?${C_RESET}" ;;
+    esac
+
+    echo -e "  $status_icon ${C_BOLD}$id${C_RESET} ${C_DIM}($created)${C_RESET}"
+    echo -e "    $task"
+  done
+
+  # Win rate stats
+  if [[ "$completed" -gt 0 ]]; then
+    echo ""
+    section "📊 Stats"
+    local avg_confidence
+    avg_confidence=$(grep '"complete"' "$RUNS_FILE" | jq -r '.confidence // 0' | awk '{s+=$1; n++} END {if(n>0) printf "%.1f", s/n*100; else print "N/A"}')
+    info "Avg confidence: ${avg_confidence}%"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# history — List all past runs
+# ---------------------------------------------------------------------------
+cmd_history() {
+  ensure_dirs
+
+  section "🧠 Self-MoA History"
+
+  if [[ ! -s "$RUNS_FILE" ]]; then
+    echo ""
+    info "No runs yet."
+    return
+  fi
+
+  echo ""
+  printf "  ${C_BOLD}%-30s %-10s %-8s %-8s %s${C_RESET}\n" "RUN ID" "STATUS" "AGENTS" "WINNER" "TASK"
+  printf "  ${C_DIM}%-30s %-10s %-8s %-8s %s${C_RESET}\n" "------" "------" "------" "------" "----"
+
+  while IFS= read -r line; do
+    local id status agents winner task
+    id=$(echo "$line" | jq -r '.id')
+    status=$(echo "$line" | jq -r '.status')
+    agents=$(echo "$line" | jq -r '.agents')
+    winner=$(echo "$line" | jq -r '.winner // "-"')
+    task=$(echo "$line" | jq -r '.task' | head -c 40)
+    printf "  %-30s %-10s %-8s %-8s %s\n" "$id" "$status" "$agents" "$winner" "$task"
+  done < "$RUNS_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# show — Show details of a specific run
+# ---------------------------------------------------------------------------
+cmd_show() {
+  local run_id="${1:-}"
+  [[ -n "$run_id" ]] || die "Usage: self-moa show <run-id>"
+
+  local run_dir="$MOA_DIR/$run_id"
+  [[ -d "$run_dir" ]] || die "Run not found: $run_id"
+
+  section "🧠 Run: $run_id"
+
+  echo ""
+  echo -e "${C_BOLD}Task:${C_RESET}"
+  cat "$run_dir/task.md"
+
+  echo ""
+  local workers=0
+  for f in "$run_dir"/worker-*.md; do
+    [[ -f "$f" ]] || continue
+    ((workers++))
+    local name
+    name=$(basename "$f" .md)
+    local status_line
+    if grep -q '<!-- Status: pending -->' "$f" 2>/dev/null; then
+      echo -e "  ${C_YELLOW}⏳${C_RESET} $name — pending"
+    else
+      local lines
+      lines=$(wc -l < "$f" | tr -d ' ')
+      echo -e "  ${C_GREEN}✓${C_RESET} $name — $lines lines"
+    fi
+  done
+
+  if [[ -f "$run_dir/verdict.json" ]]; then
+    echo ""
+    echo -e "${C_BOLD}Verdict:${C_RESET}"
+    jq '.' "$run_dir/verdict.json"
+  fi
+
+  if [[ -f "$run_dir/final.md" ]]; then
+    echo ""
+    echo -e "${C_BOLD}Final output:${C_RESET} $run_dir/final.md"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  run)      cmd_run "$@" ;;
+  judge)    cmd_judge "$@" ;;
+  complete) cmd_complete "$@" ;;
+  status)   cmd_status ;;
+  history)  cmd_history ;;
+  show)     cmd_show "$@" ;;
+  --help|-h|help|"")
+    echo "self-moa — Mixture of Agents orchestration tool"
+    echo ""
+    echo "Usage:"
+    echo "  self-moa run \"<task>\" [--agents N] [--strategy pick-best|merge]"
+    echo "  self-moa judge <run-id>           Generate judge prompt from worker outputs"
+    echo "  self-moa complete <run-id>        Record completed run (after verdict.json exists)"
+    echo "  self-moa status                   Show recent runs and stats"
+    echo "  self-moa history                  List all past runs"
+    echo "  self-moa show <run-id>            Show run details"
+    echo "  self-moa --help                   Show this help"
+    ;;
+  *) die "Unknown command: $cmd. Run self-moa --help" ;;
+esac

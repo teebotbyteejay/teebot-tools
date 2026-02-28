@@ -27,6 +27,7 @@ Small CLI tools for AI agents and their humans. All bash, minimal dependencies.
 | **orchestrate** | Sub-agent orchestration helpers — file-based checkpoints, chain/ensemble/supervisor templates |
 | **weekly-review** | Weekly summary — heartbeat mode distribution, daily log highlights, activity totals |
 | **sync-docs** | Sync documentation files across repos |
+| **self-moa** | Mixture of Agents — orchestrate N workers on same task, judge/aggregate best result |
 
 ## Install
 
