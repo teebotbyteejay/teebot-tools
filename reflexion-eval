@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+# reflexion-eval — post-task reflection & behavioral rule extraction
+# Part of teebot-tools. Uses OpenAI gpt-4o-mini to evaluate tasks and extract rules.
+#
+# Usage:
+#   reflexion-eval evaluate '<task>' '<outcome>'   Evaluate a task, extract rules
+#   reflexion-eval rules [--min-confidence N]       List active rules
+#   reflexion-eval match '<task_description>'        Find rules matching a task
+#   reflexion-eval reinforce <rule_id> <task_id>     Add positive evidence to rule
+#   reflexion-eval contradict <rule_id> <task_id>    Add negative evidence to rule
+#   reflexion-eval decay                             Decay stale rules, archive weak ones
+#   reflexion-eval stats                             Show rule store statistics
+#   reflexion-eval --help                            Show this help
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+RULES_FILE="$WORKSPACE/memory/reflexion-rules.json"
+EVALS_DIR="$WORKSPACE/memory/reflexion-evals"
+LLM_MODEL="gpt-4o-mini"
+DECAY_DAYS=14
+DECAY_AMOUNT=5
+ARCHIVE_THRESHOLD=20
+MAX_ACTIVE_RULES=50
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_YELLOW='\033[33m'; C_GREEN='\033[32m'; C_RED='\033[31m'; C_CYAN='\033[36m'
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+die() { echo -e "${C_RED}✗${C_RESET} $1" >&2; exit 1; }
+info() { echo -e "  ${C_DIM}$1${C_RESET}"; }
+ok() { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+warn() { echo -e "  ${C_YELLOW}⚠${C_RESET} $1"; }
+section() { echo -e "\n${C_CYAN}${C_BOLD}$1${C_RESET}"; }
+
+ensure_deps() {
+  command -v jq &>/dev/null || die "jq required but not found"
+  command -v curl &>/dev/null || die "curl required but not found"
+  [[ -n "${OPENAI_API_KEY:-}" ]] || die "OPENAI_API_KEY not set"
+}
+
+ensure_rules_file() {
+  mkdir -p "$(dirname "$RULES_FILE")"
+  if [[ ! -f "$RULES_FILE" ]]; then
+    echo '{"version":1,"rules":[],"archived":[]}' | jq . > "$RULES_FILE"
+    info "Created $RULES_FILE"
+  fi
+}
+
+ensure_evals_dir() {
+  mkdir -p "$EVALS_DIR"
+}
+
+now_iso() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+uuid() {
+  # Portable UUID generation
+  if command -v uuidgen &>/dev/null; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  else
+    cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())"
+  fi
+}
+
+# Call OpenAI chat completion
+openai_chat() {
+  local system_prompt="$1"
+  local user_prompt="$2"
+
+  local payload
+  payload=$(jq -n \
+    --arg model "$LLM_MODEL" \
+    --arg sys "$system_prompt" \
+    --arg usr "$user_prompt" \
+    '{
+      model: $model,
+      messages: [
+        {role: "system", content: $sys},
+        {role: "user", content: $usr}
+      ],
+      temperature: 0.3,
+      response_format: {type: "json_object"}
+    }')
+
+  local response
+  response=$(curl -sS --max-time 60 \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    "https://api.openai.com/v1/chat/completions")
+
+  # Extract content from response
+  local content
+  content=$(echo "$response" | jq -r '.choices[0].message.content // empty')
+  if [[ -z "$content" ]]; then
+    local err
+    err=$(echo "$response" | jq -r '.error.message // "Unknown API error"')
+    die "OpenAI API error: $err"
+  fi
+  echo "$content"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_evaluate() {
+  local task="${1:-}"
+  local outcome="${2:-}"
+  [[ -z "$task" ]] && die "Usage: reflexion-eval evaluate '<task>' '<outcome>'"
+  [[ -z "$outcome" ]] && die "Usage: reflexion-eval evaluate '<task>' '<outcome>'"
+
+  ensure_deps
+  ensure_rules_file
+  ensure_evals_dir
+
+  section "Evaluating task"
+  info "Task: ${task:0:80}..."
+
+  local system_prompt
+  system_prompt='You are a task evaluation system for an AI agent. Analyze the completed task and extract behavioral rules.
+
+Return JSON with this exact structure:
+{
+  "success": true/false,
+  "score": 0-100 (overall quality),
+  "what_worked": ["specific thing 1", "specific thing 2"],
+  "what_failed": ["specific thing 1", "specific thing 2"],
+  "rules": [
+    {
+      "trigger": "when <specific situation>",
+      "action": "<specific behavioral guidance>",
+      "reasoning": "why this rule matters"
+    }
+  ]
+}
+
+Rules should be:
+- Specific enough to be actionable (not "be careful")
+- General enough to apply across tasks (not "use file X")
+- Based on actual evidence from this task
+- 0-3 rules per evaluation (quality over quantity)
+- trigger should describe WHEN to apply the rule
+- action should describe WHAT to do'
+
+  local user_prompt="Task description: $task
+
+Task outcome: $outcome
+
+Evaluate this task. What worked? What failed? What behavioral rules should be extracted for future tasks?"
+
+  echo -e "  ${C_DIM}Calling $LLM_MODEL...${C_RESET}"
+  local eval_json
+  eval_json=$(openai_chat "$system_prompt" "$user_prompt")
+
+  # Validate JSON
+  if ! echo "$eval_json" | jq . &>/dev/null; then
+    die "Invalid JSON from LLM: $eval_json"
+  fi
+
+  local success score
+  success=$(echo "$eval_json" | jq -r '.success')
+  score=$(echo "$eval_json" | jq -r '.score')
+
+  # Display results
+  if [[ "$success" == "true" ]]; then
+    ok "Success (score: $score/100)"
+  else
+    warn "Failure (score: $score/100)"
+  fi
+
+  echo -e "\n  ${C_BOLD}What worked:${C_RESET}"
+  echo "$eval_json" | jq -r '.what_worked[]? // empty' | while read -r line; do
+    echo -e "    ${C_GREEN}+${C_RESET} $line"
+  done
+
+  echo -e "\n  ${C_BOLD}What failed:${C_RESET}"
+  echo "$eval_json" | jq -r '.what_failed[]? // empty' | while read -r line; do
+    echo -e "    ${C_RED}-${C_RESET} $line"
+  done
+
+  # Process rules
+  local rule_count
+  rule_count=$(echo "$eval_json" | jq '.rules | length')
+
+  if [[ "$rule_count" -gt 0 ]]; then
+    echo -e "\n  ${C_BOLD}Extracted rules:${C_RESET}"
+
+    local eval_id
+    eval_id=$(uuid)
+    local timestamp
+    timestamp=$(now_iso)
+
+    for i in $(seq 0 $((rule_count - 1))); do
+      local trigger action reasoning rule_id
+      trigger=$(echo "$eval_json" | jq -r ".rules[$i].trigger")
+      action=$(echo "$eval_json" | jq -r ".rules[$i].action")
+      reasoning=$(echo "$eval_json" | jq -r ".rules[$i].reasoning // \"\"")
+      rule_id=$(uuid)
+
+      echo -e "    ${C_CYAN}→${C_RESET} $trigger: $action"
+      [[ -n "$reasoning" ]] && info "      ($reasoning)"
+
+      # Check for similar existing rules (simple keyword overlap)
+      local existing_match
+      existing_match=$(jq -r --arg trig "$trigger" --arg act "$action" '
+        .rules[] | select(
+          (.trigger | ascii_downcase | contains($trig | ascii_downcase | split(" ")[2:4] | join(" "))) or
+          (.action | ascii_downcase | contains($act | ascii_downcase | split(" ")[0:3] | join(" ")))
+        ) | .id' "$RULES_FILE" 2>/dev/null | head -1)
+
+      if [[ -n "$existing_match" ]]; then
+        # Reinforce existing rule
+        info "      Reinforcing existing rule $existing_match"
+        _reinforce_rule "$existing_match" "$eval_id"
+      else
+        # Add new rule
+        local new_rule
+        new_rule=$(jq -n \
+          --arg id "$rule_id" \
+          --arg trigger "$trigger" \
+          --arg action "$action" \
+          --arg reasoning "$reasoning" \
+          --arg eval_id "$eval_id" \
+          --arg ts "$timestamp" \
+          '{
+            id: $id,
+            trigger: $trigger,
+            action: $action,
+            reasoning: $reasoning,
+            confidence: 50,
+            evidence: [$eval_id],
+            created: $ts,
+            updated: $ts
+          }')
+
+        # Check active rule cap
+        local active_count
+        active_count=$(jq '.rules | length' "$RULES_FILE")
+        if [[ "$active_count" -ge "$MAX_ACTIVE_RULES" ]]; then
+          # Archive lowest confidence rule
+          local lowest_id
+          lowest_id=$(jq -r '[.rules[] | {id, confidence}] | sort_by(.confidence) | .[0].id' "$RULES_FILE")
+          warn "Rule cap ($MAX_ACTIVE_RULES) reached. Archiving lowest: $lowest_id"
+          _archive_rule "$lowest_id"
+        fi
+
+        # Insert new rule
+        local tmp
+        tmp=$(mktemp)
+        jq --argjson rule "$new_rule" '.rules += [$rule]' "$RULES_FILE" > "$tmp" && mv "$tmp" "$RULES_FILE"
+        ok "New rule: $rule_id"
+      fi
+    done
+  else
+    info "No rules extracted"
+  fi
+
+  # Save evaluation
+  local eval_file="$EVALS_DIR/${eval_id}.json"
+  local full_eval
+  full_eval=$(jq -n \
+    --arg id "$eval_id" \
+    --arg task "$task" \
+    --arg outcome "$outcome" \
+    --arg ts "$(now_iso)" \
+    --argjson eval "$eval_json" \
+    '{
+      id: $id,
+      task: $task,
+      outcome: $outcome,
+      timestamp: $ts,
+      evaluation: $eval
+    }')
+  echo "$full_eval" | jq . > "$eval_file"
+  info "Saved evaluation: $eval_file"
+}
+
+cmd_rules() {
+  ensure_rules_file
+
+  local min_confidence=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --min-confidence) min_confidence="${2:-0}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  section "Active Rules (confidence ≥ $min_confidence)"
+
+  local count
+  count=$(jq --argjson min "$min_confidence" '[.rules[] | select(.confidence >= $min)] | length' "$RULES_FILE")
+
+  if [[ "$count" -eq 0 ]]; then
+    info "No rules found"
+    return 0
+  fi
+
+  jq -r --argjson min "$min_confidence" '
+    .rules[] | select(.confidence >= $min) |
+    "  \(.trigger) → \(.action)\n    confidence: \(.confidence) | evidence: \(.evidence | length) tasks | updated: \(.updated)\n"
+  ' "$RULES_FILE"
+
+  info "Total: $count active rules"
+
+  local archived
+  archived=$(jq '.archived | length' "$RULES_FILE")
+  [[ "$archived" -gt 0 ]] && info "Archived: $archived rules"
+}
+
+cmd_match() {
+  local task="${1:-}"
+  [[ -z "$task" ]] && die "Usage: reflexion-eval match '<task_description>'"
+
+  ensure_rules_file
+
+  section "Matching rules for task"
+
+  # Simple keyword matching: extract significant words from task, match against triggers
+  local task_lower
+  task_lower=$(echo "$task" | tr '[:upper:]' '[:lower:]')
+
+  local matches=0
+  echo -e "\n## Learned Rules (from prior tasks)" 
+
+  while IFS= read -r rule_json; do
+    local trigger action confidence
+    trigger=$(echo "$rule_json" | jq -r '.trigger')
+    action=$(echo "$rule_json" | jq -r '.action')
+    confidence=$(echo "$rule_json" | jq -r '.confidence')
+    local evidence_count
+    evidence_count=$(echo "$rule_json" | jq '.evidence | length')
+
+    # Check confidence threshold
+    [[ "$confidence" -lt 40 ]] && continue
+
+    # Keyword matching: split trigger into words, check if any significant words appear in task
+    local trigger_lower
+    trigger_lower=$(echo "$trigger" | tr '[:upper:]' '[:lower:]')
+
+    # Extract content words (skip stop words)
+    local match_found=false
+    for word in $(echo "$trigger_lower" | tr -cs '[:alpha:]' '\n' | grep -vE '^(when|the|a|an|is|are|in|on|at|to|for|of|with|and|or|it|this|that|do|be|have|from|by)$'); do
+      [[ ${#word} -lt 3 ]] && continue
+      if echo "$task_lower" | grep -qw "$word"; then
+        match_found=true
+        break
+      fi
+    done
+
+    if [[ "$match_found" == "true" ]]; then
+      echo "- $trigger: $action (confidence: $confidence, evidence: $evidence_count tasks)"
+      matches=$((matches + 1))
+    fi
+  done < <(jq -c '.rules[]' "$RULES_FILE" 2>/dev/null)
+
+  if [[ "$matches" -eq 0 ]]; then
+    info "No matching rules found"
+  else
+    echo ""
+    info "$matches rules matched"
+  fi
+}
+
+cmd_reinforce() {
+  local rule_id="${1:-}"
+  local task_id="${2:-}"
+  [[ -z "$rule_id" ]] && die "Usage: reflexion-eval reinforce <rule_id> <task_id>"
+  [[ -z "$task_id" ]] && die "Usage: reflexion-eval reinforce <rule_id> <task_id>"
+
+  ensure_rules_file
+  _reinforce_rule "$rule_id" "$task_id"
+  ok "Reinforced rule $rule_id (added evidence: $task_id)"
+}
+
+cmd_contradict() {
+  local rule_id="${1:-}"
+  local task_id="${2:-}"
+  [[ -z "$rule_id" ]] && die "Usage: reflexion-eval contradict <rule_id> <task_id>"
+  [[ -z "$task_id" ]] && die "Usage: reflexion-eval contradict <rule_id> <task_id>"
+
+  ensure_rules_file
+  _contradict_rule "$rule_id" "$task_id"
+  ok "Contradicted rule $rule_id (added counter-evidence: $task_id)"
+}
+
+cmd_decay() {
+  ensure_rules_file
+
+  section "Rule Decay"
+
+  local now_epoch
+  now_epoch=$(date -u +%s)
+  local decay_threshold=$((now_epoch - DECAY_DAYS * 86400))
+
+  local decayed=0
+  local archived=0
+
+  # Process each rule
+  local tmp
+  tmp=$(mktemp)
+  cp "$RULES_FILE" "$tmp"
+
+  local rule_count
+  rule_count=$(jq '.rules | length' "$tmp")
+
+  for i in $(seq $((rule_count - 1)) -1 0); do
+    local updated
+    updated=$(jq -r ".rules[$i].updated" "$tmp")
+    local updated_epoch
+    updated_epoch=$(date -u -d "$updated" +%s 2>/dev/null || echo "$now_epoch")
+
+    if [[ "$updated_epoch" -lt "$decay_threshold" ]]; then
+      local old_conf new_conf rule_id
+      old_conf=$(jq -r ".rules[$i].confidence" "$tmp")
+      new_conf=$((old_conf - DECAY_AMOUNT))
+      [[ "$new_conf" -lt 0 ]] && new_conf=0
+      rule_id=$(jq -r ".rules[$i].id" "$tmp")
+
+      if [[ "$new_conf" -lt "$ARCHIVE_THRESHOLD" ]]; then
+        # Archive it
+        _archive_rule "$rule_id"
+        archived=$((archived + 1))
+        info "Archived: $rule_id (confidence: $old_conf → $new_conf)"
+      else
+        # Decay confidence
+        local tmp2
+        tmp2=$(mktemp)
+        jq --argjson i "$i" --argjson conf "$new_conf" --arg ts "$(now_iso)" \
+          '.rules[$i].confidence = $conf | .rules[$i].updated = $ts' "$RULES_FILE" > "$tmp2" && mv "$tmp2" "$RULES_FILE"
+        decayed=$((decayed + 1))
+        info "Decayed: $rule_id ($old_conf → $new_conf)"
+      fi
+    fi
+  done
+
+  rm -f "$tmp"
+  ok "Decayed: $decayed rules, Archived: $archived rules"
+}
+
+cmd_stats() {
+  ensure_rules_file
+
+  section "Reflexion Stats"
+
+  local active archived avg_conf total_evidence most_reinforced_id most_reinforced_count eval_count
+
+  active=$(jq '.rules | length' "$RULES_FILE")
+  archived=$(jq '.archived | length' "$RULES_FILE")
+
+  if [[ "$active" -eq 0 ]]; then
+    info "No rules yet. Run 'reflexion-eval evaluate' to start learning."
+    return 0
+  fi
+
+  avg_conf=$(jq '[.rules[].confidence] | add / length | floor' "$RULES_FILE")
+  total_evidence=$(jq '[.rules[].evidence | length] | add' "$RULES_FILE")
+
+  most_reinforced_id=$(jq -r '[.rules[] | {id, count: (.evidence | length)}] | sort_by(.count) | last | .id' "$RULES_FILE")
+  most_reinforced_count=$(jq -r '[.rules[] | {id, count: (.evidence | length)}] | sort_by(.count) | last | .count' "$RULES_FILE")
+
+  eval_count=$(find "$EVALS_DIR" -name "*.json" 2>/dev/null | wc -l)
+
+  echo -e "  Active rules:      ${C_BOLD}$active${C_RESET}"
+  echo -e "  Archived rules:    $archived"
+  echo -e "  Avg confidence:    $avg_conf"
+  echo -e "  Total evidence:    $total_evidence references"
+  echo -e "  Most reinforced:   $most_reinforced_id ($most_reinforced_count evidence)"
+  echo -e "  Evaluations:       $eval_count"
+}
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_reinforce_rule() {
+  local rule_id="$1"
+  local task_id="$2"
+  local timestamp
+  timestamp=$(now_iso)
+
+  local tmp
+  tmp=$(mktemp)
+  jq --arg id "$rule_id" --arg task "$task_id" --arg ts "$timestamp" '
+    .rules = [.rules[] |
+      if .id == $id then
+        .confidence = ((.confidence + 10) | if . > 100 then 100 else . end) |
+        .evidence += [$task] |
+        .updated = $ts
+      else . end
+    ]' "$RULES_FILE" > "$tmp" && mv "$tmp" "$RULES_FILE"
+}
+
+_contradict_rule() {
+  local rule_id="$1"
+  local task_id="$2"
+  local timestamp
+  timestamp=$(now_iso)
+
+  local tmp
+  tmp=$(mktemp)
+  jq --arg id "$rule_id" --arg task "$task_id" --arg ts "$timestamp" '
+    .rules = [.rules[] |
+      if .id == $id then
+        .confidence = ((.confidence - 15) | if . < 0 then 0 else . end) |
+        .evidence += [$task] |
+        .updated = $ts
+      else . end
+    ]' "$RULES_FILE" > "$tmp" && mv "$tmp" "$RULES_FILE"
+}
+
+_archive_rule() {
+  local rule_id="$1"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg id "$rule_id" '
+    (.rules[] | select(.id == $id)) as $rule |
+    .archived += [$rule + {archived_at: (now | todate)}] |
+    .rules = [.rules[] | select(.id != $id)]
+  ' "$RULES_FILE" > "$tmp" && mv "$tmp" "$RULES_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+show_help() {
+  echo -e "${C_BOLD}reflexion-eval${C_RESET} — post-task reflection & behavioral rule extraction"
+  echo ""
+  echo "Usage:"
+  echo "  reflexion-eval evaluate '<task>' '<outcome>'   Evaluate a task, extract rules"
+  echo "  reflexion-eval rules [--min-confidence N]       List active rules"
+  echo "  reflexion-eval match '<task_description>'        Find rules matching a task"
+  echo "  reflexion-eval reinforce <rule_id> <task_id>     Add positive evidence"
+  echo "  reflexion-eval contradict <rule_id> <task_id>    Add negative evidence"
+  echo "  reflexion-eval decay                             Decay stale rules"
+  echo "  reflexion-eval stats                             Show statistics"
+  echo ""
+  echo "Environment:"
+  echo "  OPENAI_API_KEY    Required for 'evaluate' command"
+  echo "  WORKSPACE         Override workspace dir (default: ~/.openclaw/workspace)"
+  echo ""
+  echo "Files:"
+  echo "  memory/reflexion-rules.json    Rule store (active + archived)"
+  echo "  memory/reflexion-evals/        Individual evaluation records"
+}
+
+case "${1:-}" in
+  evaluate)   shift; cmd_evaluate "$@" ;;
+  rules)      shift; cmd_rules "$@" ;;
+  match)      shift; cmd_match "$@" ;;
+  reinforce)  shift; cmd_reinforce "$@" ;;
+  contradict) shift; cmd_contradict "$@" ;;
+  decay)      cmd_decay ;;
+  stats)      cmd_stats ;;
+  --help|-h)  show_help ;;
+  *)          show_help; exit 1 ;;
+esac
