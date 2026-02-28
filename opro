@@ -8,7 +8,7 @@
 #   opro baseline                     Snapshot current prompt files as baseline
 #   opro suggest                      Generate suggested prompt diff from signals
 #   opro status                       Show current state, baselines, scores
-#   opro apply <patch-file> --confirm Apply a patch (with backup)
+#   opro apply <patch-file> Apply a patch (with backup)
 #   opro rollback                     Revert to baseline
 #   opro history                      Show variant history
 #   opro --help                       Show this help
@@ -293,7 +293,7 @@ PATCH
   echo -e "Patch:  ${C_BOLD}$patch_file${C_RESET}\n"
   cat "$patch_file"
   echo ""
-  ok "Variant saved. Review the patch, then apply with: opro apply $patch_file --confirm"
+  ok "Variant saved. Apply with: opro apply $patch_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -365,14 +365,12 @@ cmd_status() {
 }
 
 # ---------------------------------------------------------------------------
-# apply <patch-file> --confirm — Apply a patch
+# apply <patch-file> — Apply a patch
 # ---------------------------------------------------------------------------
 cmd_apply() {
   local patch_file="${1:-}"
-  local confirm="${2:-}"
 
-  [[ -z "$patch_file" ]] && die "Usage: opro apply <patch-file> --confirm"
-  [[ "$confirm" != "--confirm" ]] && die "Safety: must pass --confirm flag to apply patches.\n  opro apply $patch_file --confirm"
+  [[ -z "$patch_file" ]] && die "Usage: opro apply <patch-file>"
   [[ ! -f "$patch_file" ]] && die "Patch file not found: $patch_file"
 
   ensure_state
@@ -528,7 +526,7 @@ Usage:
   opro baseline                     Snapshot current prompt files as baseline
   opro suggest                      Generate suggested prompt diff from signals
   opro status                       Show current state, baselines, scores
-  opro apply <patch-file> --confirm Apply a patch (with backup)
+  opro apply <patch-file> Apply a patch (with backup)
   opro rollback                     Revert to baseline
   opro history                      Show variant history
   opro --help                       Show this help
