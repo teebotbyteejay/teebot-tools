@@ -10,6 +10,7 @@
 #   status <task>       Show status of all steps in a task
 #   step <task> <name>  Print the output file path for a step (creates parent dir)
 #   template <pattern>  Print a prompt template for a pattern (chain|ensemble|supervisor)
+#   budget <task>       Print remaining seconds until deadline (exit 1 if expired)
 #   clean <task>        Remove a task workspace
 
 set -uo pipefail
@@ -22,13 +23,57 @@ _dir() {
 
 _init() {
   local task="$1"
+  shift
+  local deadline=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --deadline) deadline="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
   local dir="$ORCH_BASE/$task"
   mkdir -p "$dir"
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) initialized" > "$dir/.meta"
+  local meta="$(date -u +%Y-%m-%dT%H:%M:%SZ) initialized"
+  if [[ -n "$deadline" ]]; then
+    # If numeric, treat as seconds from now; otherwise assume ISO timestamp
+    if [[ "$deadline" =~ ^[0-9]+$ ]]; then
+      deadline="$(date -u -d "+${deadline} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+    fi
+    meta="$meta"$'\n'"deadline=$deadline"
+  fi
+  echo "$meta" > "$dir/.meta"
   echo "✓ Task workspace: $dir"
+  [[ -n "$deadline" ]] && echo "  Deadline: $deadline"
   echo ""
   echo "Use in subagent prompts:"
   echo "  \"Write your output to $dir/step-NAME.md\""
+}
+
+_budget() {
+  local task="$1"
+  local dir="$ORCH_BASE/$task"
+  if [[ ! -f "$dir/.meta" ]]; then
+    echo "❌ No workspace for task '$task'" >&2
+    exit 1
+  fi
+  local deadline=$(grep '^deadline=' "$dir/.meta" | head -1 | cut -d= -f2-)
+  if [[ -z "$deadline" ]]; then
+    echo "∞"
+    return 0
+  fi
+  local now=$(date -u +%s)
+  local end=$(date -u -d "$deadline" +%s 2>/dev/null)
+  if [[ -z "$end" ]]; then
+    echo "❌ Cannot parse deadline: $deadline" >&2
+    exit 1
+  fi
+  local remaining=$((end - now))
+  if ((remaining <= 0)); then
+    echo "0"
+    echo "❌ Deadline expired $((-remaining))s ago" >&2
+    exit 1
+  fi
+  echo "$remaining"
 }
 
 _check() {
@@ -95,6 +140,7 @@ _template() {
 #
 #   "Do [TASK]. Read input from [INPUT_FILE] if it exists.
 #    Write your complete output to [OUTPUT_FILE].
+#    DEADLINE={{deadline}}
 #    Be thorough — the next step depends on your output."
 #
 # Main agent pseudocode:
@@ -168,12 +214,13 @@ _read() {
 }
 
 case "${1:-help}" in
-  init)     shift; _init "$1" ;;
+  init)     shift; _init "$@" ;;
   dir)      shift; _dir "$1" ;;
   check)    shift; _check "$1" ;;
   status)   shift; _status "$1" ;;
   step)     shift; _step "$1" "$2" ;;
   read)     shift; _read "$1" "$2" ;;
+  budget)   shift; _budget "$1" ;;
   template) shift; _template "$1" ;;
   clean)    shift; _clean "$1" ;;
   -h|--help|help)
@@ -182,11 +229,12 @@ case "${1:-help}" in
     echo "Sub-agent orchestration helpers. Filesystem as message bus."
     echo ""
     echo "Commands:"
-    echo "  init <task>           Create task workspace"
+    echo "  init <task> [--deadline <ISO|seconds>]  Create task workspace"
     echo "  dir <task>            Print workspace dir path"
     echo "  step <task> <name>    Print output file path for a step"
     echo "  check <task>          List all step outputs"
     echo "  read <task> <step>    Read a step's output"
+    echo "  budget <task>         Print remaining seconds until deadline"
     echo "  status <task>         Show task progress"
     echo "  template <pattern>    Print prompt template (chain|ensemble|supervisor)"
     echo "  clean <task>          Remove task workspace"
