@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# corrections — track and report capability corrections from Teejay
+# Usage:
+#   corrections log <category> <what> <correction> [lesson]
+#   corrections report [--days N]
+#   corrections trend [--weeks N]
+
+set -euo pipefail
+
+C_BOLD="\033[1m"
+C_DIM="\033[2m"
+C_RED="\033[31m"
+C_GREEN="\033[32m"
+C_YELLOW="\033[33m"
+C_CYAN="\033[36m"
+C_RESET="\033[0m"
+
+CORRECTIONS_FILE="${CORRECTIONS_FILE:-$HOME/.openclaw/workspace/memory/corrections.jsonl}"
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  log)
+    category="${1:?Usage: corrections log <category> <what> <correction> [lesson]}"
+    what="${2:?Missing: what happened}"
+    correction="${3:?Missing: what the correction was}"
+    lesson="${4:-}"
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    
+    entry=$(jq -nc \
+      --arg ts "$ts" \
+      --arg cat "$category" \
+      --arg what "$what" \
+      --arg corr "$correction" \
+      --arg lesson "$lesson" \
+      '{ts:$ts, category:$cat, what:$what, correction:$corr, lesson:$lesson}')
+    
+    echo "$entry" >> "$CORRECTIONS_FILE"
+    echo -e "${C_GREEN}✓${C_RESET} Logged ${C_CYAN}$category${C_RESET} correction at $ts"
+    ;;
+    
+  report)
+    days="${1:-7}"
+    cutoff=$(date -u -d "$days days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-${days}d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "2000-01-01")
+    
+    if [[ ! -f "$CORRECTIONS_FILE" ]]; then
+      echo "No corrections file found."
+      exit 0
+    fi
+    
+    total=$(jq -r --arg cutoff "$cutoff" 'select(.ts >= $cutoff)' "$CORRECTIONS_FILE" | jq -s 'length')
+    
+    echo -e "${C_BOLD}Corrections Report (last ${days} days)${C_RESET}"
+    echo -e "${C_BOLD}Total: ${total}${C_RESET}\n"
+    
+    # By category
+    echo -e "${C_BOLD}By category:${C_RESET}"
+    jq -r --arg cutoff "$cutoff" 'select(.ts >= $cutoff) | .category' "$CORRECTIONS_FILE" | sort | uniq -c | sort -rn | while read count cat; do
+      case "$cat" in
+        knowledge)  color="$C_RED" ;;
+        judgment)   color="$C_YELLOW" ;;
+        repetition) color="$C_CYAN" ;;
+        priority)   color="$C_GREEN" ;;
+        *)          color="$C_DIM" ;;
+      esac
+      echo -e "  ${color}${cat}${C_RESET}: ${count}"
+    done
+    
+    echo ""
+    echo -e "${C_BOLD}Recent:${C_RESET}"
+    jq -r --arg cutoff "$cutoff" 'select(.ts >= $cutoff) | "  \(.ts | split("T")[0]) [\(.category)] \(.what | .[0:80])"' "$CORRECTIONS_FILE" | tail -10
+    
+    # Lessons
+    echo ""
+    echo -e "${C_BOLD}Lessons learned:${C_RESET}"
+    jq -r --arg cutoff "$cutoff" 'select(.ts >= $cutoff and .lesson != "") | "  → \(.lesson)"' "$CORRECTIONS_FILE"
+    ;;
+    
+  trend)
+    weeks="${1:-4}"
+    if [[ ! -f "$CORRECTIONS_FILE" ]]; then
+      echo "No corrections file found."
+      exit 0
+    fi
+    
+    echo -e "${C_BOLD}Correction Trend (last ${weeks} weeks)${C_RESET}\n"
+    
+    for ((i=weeks-1; i>=0; i--)); do
+      start=$(date -u -d "$((i*7+7)) days ago" +%Y-%m-%d 2>/dev/null || date -u -v-$((i*7+7))d +%Y-%m-%d)
+      end=$(date -u -d "$((i*7)) days ago" +%Y-%m-%d 2>/dev/null || date -u -v-$((i*7))d +%Y-%m-%d)
+      count=$(jq -r --arg s "${start}T00:00:00Z" --arg e "${end}T23:59:59Z" 'select(.ts >= $s and .ts <= $e)' "$CORRECTIONS_FILE" 2>/dev/null | jq -s 'length')
+      bar=$(printf '█%.0s' $(seq 1 ${count:-0}) 2>/dev/null || echo "")
+      echo -e "  ${C_DIM}${start}${C_RESET}  ${bar:-·} ${count}"
+    done
+    ;;
+    
+  count)
+    if [[ ! -f "$CORRECTIONS_FILE" ]]; then
+      echo "0"
+      exit 0
+    fi
+    jq -s 'length' "$CORRECTIONS_FILE"
+    ;;
+    
+  help|*)
+    echo -e "${C_BOLD}corrections${C_RESET} — track capability corrections"
+    echo ""
+    echo "  log <category> <what> <correction> [lesson]"
+    echo "    Categories: knowledge, judgment, repetition, priority"
+    echo ""
+    echo "  report [days]     Show corrections from last N days (default 7)"
+    echo "  trend [weeks]     Show weekly trend (default 4)"
+    echo "  count             Total correction count"
+    ;;
+esac
