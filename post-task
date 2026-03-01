@@ -1,31 +1,39 @@
 #!/usr/bin/env bash
-# post-task — evaluate a completed task and extract behavioral rules
-# Wrapper around reflexion-eval that also ingests into graphmem if notable.
+# post-task — evaluate a completed task, close the reflexion feedback loop
+# 1. Runs reflexion-eval evaluate (extracts new rules)
+# 2. Checks which pre-task rules were followed/ignored → reinforce/contradict
+# 3. Ingests into graphmem
 #
 # Usage: post-task "task description" "outcome summary"
 # Options:
 #   --score-only    Just output the score (for scripting)
 #   --no-graph      Skip graphmem ingestion
+#   --no-feedback   Skip rule feedback loop
 set -euo pipefail
 
 TASK="${1:-}"
 OUTCOME="${2:-}"
 SCORE_ONLY=false
 NO_GRAPH=false
+NO_FEEDBACK=false
 
 for arg in "$@"; do
   case "$arg" in
     --score-only) SCORE_ONLY=true ;;
     --no-graph) NO_GRAPH=true ;;
+    --no-feedback) NO_FEEDBACK=true ;;
   esac
 done
 
 [[ -z "$TASK" ]] && { echo "Usage: post-task '<task>' '<outcome>'" >&2; exit 1; }
 [[ -z "$OUTCOME" ]] && { echo "Usage: post-task '<task>' '<outcome>'" >&2; exit 1; }
 
-C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_CYAN='\033[36m'
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+PRETASK_FILE="$WORKSPACE/memory/last-pretask.json"
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_CYAN='\033[36m'; C_YELLOW='\033[33m'; C_DIM='\033[2m'
 
-# --- Run reflexion evaluation ---
+# --- Run reflexion evaluation (extract new rules) ---
+eval_id=""
 if command -v reflexion-eval &>/dev/null; then
   eval_output=$(reflexion-eval evaluate "$TASK" "$OUTCOME" 2>&1)
   
@@ -36,13 +44,85 @@ if command -v reflexion-eval &>/dev/null; then
   
   echo -e "${C_CYAN}${C_BOLD}Post-task evaluation${C_RESET}"
   echo "$eval_output"
-else
-  echo "reflexion-eval not found, skipping evaluation" >&2
+  
+  # Extract eval ID from output if available
+  eval_id=$(echo "$eval_output" | grep -oP 'eval_id=\K[a-f0-9-]+' || echo "post-$(date +%s)")
 fi
 
-# --- Ingest into graphmem if notable ---
+# --- Rule Feedback Loop ---
+if ! $NO_FEEDBACK && [[ -f "$PRETASK_FILE" ]] && command -v reflexion-eval &>/dev/null; then
+  pretask_task=$(jq -r '.task // ""' "$PRETASK_FILE" 2>/dev/null)
+  rule_count=$(jq '.matched_rules | length' "$PRETASK_FILE" 2>/dev/null || echo 0)
+  
+  if [[ "$rule_count" -gt 0 ]]; then
+    echo -e "\n${C_CYAN}${C_BOLD}Rule Feedback Loop${C_RESET} ($rule_count rules to evaluate)"
+    
+    # Build a summary of matched rules for the LLM
+    rules_summary=$(jq -r '.matched_rules[] | "- [\(.id)] WHEN \(.trigger) → \(.action)"' "$PRETASK_FILE" 2>/dev/null)
+    
+    # Ask LLM to evaluate which rules were followed
+    if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+      system_prompt="You evaluate whether behavioral rules were followed during a task. For each rule, respond with a JSON array of objects: {\"id\": \"rule-id\", \"verdict\": \"reinforced\" or \"contradicted\" or \"not_applicable\", \"reason\": \"brief explanation\"}. Only output the JSON array, nothing else."
+      
+      user_prompt="Task: $TASK
+
+Outcome: $OUTCOME
+
+Rules that were available during this task:
+$rules_summary
+
+For each rule, was it followed (reinforced), violated (contradicted), or not relevant (not_applicable)?"
+
+      response=$(curl -s --max-time 30 "https://api.openai.com/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $OPENAI_API_KEY" \
+        -d "$(jq -n --arg sys "$system_prompt" --arg usr "$user_prompt" '{
+          model: "gpt-4o-mini",
+          messages: [{role: "system", content: $sys}, {role: "user", content: $usr}],
+          temperature: 0.1
+        }')" 2>/dev/null)
+      
+      verdicts=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null | sed 's/^```json//;s/^```//;s/```$//' || echo "[]")
+      
+      # Process verdicts
+      reinforced=0
+      contradicted=0
+      skipped=0
+      
+      while IFS= read -r verdict_json; do
+        [[ -z "$verdict_json" || "$verdict_json" == "null" ]] && continue
+        rid=$(echo "$verdict_json" | jq -r '.id' 2>/dev/null)
+        v=$(echo "$verdict_json" | jq -r '.verdict' 2>/dev/null)
+        reason=$(echo "$verdict_json" | jq -r '.reason' 2>/dev/null)
+        
+        [[ -z "$rid" || "$rid" == "null" ]] && continue
+        
+        case "$v" in
+          reinforced)
+            reflexion-eval reinforce "$rid" "$eval_id" 2>/dev/null && \
+              echo -e "  ${C_GREEN}✓${C_RESET} Reinforced: $reason" || true
+            reinforced=$((reinforced + 1))
+            ;;
+          contradicted)
+            reflexion-eval contradict "$rid" "$eval_id" 2>/dev/null && \
+              echo -e "  ${C_YELLOW}✗${C_RESET} Contradicted: $reason" || true
+            contradicted=$((contradicted + 1))
+            ;;
+          *)
+            skipped=$((skipped + 1))
+            ;;
+        esac
+      done < <(echo "$verdicts" | jq -c '.[]' 2>/dev/null)
+      
+      echo -e "\n  ${C_DIM}Feedback: $reinforced reinforced, $contradicted contradicted, $skipped skipped${C_RESET}"
+    else
+      echo -e "  ${C_YELLOW}⚠${C_RESET} OPENAI_API_KEY not set — skipping rule feedback"
+    fi
+  fi
+fi
+
+# --- Ingest into graphmem ---
 if ! $NO_GRAPH && command -v graphmem-sqlite &>/dev/null; then
-  # Only ingest if the outcome is substantial (more than 20 chars)
   if [[ ${#OUTCOME} -gt 20 ]]; then
     graphmem-sqlite add "Task: $TASK. Outcome: $OUTCOME" 2>/dev/null && \
       echo -e "\n  ${C_GREEN}✓${C_RESET} Added to graph memory" || true

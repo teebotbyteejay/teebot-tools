@@ -369,6 +369,42 @@ cmd_match() {
   fi
 }
 
+cmd_match_json() {
+  # Like match but outputs JSON array of matched rule IDs + text for machine consumption
+  local task="${1:-}"
+  [[ -z "$task" ]] && die "Usage: reflexion-eval match-json '<task_description>'"
+  ensure_rules_file
+
+  local task_lower
+  task_lower=$(echo "$task" | tr '[:upper:]' '[:lower:]')
+
+  local results="[]"
+  while IFS= read -r rule_json; do
+    local trigger confidence id
+    trigger=$(echo "$rule_json" | jq -r '.trigger')
+    confidence=$(echo "$rule_json" | jq -r '.confidence')
+    id=$(echo "$rule_json" | jq -r '.id')
+    [[ "$confidence" -lt 40 ]] && continue
+
+    local trigger_lower
+    trigger_lower=$(echo "$trigger" | tr '[:upper:]' '[:lower:]')
+    local match_found=false
+    for word in $(echo "$trigger_lower" | tr -cs '[:alpha:]' '\n' | grep -vE '^(when|the|a|an|is|are|in|on|at|to|for|of|with|and|or|it|this|that|do|be|have|from|by)$'); do
+      [[ ${#word} -lt 3 ]] && continue
+      if echo "$task_lower" | grep -qw "$word"; then
+        match_found=true
+        break
+      fi
+    done
+
+    if [[ "$match_found" == "true" ]]; then
+      results=$(echo "$results" | jq --argjson rule "$rule_json" '. + [$rule]')
+    fi
+  done < <(jq -c '.rules[]' "$RULES_FILE" 2>/dev/null)
+
+  echo "$results"
+}
+
 cmd_reinforce() {
   local rule_id="${1:-}"
   local task_id="${2:-}"
@@ -556,6 +592,7 @@ case "${1:-}" in
   evaluate)   shift; cmd_evaluate "$@" ;;
   rules)      shift; cmd_rules "$@" ;;
   match)      shift; cmd_match "$@" ;;
+  match-json) shift; cmd_match_json "$@" ;;
   reinforce)  shift; cmd_reinforce "$@" ;;
   contradict) shift; cmd_contradict "$@" ;;
   decay)      cmd_decay ;;

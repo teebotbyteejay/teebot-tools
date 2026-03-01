@@ -2,6 +2,8 @@
 # pre-task — gather context before spawning a task/sub-agent
 # Pulls reflexion rules + graphmem context for a task description.
 # Output: markdown block suitable for injecting into a task prompt.
+# Side effect: saves matched rule IDs to ~/.openclaw/workspace/memory/last-pretask.json
+#   so post-task can close the feedback loop.
 #
 # Usage: pre-task "build a CLI tool for X"
 set -euo pipefail
@@ -9,12 +11,16 @@ set -euo pipefail
 TASK="${1:-}"
 [[ -z "$TASK" ]] && { echo "Usage: pre-task '<task description>'" >&2; exit 1; }
 
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+PRETASK_FILE="$WORKSPACE/memory/last-pretask.json"
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'; C_CYAN='\033[36m'
 
 output=""
+matched_rules_json="[]"
 
 # --- Reflexion Rules ---
 if command -v reflexion-eval &>/dev/null; then
+  # Get human-readable output
   rules=$(reflexion-eval match "$TASK" 2>/dev/null | grep -v "^$" | grep -v "matched$" | grep -v "^Matching" || true)
   if [[ -n "$rules" && ! "$rules" =~ "0 rules matched" ]]; then
     output+="## Learned Rules (from prior experience)
@@ -22,11 +28,16 @@ $rules
 
 "
   fi
+  # Get machine-readable matched rules for feedback loop
+  matched_rules_json=$(reflexion-eval match-json "$TASK" 2>/dev/null || echo "[]")
 fi
+
+# Save pretask context for post-task feedback loop
+jq -n --arg task "$TASK" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson rules "$matched_rules_json" \
+  '{task: $task, timestamp: $ts, matched_rules: $rules}' > "$PRETASK_FILE" 2>/dev/null || true
 
 # --- Graph Memory Context ---
 if command -v graphmem-sqlite &>/dev/null; then
-  # Use full task description for semantic search
   graph_results=$(graphmem-sqlite search "$TASK" 2>/dev/null | head -8 || true)
   if [[ -n "$graph_results" && ! "$graph_results" =~ "No results" ]]; then
     output+="## Relevant Memory (graph)
