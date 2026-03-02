@@ -1,26 +1,45 @@
 #!/usr/bin/env bash
 # pre-task — gather context before spawning a task/sub-agent
-# Pulls reflexion rules + graphmem context for a task description.
-# Output: markdown block suitable for injecting into a task prompt.
-# Side effect: saves matched rule IDs to ~/.openclaw/workspace/memory/last-pretask.json
-#   so post-task can close the feedback loop.
+# Enhanced with memory distillation (filter before inject) and unified LTM+STM retrieval.
+#
+# Pipeline:
+#   1. Match reflexion rules
+#   2. Graph search (LTM) — entities, relationships, episodes
+#   3. Recent daily log search (STM) — last 3 days, keyword-matched sections
+#   4. LLM distillation — filter all retrieved context for relevance to THIS task
+#   5. Persist: matched rules + injected context → last-pretask.json (for post-task feedback)
 #
 # Usage: pre-task "build a CLI tool for X"
+# Options:
+#   --no-distill   Skip LLM filtering (dump raw context)
+#   --verbose      Show pre/post distillation context
 set -euo pipefail
 
 TASK="${1:-}"
 [[ -z "$TASK" ]] && { echo "Usage: pre-task '<task description>'" >&2; exit 1; }
 
+NO_DISTILL=false
+VERBOSE=false
+for arg in "$@"; do
+  case "$arg" in
+    --no-distill) NO_DISTILL=true ;;
+    --verbose) VERBOSE=true ;;
+  esac
+done
+
 WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
-PRETASK_FILE="$WORKSPACE/memory/last-pretask.json"
-C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'; C_CYAN='\033[36m'
+MEMORY_DIR="$WORKSPACE/memory"
+PRETASK_FILE="$MEMORY_DIR/last-pretask.json"
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'; C_CYAN='\033[36m'; C_GREEN='\033[32m'
 
 output=""
 matched_rules_json="[]"
+raw_ltm=""
+raw_stm=""
+distilled_context=""
 
-# --- Reflexion Rules ---
+# --- 1. Reflexion Rules ---
 if command -v reflexion-eval &>/dev/null; then
-  # Get human-readable output
   rules=$(reflexion-eval match "$TASK" 2>/dev/null | grep -v "^$" | grep -v "matched$" | grep -v "^Matching" || true)
   if [[ -n "$rules" && ! "$rules" =~ "0 rules matched" ]]; then
     output+="## Learned Rules (from prior experience)
@@ -28,24 +47,147 @@ $rules
 
 "
   fi
-  # Get machine-readable matched rules for feedback loop
   matched_rules_json=$(reflexion-eval match-json "$TASK" 2>/dev/null || echo "[]")
 fi
 
-# Save pretask context for post-task feedback loop
-jq -n --arg task "$TASK" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson rules "$matched_rules_json" \
-  '{task: $task, timestamp: $ts, matched_rules: $rules}' > "$PRETASK_FILE" 2>/dev/null || true
-
-# --- Graph Memory Context ---
+# --- 2. Graph Memory (LTM) ---
 if command -v graphmem-sqlite &>/dev/null; then
-  graph_results=$(graphmem-sqlite search "$TASK" 2>/dev/null | head -8 || true)
-  if [[ -n "$graph_results" && ! "$graph_results" =~ "No results" ]]; then
-    output+="## Relevant Memory (graph)
-$graph_results
+  raw_ltm=$(graphmem-sqlite search "$TASK" --limit 8 2>/dev/null | head -20 || true)
+fi
 
+# --- 3. Recent Daily Logs (STM) ---
+# Extract keywords from task description (stop words removed, 2+ char tokens)
+keywords=$(echo "$TASK" | tr '[:upper:]' '[:lower:]' | \
+  grep -oP '\b[a-z]{3,}\b' | \
+  grep -vxF -e 'the' -e 'and' -e 'for' -e 'that' -e 'this' -e 'with' -e 'from' -e 'have' -e 'been' -e 'will' -e 'should' -e 'could' -e 'would' -e 'into' -e 'than' -e 'them' -e 'then' -e 'some' -e 'also' -e 'just' -e 'about' -e 'more' -e 'when' -e 'what' -e 'which' -e 'does' -e 'done' -e 'build' -e 'make' -e 'task' | \
+  sort -u | head -10 || true)
+
+if [[ -n "$keywords" ]]; then
+  # Search last 3 days of daily logs
+  recent_logs=()
+  for days_ago in 0 1 2; do
+    log_date=$(date -d "$days_ago days ago" +%Y-%m-%d 2>/dev/null || date -v-${days_ago}d +%Y-%m-%d 2>/dev/null)
+    log_file="$MEMORY_DIR/${log_date}.md"
+    [[ -f "$log_file" ]] && recent_logs+=("$log_file")
+  done
+
+  if [[ ${#recent_logs[@]} -gt 0 ]]; then
+    # Build grep pattern from top keywords
+    pattern=$(echo "$keywords" | head -5 | paste -sd'|' -)
+    
+    # Extract matching sections (heading-delimited blocks with keyword matches)
+    stm_results=""
+    for log_file in "${recent_logs[@]}"; do
+      log_name=$(basename "$log_file" .md)
+      # Find sections that contain keywords, extract heading + first 5 lines
+      matches=$(awk -v pat="$pattern" '
+        /^##/ { section=$0; content=""; lines=0 }
+        { content = content "\n" $0; lines++ }
+        tolower($0) ~ pat && section != "" && lines <= 20 {
+          if (!seen[section]++) {
+            print "### " FILENAME " — " section
+            # Print next few lines for context
+            printed=0
+          }
+          if (printed++ < 5) print $0
+        }
+      ' "$log_file" 2>/dev/null || true)
+      
+      if [[ -n "$matches" ]]; then
+        stm_results+="[$log_name]
+$matches
 "
+      fi
+    done
+    
+    # Fallback: simple grep with context if awk found nothing
+    if [[ -z "$stm_results" ]]; then
+      stm_results=$(grep -l -iE "$pattern" "${recent_logs[@]}" 2>/dev/null | while read -r f; do
+        echo "### $(basename "$f" .md)"
+        grep -iE "$pattern" "$f" 2>/dev/null | head -8
+        echo ""
+      done || true)
+    fi
+    
+    raw_stm="$stm_results"
   fi
 fi
+
+# --- 4. LLM Distillation ---
+# Combine raw LTM + STM, then filter for relevance
+raw_combined=""
+[[ -n "$raw_ltm" && ! "$raw_ltm" =~ "No results" ]] && raw_combined+="=== Graph Memory (LTM) ===
+$raw_ltm
+
+"
+[[ -n "$raw_stm" ]] && raw_combined+="=== Recent Logs (STM) ===
+$raw_stm
+
+"
+
+if [[ -n "$raw_combined" ]] && ! $NO_DISTILL && [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  $VERBOSE && echo -e "${C_DIM}Raw context (pre-distillation): ${#raw_combined} chars${C_RESET}" >&2
+  
+  system_prompt="You are a memory distillation filter. Given a task description and retrieved memory context, output ONLY the pieces that are directly relevant to the task. Remove noise, tangential info, and duplicates. Be aggressive — less is more. Output markdown. If nothing is relevant, output 'No relevant context found.'"
+  
+  user_prompt="TASK: $TASK
+
+RETRIEVED CONTEXT:
+$raw_combined
+
+Output only the relevant pieces, organized clearly:"
+
+  response=$(curl -s --max-time 20 "https://api.openai.com/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -d "$(jq -n --arg sys "$system_prompt" --arg usr "$user_prompt" '{
+      model: "gpt-4o-mini",
+      messages: [{role: "system", content: $sys}, {role: "user", content: $usr}],
+      temperature: 0.1,
+      max_tokens: 500
+    }')" 2>/dev/null)
+  
+  distilled=$(echo "$response" | jq -r '.choices[0].message.content // ""' 2>/dev/null)
+  
+  if [[ -n "$distilled" && "$distilled" != "null" && ! "$distilled" =~ "No relevant context found" ]]; then
+    distilled_context="$distilled"
+    output+="## Relevant Memory (distilled)
+$distilled_context
+
+"
+    $VERBOSE && echo -e "${C_DIM}Distilled context: ${#distilled_context} chars (${#raw_combined} → ${#distilled_context})${C_RESET}" >&2
+  else
+    # Distillation found nothing relevant — fall back to raw LTM
+    if [[ -n "$raw_ltm" && ! "$raw_ltm" =~ "No results" ]]; then
+      output+="## Relevant Memory (graph)
+$raw_ltm
+
+"
+    fi
+  fi
+elif [[ -n "$raw_combined" ]]; then
+  # No distillation — output raw (LTM only for backward compat, plus STM if found)
+  [[ -n "$raw_ltm" && ! "$raw_ltm" =~ "No results" ]] && output+="## Relevant Memory (graph)
+$raw_ltm
+
+"
+  [[ -n "$raw_stm" ]] && output+="## Recent Context (daily logs)
+$raw_stm
+
+"
+fi
+
+# --- 5. Persist for post-task feedback ---
+jq -n \
+  --arg task "$TASK" \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --argjson rules "$matched_rules_json" \
+  --arg raw_ltm "${raw_ltm:0:2000}" \
+  --arg raw_stm "${raw_stm:0:2000}" \
+  --arg distilled "${distilled_context:0:2000}" \
+  --argjson distilled_used "$(if [[ -n "$distilled_context" ]]; then echo true; else echo false; fi)" \
+  '{task: $task, timestamp: $ts, matched_rules: $rules, retrieval: {raw_ltm: $raw_ltm, raw_stm: $raw_stm, distilled: $distilled, distilled_used: $distilled_used}}' \
+  > "$PRETASK_FILE" 2>/dev/null || true
 
 # --- Output ---
 if [[ -n "$output" ]]; then

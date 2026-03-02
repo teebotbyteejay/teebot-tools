@@ -136,6 +136,52 @@ For each rule, was it followed (reinforced), violated (contradicted), or not rel
   fi
 fi
 
+# --- Retrieval Quality Feedback ---
+if ! $NO_FEEDBACK && [[ -f "$PRETASK_FILE" ]] && [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  distilled_used=$(jq -r '.retrieval.distilled_used // false' "$PRETASK_FILE" 2>/dev/null)
+  distilled_context=$(jq -r '.retrieval.distilled // ""' "$PRETASK_FILE" 2>/dev/null)
+  
+  if [[ "$distilled_used" == "true" && -n "$distilled_context" ]]; then
+    echo -e "\n${C_CYAN}${C_BOLD}Retrieval Quality Feedback${C_RESET}"
+    
+    system_prompt="Rate how useful the retrieved context was for completing this task. Output JSON: {\"retrieval_score\": 1-5, \"reason\": \"brief explanation\", \"what_was_missing\": \"what context would have helped but wasn't retrieved\"}. 1=useless noise, 3=somewhat helpful, 5=exactly what was needed. Only output the JSON."
+    
+    user_prompt="Task: $TASK
+Outcome: $OUTCOME
+
+Context that was retrieved and injected:
+$distilled_context"
+
+    ret_response=$(curl -s --max-time 15 "https://api.openai.com/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d "$(jq -n --arg sys "$system_prompt" --arg usr "$user_prompt" '{
+        model: "gpt-4o-mini",
+        messages: [{role: "system", content: $sys}, {role: "user", content: $usr}],
+        temperature: 0.1,
+        max_tokens: 200
+      }')" 2>/dev/null)
+    
+    ret_eval=$(echo "$ret_response" | jq -r '.choices[0].message.content // ""' 2>/dev/null | sed 's/^```json//;s/^```//;s/```$//')
+    ret_score=$(echo "$ret_eval" | jq -r '.retrieval_score // "?"' 2>/dev/null || echo "?")
+    ret_reason=$(echo "$ret_eval" | jq -r '.reason // ""' 2>/dev/null || echo "")
+    ret_missing=$(echo "$ret_eval" | jq -r '.what_was_missing // ""' 2>/dev/null || echo "")
+    
+    echo -e "  Retrieval score: ${C_BOLD}$ret_score/5${C_RESET} — $ret_reason"
+    [[ -n "$ret_missing" && "$ret_missing" != "null" ]] && echo -e "  ${C_DIM}Missing: $ret_missing${C_RESET}"
+    
+    # Persist retrieval feedback into eval file
+    eval_file=$(ls -t "$WORKSPACE/memory/reflexion-evals/"*.json 2>/dev/null | head -1)
+    if [[ -n "$eval_file" ]]; then
+      tmp=$(mktemp)
+      jq --argjson ret_feedback "$(echo "$ret_eval" | jq -c '.' 2>/dev/null || echo '{}')" \
+        '. + {retrieval_feedback: $ret_feedback}' \
+        "$eval_file" > "$tmp" 2>/dev/null && mv "$tmp" "$eval_file" && \
+        echo -e "  ${C_GREEN}✓${C_RESET} Retrieval feedback persisted" || rm -f "$tmp"
+    fi
+  fi
+fi
+
 # --- Ingest into graphmem ---
 if ! $NO_GRAPH && command -v graphmem-sqlite &>/dev/null; then
   if [[ ${#OUTCOME} -gt 20 ]]; then
