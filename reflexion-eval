@@ -124,6 +124,12 @@ cmd_evaluate() {
   info "Task: ${task:0:80}..."
 
   local system_prompt
+  # Get existing rule triggers to avoid duplicates
+  local existing_triggers=""
+  if [[ -f "$RULES_FILE" ]]; then
+    existing_triggers=$(jq -r '[.active[].trigger] | join("; ")' "$RULES_FILE" 2>/dev/null | head -c 1000 || true)
+  fi
+
   system_prompt='You are a task evaluation system for an AI agent. Analyze the completed task and extract behavioral rules.
 
 Return JSON with this exact structure:
@@ -141,19 +147,37 @@ Return JSON with this exact structure:
   ]
 }
 
-Rules should be:
-- Specific enough to be actionable (not "be careful")
-- General enough to apply across tasks (not "use file X")
-- Based on actual evidence from this task
-- 0-3 rules per evaluation (quality over quantity)
-- trigger should describe WHEN to apply the rule
-- action should describe WHAT to do'
+RULE QUALITY IS CRITICAL. Most rules are useless platitudes. Only extract rules that:
+1. Come from something SURPRISING or PAINFUL in this specific task
+2. Would change behavior in a non-obvious way (not just "be thorough" or "test your code")
+3. Are specific enough that you could tell whether someone followed them
+
+BAD rules (DO NOT generate these):
+- "when developing a system → ensure clear communication" (generic advice)
+- "when completing a task → implement error handling" (obvious)
+- "when working with a team → encourage diverse viewpoints" (platitude)
+- "when building a tool → test it before deploying" (everyone knows this)
+
+GOOD rules (generate rules like these):
+- "when a bash script uses set -e with grep → add || true to grep calls that may return no matches" (specific, from pain)
+- "when migrating databases → use SQLite over novel options like Kuzu; community support matters more than features" (learned from failure)
+- "when episode metadata exists but is unused → audit the API surface; designed-but-not-wired is a recurring pattern" (non-obvious insight)
+
+If nothing surprising happened, return an EMPTY rules array. Zero rules is better than generic rules.
+Do NOT duplicate existing rules.'
+
+  local existing_rules_section=""
+  if [[ -n "$existing_triggers" ]]; then
+    existing_rules_section="
+EXISTING RULES (do not duplicate):
+$existing_triggers"
+  fi
 
   local user_prompt="Task description: $task
 
 Task outcome: $outcome
-
-Evaluate this task. What worked? What failed? What behavioral rules should be extracted for future tasks?"
+$existing_rules_section
+Evaluate this task. What worked? What failed? Extract rules ONLY if something surprising or painful happened. Empty rules array is fine."
 
   echo -e "  ${C_DIM}Calling $LLM_MODEL...${C_RESET}"
   local eval_json
@@ -189,13 +213,13 @@ Evaluate this task. What worked? What failed? What behavioral rules should be ex
   local rule_count
   rule_count=$(echo "$eval_json" | jq '.rules | length')
 
+  local eval_id
+  eval_id=$(uuid)
+  local timestamp
+  timestamp=$(now_iso)
+
   if [[ "$rule_count" -gt 0 ]]; then
     echo -e "\n  ${C_BOLD}Extracted rules:${C_RESET}"
-
-    local eval_id
-    eval_id=$(uuid)
-    local timestamp
-    timestamp=$(now_iso)
 
     for i in $(seq 0 $((rule_count - 1))); do
       local trigger action reasoning rule_id

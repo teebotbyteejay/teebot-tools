@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# reflexion-prune — audit and prune generic/platitude rules from the reflexion store
+# Uses LLM to classify rules as specific (keep) or generic (archive)
+#
+# Usage: reflexion-prune [--dry-run]
+set -euo pipefail
+
+DRY_RUN=false
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+RULES_FILE="$WORKSPACE/memory/reflexion-rules.json"
+
+[[ -z "${OPENAI_API_KEY:-}" ]] && { echo "OPENAI_API_KEY required" >&2; exit 1; }
+[[ ! -f "$RULES_FILE" ]] && { echo "No rules file" >&2; exit 1; }
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'; C_CYAN='\033[36m'
+
+# Extract all active rules
+rules_text=$(jq -r '.rules[] | "[\(.id)] WHEN \(.trigger) → \(.action) (confidence: \(.confidence))"' "$RULES_FILE" 2>/dev/null)
+rule_count=$(jq '.rules | length' "$RULES_FILE" 2>/dev/null)
+
+echo -e "${C_CYAN}${C_BOLD}Reflexion Rule Audit${C_RESET}"
+echo -e "  Active rules: $rule_count"
+echo ""
+
+system_prompt='You are an expert at evaluating behavioral rules for an AI agent. Classify each rule as:
+- "specific": Learned from real experience. Non-obvious. Would change behavior. Worth keeping.
+- "generic": Could be found in any software engineering textbook. Obvious. Platitude. Should be archived.
+
+For each rule, output a JSON array of objects:
+[{"id": "rule-id", "verdict": "specific" or "generic", "reason": "1-sentence explanation"}]
+
+Be AGGRESSIVE about marking rules as generic. If a junior developer would already know it, it is generic.
+Only output the JSON array.'
+
+user_prompt="Classify each rule:
+
+$rules_text"
+
+echo -e "${C_DIM}Calling gpt-4o-mini for classification...${C_RESET}"
+
+response=$(curl -s --max-time 45 "https://api.openai.com/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d "$(jq -n --arg sys "$system_prompt" --arg usr "$user_prompt" '{
+    model: "gpt-4o-mini",
+    messages: [{role: "system", content: $sys}, {role: "user", content: $usr}],
+    temperature: 0.1
+  }')" 2>/dev/null)
+
+verdicts=$(echo "$response" | jq -r '.choices[0].message.content // ""' 2>/dev/null | sed 's/^```json//;s/^```//;s/```$//')
+
+specific_count=0
+generic_count=0
+archived_ids=()
+
+echo ""
+while IFS= read -r item; do
+  [[ -z "$item" || "$item" == "null" ]] && continue
+  id=$(echo "$item" | jq -r '.id' 2>/dev/null)
+  verdict=$(echo "$item" | jq -r '.verdict' 2>/dev/null)
+  reason=$(echo "$item" | jq -r '.reason' 2>/dev/null)
+  
+  [[ -z "$id" || "$id" == "null" ]] && continue
+  
+  # Get the rule trigger for display
+  trigger=$(jq -r --arg id "$id" '.rules[] | select(.id == $id) | .trigger' "$RULES_FILE" 2>/dev/null | head -1)
+  
+  if [[ "$verdict" == "generic" ]]; then
+    echo -e "  ${C_RED}✗ GENERIC${C_RESET} $trigger"
+    echo -e "    ${C_DIM}$reason${C_RESET}"
+    archived_ids+=("$id")
+    generic_count=$((generic_count + 1))
+  else
+    echo -e "  ${C_GREEN}✓ SPECIFIC${C_RESET} $trigger"
+    echo -e "    ${C_DIM}$reason${C_RESET}"
+    specific_count=$((specific_count + 1))
+  fi
+done < <(echo "$verdicts" | jq -c '.[]' 2>/dev/null)
+
+echo ""
+echo -e "${C_BOLD}Summary:${C_RESET} $specific_count specific, $generic_count generic"
+
+if [[ ${#archived_ids[@]} -eq 0 ]]; then
+  echo "No rules to archive."
+  exit 0
+fi
+
+if $DRY_RUN; then
+  echo -e "${C_YELLOW}DRY RUN — no changes made. Run without --dry-run to archive ${#archived_ids[@]} generic rules.${C_RESET}"
+  exit 0
+fi
+
+# Archive generic rules
+echo ""
+echo -e "${C_CYAN}Archiving ${#archived_ids[@]} generic rules...${C_RESET}"
+tmp=$(mktemp)
+for id in "${archived_ids[@]}"; do
+  # Move from active to archived
+  jq --arg id "$id" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    (.rules[] | select(.id == $id)) as $rule |
+    if $rule then
+      .archived += [$rule + {archived_at: $ts, archive_reason: "generic_platitude"}] |
+      .rules = [.rules[] | select(.id != $id)]
+    else . end
+  ' "$RULES_FILE" > "$tmp" && mv "$tmp" "$RULES_FILE"
+done
+
+new_count=$(jq '.rules | length' "$RULES_FILE" 2>/dev/null)
+echo -e "${C_GREEN}✓${C_RESET} Archived $generic_count rules. Active rules: $new_count"
