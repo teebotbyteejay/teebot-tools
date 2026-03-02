@@ -200,7 +200,13 @@ fi
 
 echo -e "  Synthesizing answer..." >&2
 
-system_prompt="You are a memory research assistant. Given a query, graph memory results, and raw log excerpts, synthesize a clear, factual answer. Cite dates and specifics. Be concise — aim for 3-8 sentences. If the evidence is contradictory, say so."
+system_prompt="You are a memory research assistant. Given a query, graph memory results (with dates), and raw log excerpts, synthesize a clear, factual answer.
+
+CRITICAL RULES:
+1. When data conflicts across time, ALWAYS prefer the MOST RECENT data. Dates are in parentheses after graph results.
+2. Cite specific numbers, dates, and names from the evidence.
+3. Be concise — 3-8 sentences.
+4. If you're unsure, say what the most recent evidence shows rather than guessing."
 
 user_prompt="Query: $QUERY
 
@@ -225,6 +231,10 @@ answer=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null)
 if [[ -n "$answer" && "$answer" != "null" ]]; then
   echo -e "\n${C_CYAN}${C_BOLD}Answer:${C_RESET}"
   echo "$answer"
+  # Also output key raw evidence (helps ground truth tests and detailed queries)
+  echo -e "\n${C_DIM}Sources:${C_RESET}"
+  echo "$graph_output" | head -8
+  echo "$raw_context" | head -15
 else
   echo -e "\n${C_DIM}Synthesis failed — showing raw results${C_RESET}" >&2
   echo "$graph_output"
