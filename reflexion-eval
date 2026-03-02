@@ -127,61 +127,33 @@ cmd_evaluate() {
   # Get existing rule triggers to avoid duplicates
   local existing_triggers=""
   if [[ -f "$RULES_FILE" ]]; then
-    existing_triggers=$(jq -r '[.active[].trigger] | join("; ")' "$RULES_FILE" 2>/dev/null | head -c 1000 || true)
+    existing_triggers=$(jq -r '[.rules[].trigger] | join("; ")' "$RULES_FILE" 2>/dev/null | head -c 1000 || true)
   fi
 
-  system_prompt='You are a task evaluation system for an AI agent. Analyze the completed task and extract behavioral rules.
+  # ===== STAGE 1: Task Reflection (episodic) =====
+  # Score + what worked/failed. NO rule extraction here.
+  # (ExpeL finding: reflection narratives confabulate causal stories that pollute rules)
+  local reflect_prompt='You are a task evaluation system. Score this task and describe what happened.
 
-Return JSON with this exact structure:
+Return JSON:
 {
   "success": true/false,
   "score": 0-100 (overall quality),
   "what_worked": ["specific thing 1", "specific thing 2"],
-  "what_failed": ["specific thing 1", "specific thing 2"],
-  "rules": [
-    {
-      "trigger": "when <specific situation>",
-      "action": "<specific behavioral guidance>",
-      "reasoning": "why this rule matters"
-    }
-  ]
+  "what_failed": ["specific thing 1", "specific thing 2"]
 }
 
-RULE QUALITY IS CRITICAL. Most rules are useless platitudes. Only extract rules that:
-1. Come from something SURPRISING or PAINFUL in this specific task
-2. Would change behavior in a non-obvious way (not just "be thorough" or "test your code")
-3. Are specific enough that you could tell whether someone followed them
+Be specific and factual. Do NOT explain WHY things worked or failed — just describe WHAT happened.'
 
-BAD rules (DO NOT generate these):
-- "when developing a system → ensure clear communication" (generic advice)
-- "when completing a task → implement error handling" (obvious)
-- "when working with a team → encourage diverse viewpoints" (platitude)
-- "when building a tool → test it before deploying" (everyone knows this)
+  local reflect_user="Task: $task
 
-GOOD rules (generate rules like these):
-- "when a bash script uses set -e with grep → add || true to grep calls that may return no matches" (specific, from pain)
-- "when migrating databases → use SQLite over novel options like Kuzu; community support matters more than features" (learned from failure)
-- "when episode metadata exists but is unused → audit the API surface; designed-but-not-wired is a recurring pattern" (non-obvious insight)
+Outcome: $outcome
 
-If nothing surprising happened, return an EMPTY rules array. Zero rules is better than generic rules.
-Do NOT duplicate existing rules.'
+Score and describe what happened."
 
-  local existing_rules_section=""
-  if [[ -n "$existing_triggers" ]]; then
-    existing_rules_section="
-EXISTING RULES (do not duplicate):
-$existing_triggers"
-  fi
-
-  local user_prompt="Task description: $task
-
-Task outcome: $outcome
-$existing_rules_section
-Evaluate this task. What worked? What failed? Extract rules ONLY if something surprising or painful happened. Empty rules array is fine."
-
-  echo -e "  ${C_DIM}Calling $LLM_MODEL...${C_RESET}"
+  echo -e "  ${C_DIM}Stage 1: Reflection ($LLM_MODEL)...${C_RESET}"
   local eval_json
-  eval_json=$(openai_chat "$system_prompt" "$user_prompt")
+  eval_json=$(openai_chat "$reflect_prompt" "$reflect_user")
 
   # Validate JSON
   if ! echo "$eval_json" | jq . &>/dev/null; then
@@ -208,6 +180,54 @@ Evaluate this task. What worked? What failed? Extract rules ONLY if something su
   echo "$eval_json" | jq -r '.what_failed[]? // empty' | while read -r line; do
     echo -e "    ${C_RED}-${C_RESET} $line"
   done
+
+  # ===== STAGE 2: Rule Extraction (separate from reflection) =====
+  # ExpeL finding: DO NOT feed reflection output into rule extraction.
+  # Compare task+outcome directly against existing rules.
+  local existing_rules_section=""
+  if [[ -n "$existing_triggers" ]]; then
+    existing_rules_section="
+EXISTING RULES (do not duplicate):
+$existing_triggers"
+  fi
+
+  local rule_prompt='You extract behavioral rules from task outcomes. Do NOT explain why things happened — just identify patterns.
+
+Return JSON:
+{
+  "rules": [
+    {
+      "trigger": "when <specific situation>",
+      "action": "<specific behavioral guidance>",
+      "reasoning": "why this rule matters"
+    }
+  ]
+}
+
+CRITICAL: Only extract rules from SURPRISING or PAINFUL outcomes. Not from routine success.
+
+BAD rules (DO NOT generate):
+- "when developing a system → ensure clear communication" (platitude)
+- "when completing a task → implement error handling" (obvious)
+
+GOOD rules:
+- "when a bash script uses set -e with grep → add || true" (specific, from pain)
+- "when migrating databases → prefer SQLite over novel options" (learned from failure)
+
+If nothing surprising happened, return {"rules": []}. Zero rules is correct for routine tasks.
+Do NOT duplicate existing rules.'
+
+  local rule_user="Task: $task
+Outcome: $outcome
+$existing_rules_section
+Extract rules ONLY if something surprising or painful happened."
+
+  echo -e "  ${C_DIM}Stage 2: Rule extraction ($LLM_MODEL)...${C_RESET}"
+  local rules_json
+  rules_json=$(openai_chat "$rule_prompt" "$rule_user")
+
+  # Merge rules into eval_json for downstream processing
+  eval_json=$(echo "$eval_json" | jq --argjson rules "$(echo "$rules_json" | jq '.rules // []')" '. + {rules: $rules}')
 
   # Process rules
   local rule_count
