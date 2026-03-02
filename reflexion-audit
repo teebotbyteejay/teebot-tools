@@ -160,5 +160,35 @@ if len(with_feedback) >= 3:
 else:
     print(f"  Need ≥3 feedback-enriched evals for correlation analysis (have {len(with_feedback)})")
 
+# --- Retrieval Quality Analysis ---
+with_retrieval = [(e, e['retrieval_feedback']) for e in evals 
+                  if isinstance(e.get('retrieval_feedback'), dict) and 'retrieval_score' in e.get('retrieval_feedback', {})]
+
+if with_retrieval:
+    print(f"\033[36m\033[1m=== Retrieval Quality ===\033[0m")
+    print(f"  Evals with retrieval feedback: {len(with_retrieval)}")
+    scores = [rf['retrieval_score'] for _, rf in with_retrieval if isinstance(rf.get('retrieval_score'), (int, float))]
+    if scores:
+        avg = sum(scores) / len(scores)
+        print(f"  Average retrieval score: {avg:.1f}/5 (n={len(scores)})")
+    
+    missing = [rf.get('what_was_missing', '') for _, rf in with_retrieval 
+               if rf.get('what_was_missing') and rf['what_was_missing'] != 'null']
+    if missing:
+        print(f"  Common gaps:")
+        for m in missing[-5:]:
+            print(f"    - {m}")
+    
+    # Correlate retrieval quality with task scores
+    pairs = [(e.get('evaluation', {}).get('score', 0), rf['retrieval_score']) 
+             for e, rf in with_retrieval 
+             if isinstance(rf.get('retrieval_score'), (int, float)) and e.get('evaluation', {}).get('score')]
+    if len(pairs) >= 3:
+        high_ret = [s for s, r in pairs if r >= 4]
+        low_ret = [s for s, r in pairs if r < 4]
+        if high_ret and low_ret:
+            print(f"  High retrieval (≥4): avg task score {sum(high_ret)/len(high_ret):.1f}")
+            print(f"  Low retrieval (<4):  avg task score {sum(low_ret)/len(low_ret):.1f}")
+
 print()
 PYEOF
