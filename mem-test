@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# mem-test — ground truth test suite for memory retrieval quality
+# Tests whether the memory system can answer factual questions about its own history.
+# Each test case has a question and a set of required facts that must appear in the answer.
+#
+# Usage: mem-test [--verbose]
+# Options:
+#   --verbose    Show full retrieval output for each question
+#   --tool TOOL  Test a specific retrieval tool (graphmem|mem-research|pre-task) [default: mem-research]
+set -euo pipefail
+
+VERBOSE=false
+TOOL="mem-research"
+
+for arg in "$@"; do
+  case "$arg" in
+    --verbose) VERBOSE=true ;;
+    --tool) shift; TOOL="${2:-mem-research}" ;;
+  esac
+done
+
+# Handle --tool=X format
+for arg in "$@"; do
+  if [[ "$arg" == --tool=* ]]; then
+    TOOL="${arg#--tool=}"
+  fi
+done
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_GREEN='\033[32m'; C_RED='\033[31m'; C_CYAN='\033[36m'; C_YELLOW='\033[33m'
+
+# ============================================================
+# TEST CASES: question | required_facts (pipe-separated) | source
+# Required facts are substrings that MUST appear in a correct answer.
+# ============================================================
+TEST_CASES=(
+  # Factual: What database was used before SQLite?
+  "What database did teebot use before switching to SQLite for graph memory?|kuzu|Kuzu|2026-02-26"
+
+  # Factual: How many entities when Kuzu crashed?
+  "How many entities were in the graph when Kuzu started segfaulting?|270|2026-02-26"
+
+  # Factual: What was the mem-eval score?
+  "What score did mem-eval give the memory system after the Day 2 improvements?|85|2026-02-26"
+
+  # Factual: Who is described as the sharpest critic?
+  "Who does teebot consider the sharpest critic among key people?|Faheem|MEMORY.md"
+
+  # Factual: What tool does hymem implement?
+  "What does hymem do? What technique does it implement?|complexity-routed|retrieval|2026-02-26"
+
+  # Factual: How many reflexion rules were active before the prune?
+  "How many active reflexion rules existed before the platitude prune on March 2?|37|2026-03-02"
+
+  # Factual: What percentage were platitudes?
+  "What percentage of reflexion rules were classified as generic platitudes?|70|2026-03-02"
+
+  # Factual: What was the context reduction ratio from memory distillation?
+  "What was the context reduction percentage from the memory distillation enhancement to pre-task?|88|2026-03-02"
+
+  # Factual: What paper inspired JIT retrieval?
+  "What research paper inspired the JIT retrieval approach in mem-research?|GAM|2026-03-01 or 2026-03-02"
+
+  # Factual: What is memchain?
+  "What is memchain and what does it provide?|cryptographic|verification|2026-02-26"
+)
+
+echo -e "${C_CYAN}${C_BOLD}Memory Ground Truth Test Suite${C_RESET}"
+echo -e "  Tool: $TOOL"
+echo -e "  Test cases: ${#TEST_CASES[@]}"
+echo ""
+
+passed=0
+failed=0
+errors=0
+results=()
+
+for test_case in "${TEST_CASES[@]}"; do
+  # Parse test case
+  IFS='|' read -r question facts_str source <<< "$test_case"
+  
+  # Split facts on | (remaining fields after question)
+  IFS='|' read -ra all_parts <<< "$test_case"
+  question="${all_parts[0]}"
+  source="${all_parts[${#all_parts[@]}-1]}"
+  # Facts are everything between question and source
+  facts=()
+  for ((i=1; i<${#all_parts[@]}-1; i++)); do
+    facts+=("${all_parts[$i]}")
+  done
+
+  echo -ne "  ${C_DIM}Testing:${C_RESET} ${question:0:70}... "
+
+  # Run retrieval
+  case "$TOOL" in
+    graphmem)
+      output=$(graphmem-sqlite search "$question" --limit 10 2>/dev/null || echo "ERROR")
+      ;;
+    mem-research)
+      output=$(mem-research "$question" 2>/dev/null || echo "ERROR")
+      ;;
+    pre-task)
+      output=$(pre-task "$question" 2>/dev/null || echo "ERROR")
+      ;;
+    *)
+      echo -e "${C_RED}Unknown tool: $TOOL${C_RESET}"
+      exit 1
+      ;;
+  esac
+
+  if [[ "$output" == "ERROR" ]]; then
+    echo -e "${C_RED}ERROR${C_RESET}"
+    errors=$((errors + 1))
+    results+=("ERROR|$question")
+    continue
+  fi
+
+  # Check each required fact
+  all_found=true
+  missing=()
+  for fact in "${facts[@]}"; do
+    if ! echo "$output" | grep -qi "$fact"; then
+      all_found=false
+      missing+=("$fact")
+    fi
+  done
+
+  if $all_found; then
+    echo -e "${C_GREEN}PASS${C_RESET}"
+    passed=$((passed + 1))
+    results+=("PASS|$question")
+  else
+    echo -e "${C_RED}FAIL${C_RESET} (missing: ${missing[*]})"
+    failed=$((failed + 1))
+    results+=("FAIL|$question|missing: ${missing[*]}")
+  fi
+
+  $VERBOSE && echo -e "${C_DIM}${output:0:200}${C_RESET}\n"
+done
+
+# Summary
+echo ""
+echo -e "${C_BOLD}Results:${C_RESET} $passed passed, $failed failed, $errors errors out of ${#TEST_CASES[@]}"
+pct=0
+[[ ${#TEST_CASES[@]} -gt 0 ]] && pct=$(( (passed * 100) / ${#TEST_CASES[@]} ))
+echo -e "${C_BOLD}Score:${C_RESET} ${pct}%"
+
+# Save results for tracking
+results_file="$WORKSPACE/memory/mem-test-results.json"
+jq -n \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg tool "$TOOL" \
+  --argjson passed "$passed" \
+  --argjson failed "$failed" \
+  --argjson errors "$errors" \
+  --argjson total "${#TEST_CASES[@]}" \
+  --argjson pct "$pct" \
+  '{timestamp: $ts, tool: $tool, passed: $passed, failed: $failed, errors: $errors, total: $total, score_pct: $pct}' \
+  > "$results_file" 2>/dev/null || true
+
+if [[ $pct -ge 80 ]]; then
+  echo -e "${C_GREEN}Memory system is healthy.${C_RESET}"
+elif [[ $pct -ge 50 ]]; then
+  echo -e "${C_YELLOW}Memory system has gaps.${C_RESET}"
+else
+  echo -e "${C_RED}Memory system is failing.${C_RESET}"
+fi
