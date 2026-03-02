@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# mem-research — JIT retrieval: graph search → raw log lookup → synthesize
+# Uses graph memory as an INDEX into raw daily logs (the source of truth).
+# Inspired by GAM's page-store / JIT retrieval pattern.
+#
+# Usage: mem-research "what happened with the kuzu migration?"
+# Options:
+#   --raw       Show raw log excerpts without LLM synthesis
+#   --limit N   Number of graph results (default 8)
+set -euo pipefail
+
+QUERY="${1:-}"
+[[ -z "$QUERY" ]] && { echo "Usage: mem-research '<query>'" >&2; exit 1; }
+
+RAW_MODE=false
+LIMIT=8
+
+for arg in "$@"; do
+  case "$arg" in
+    --raw) RAW_MODE=true ;;
+    --limit) shift; LIMIT="${2:-8}" ;;
+  esac
+done
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+MEMORY_DIR="$WORKSPACE/memory"
+GRAPHMEM_DB="$WORKSPACE/graphmem/data/graphmem.db"
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'; C_CYAN='\033[36m'; C_GREEN='\033[32m'
+
+# Step 1: Graph search (the index)
+echo -e "${C_CYAN}${C_BOLD}[1/3] Searching graph memory...${C_RESET}" >&2
+
+graph_output=$(graphmem-sqlite search "$QUERY" --limit "$LIMIT" 2>/dev/null || echo "No results")
+
+echo -e "${C_DIM}$graph_output${C_RESET}" >&2
+
+# Step 2: Extract dates and source files from graph results
+# Parse entity names, edge facts, dates from graph output to find relevant log files
+echo -e "\n${C_CYAN}${C_BOLD}[2/3] Locating raw log sections...${C_RESET}" >&2
+
+# Extract dates mentioned in results (YYYY-MM-DD patterns)
+dates_from_graph=$(echo "$graph_output" | grep -oP '\d{4}-\d{2}-\d{2}' | sort -u || true)
+
+# Also query the DB directly: find episodes related to top entities, get their sources + dates
+relevant_files=$(python3 - "$GRAPHMEM_DB" "$QUERY" "$MEMORY_DIR" <<'PYEOF'
+import sqlite3, re, sys, os
+from datetime import datetime
+
+db_path = sys.argv[1]
+query = sys.argv[2]
+memory_dir = sys.argv[3]
+
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+
+# Get episode sources for edges matching our graph results
+# Use entity names from the query to find related episodes
+words = [w.lower() for w in re.findall(r'[a-zA-Z0-9_]+', query) if len(w) >= 3]
+if not words:
+    sys.exit(0)
+
+# Find entities matching query words
+entity_ids = set()
+for row in conn.execute('SELECT id, name FROM entities'):
+    name_lower = row['name'].lower()
+    if any(w in name_lower for w in words):
+        entity_ids.add(row['id'])
+
+# Find episodes connected to these entities via edges
+episode_ids = set()
+if entity_ids:
+    placeholders = ','.join('?' * len(entity_ids))
+    for row in conn.execute(f'''
+        SELECT DISTINCT episode_id FROM edges 
+        WHERE (source_id IN ({placeholders}) OR target_id IN ({placeholders}))
+          AND episode_id IS NOT NULL
+    ''', list(entity_ids) + list(entity_ids)):
+        episode_ids.add(row['episode_id'])
+
+# Get source files and dates from episodes
+sources = set()
+dates = set()
+if episode_ids:
+    placeholders = ','.join('?' * len(episode_ids))
+    for row in conn.execute(f'SELECT source, reference_time FROM episodes WHERE id IN ({placeholders})', list(episode_ids)):
+        src = row['source']
+        ref_time = row['reference_time'] or ''
+        if src.startswith('file:'):
+            sources.add(src[5:])
+        # Extract date from reference_time
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', ref_time)
+        if date_match:
+            dates.add(date_match.group(1))
+
+# Map dates to daily log files
+for d in dates:
+    log_path = os.path.join(memory_dir, f'{d}.md')
+    if os.path.exists(log_path):
+        sources.add(log_path)
+
+# Also add any explicit file sources
+for src in list(sources):
+    if not os.path.isabs(src):
+        abs_path = os.path.join(os.path.dirname(db_path), src)
+        if os.path.exists(abs_path):
+            sources.discard(src)
+            sources.add(abs_path)
+
+for s in sorted(sources):
+    if os.path.exists(s):
+        print(s)
+conn.close()
+PYEOF
+)
+
+# Also add date-matched log files from graph output
+for d in $dates_from_graph; do
+  f="$MEMORY_DIR/$d.md"
+  [[ -f "$f" ]] && relevant_files="$relevant_files"$'\n'"$f"
+done
+
+# Deduplicate
+relevant_files=$(echo "$relevant_files" | sort -u | grep -v '^$')
+
+if [[ -z "$relevant_files" ]]; then
+  echo -e "  ${C_DIM}No source files found. Falling back to graph results only.${C_RESET}" >&2
+  echo "$graph_output"
+  exit 0
+fi
+
+file_count=$(echo "$relevant_files" | wc -l)
+echo -e "  ${C_GREEN}✓${C_RESET} Found $file_count source files" >&2
+
+# Step 3: Extract relevant sections from raw logs
+echo -e "\n${C_CYAN}${C_BOLD}[3/3] Reading raw log sections...${C_RESET}" >&2
+
+raw_context=""
+while IFS= read -r filepath; do
+  [[ -z "$filepath" || ! -f "$filepath" ]] && continue
+  fname=$(basename "$filepath")
+  
+  # Search for relevant sections using query keywords
+  # Extract heading-delimited sections that contain query terms
+  sections=$(python3 - "$QUERY" "$filepath" <<'PYEOF2'
+import re, sys
+
+query_words = [w.lower() for w in re.findall(r'[a-zA-Z0-9_]+', sys.argv[1]) if len(w) >= 3]
+filepath = sys.argv[2]
+
+with open(filepath) as f:
+    content = f.read()
+
+sections = re.split(r'(?=^##? )', content, flags=re.MULTILINE)
+matches = []
+for sec in sections:
+    sec_lower = sec.lower()
+    score = sum(1 for w in query_words if w in sec_lower)
+    if score > 0:
+        trimmed = sec.strip()[:600]
+        if len(sec.strip()) > 600:
+            trimmed += '...'
+        matches.append((score, trimmed))
+
+matches.sort(key=lambda x: -x[0])
+for score, text in matches[:3]:
+    print(f'--- [{filepath}] (relevance: {score}) ---')
+    print(text)
+    print()
+PYEOF2
+)
+
+  if [[ -n "$sections" ]]; then
+    raw_context+="$sections"$'\n'
+  fi
+done <<< "$relevant_files"
+
+if [[ -z "$raw_context" ]]; then
+  echo -e "  ${C_DIM}No matching sections found in logs.${C_RESET}" >&2
+  echo "$graph_output"
+  exit 0
+fi
+
+# Raw mode: just dump the context
+if $RAW_MODE; then
+  echo -e "\n${C_BOLD}Graph results:${C_RESET}"
+  echo "$graph_output"
+  echo -e "\n${C_BOLD}Raw log excerpts:${C_RESET}"
+  echo "$raw_context"
+  exit 0
+fi
+
+# Synthesis mode: ask LLM to answer the query using graph + raw context
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+  echo -e "  ${C_DIM}No OPENAI_API_KEY — showing raw results${C_RESET}" >&2
+  echo "$graph_output"
+  echo "$raw_context"
+  exit 0
+fi
+
+echo -e "  Synthesizing answer..." >&2
+
+system_prompt="You are a memory research assistant. Given a query, graph memory results, and raw log excerpts, synthesize a clear, factual answer. Cite dates and specifics. Be concise — aim for 3-8 sentences. If the evidence is contradictory, say so."
+
+user_prompt="Query: $QUERY
+
+Graph memory results:
+$graph_output
+
+Raw log excerpts:
+$raw_context"
+
+response=$(curl -s --max-time 30 "https://api.openai.com/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d "$(jq -n --arg sys "$system_prompt" --arg usr "$user_prompt" '{
+    model: "gpt-4o-mini",
+    messages: [{role: "system", content: $sys}, {role: "user", content: $usr}],
+    temperature: 0.1,
+    max_tokens: 500
+  }')" 2>/dev/null)
+
+answer=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null)
+
+if [[ -n "$answer" && "$answer" != "null" ]]; then
+  echo -e "\n${C_CYAN}${C_BOLD}Answer:${C_RESET}"
+  echo "$answer"
+else
+  echo -e "\n${C_DIM}Synthesis failed — showing raw results${C_RESET}" >&2
+  echo "$graph_output"
+  echo "$raw_context"
+fi
