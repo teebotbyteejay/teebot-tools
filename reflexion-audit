@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# reflexion-audit — Measure whether reflexion rules actually change behavior
+# Analyzes eval files to correlate rule adherence with task scores.
+#
+# Usage: reflexion-audit
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+EVALS_DIR="$WORKSPACE/memory/reflexion-evals"
+RULES_FILE="$WORKSPACE/memory/reflexion-rules.json"
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_CYAN='\033[36m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'
+
+python3 - "$EVALS_DIR" "$RULES_FILE" <<'PYEOF'
+import json, os, sys, glob
+from pathlib import Path
+
+evals_dir = sys.argv[1]
+rules_file = sys.argv[2]
+
+# Load all evals
+evals = []
+for f in sorted(glob.glob(os.path.join(evals_dir, "*.json"))):
+    try:
+        with open(f) as fh:
+            e = json.load(fh)
+            score = (e.get("evaluation") or {}).get("score")
+            if score is not None:
+                evals.append(e)
+    except:
+        pass
+
+# Load current rules for confidence lookup
+rules_by_id = {}
+try:
+    with open(rules_file) as f:
+        data = json.load(f)
+    for r in data.get("rules", []):
+        rules_by_id[r["id"]] = r
+    for r in data.get("archived", []):
+        rules_by_id[r["id"]] = r
+except:
+    pass
+
+print(f"\033[36m\033[1mReflexion Audit\033[0m")
+print(f"  Total evals: {len(evals)}")
+
+# Split evals: with feedback vs without
+with_feedback = [e for e in evals if "feedback" in e]
+without_feedback = [e for e in evals if "feedback" not in e]
+
+print(f"  With feedback data: {len(with_feedback)}")
+print(f"  Without feedback data: {len(without_feedback)}")
+
+if not with_feedback:
+    print("\n  No feedback-enriched evals yet. Run more tasks through pre-task → post-task.")
+    print("  The feedback loop was added recently — older evals don't have this data.")
+    
+    # Still analyze what we have
+    scores = [e["evaluation"]["score"] for e in evals]
+    if scores:
+        avg = sum(scores) / len(scores)
+        print(f"\n  Average task score: {avg:.1f} (n={len(scores)})")
+        print(f"  Score range: {min(scores)} — {max(scores)}")
+    sys.exit(0)
+
+print()
+
+# --- Analysis 1: Score distribution with vs without feedback ---
+scores_with = [e["evaluation"]["score"] for e in with_feedback]
+scores_without = [e["evaluation"]["score"] for e in without_feedback]
+
+if scores_with:
+    avg_with = sum(scores_with) / len(scores_with)
+    print(f"\033[1mScore Analysis\033[0m")
+    print(f"  Tasks with rule feedback: avg={avg_with:.1f} (n={len(scores_with)})")
+if scores_without:
+    avg_without = sum(scores_without) / len(scores_without)
+    print(f"  Tasks without rule feedback: avg={avg_without:.1f} (n={len(scores_without)})")
+
+# --- Analysis 2: Per-task breakdown of rule adherence ---
+print(f"\n\033[1mPer-Task Rule Adherence\033[0m")
+for e in with_feedback:
+    score = e["evaluation"]["score"]
+    fb = e["feedback"]
+    task = e.get("task", "?")[:50]
+    r = fb.get("reinforced", 0)
+    c = fb.get("contradicted", 0)
+    s = fb.get("skipped", 0)
+    total = r + c + s
+    adherence = r / max(total - s, 1) * 100  # % of relevant rules followed
+    print(f"  [{score:3d}] {r}✓ {c}✗ {s}— | adherence={adherence:.0f}% | {task}")
+
+# --- Analysis 3: Which rules are most followed/violated? ---
+rule_stats = {}  # rule_id -> {reinforced: n, contradicted: n, trigger: str}
+for e in with_feedback:
+    fb = e.get("feedback", {})
+    verdicts = fb.get("verdicts", [])
+    if isinstance(verdicts, list):
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            rid = v.get("id", "")
+            verdict = v.get("verdict", "")
+            if rid and verdict in ("reinforced", "contradicted"):
+                if rid not in rule_stats:
+                    trigger = ""
+                    if rid in rules_by_id:
+                        trigger = rules_by_id[rid].get("trigger", "")[:50]
+                    rule_stats[rid] = {"reinforced": 0, "contradicted": 0, "trigger": trigger}
+                rule_stats[rid][verdict] += 1
+
+if rule_stats:
+    print(f"\n\033[1mRule Track Record\033[0m")
+    for rid, stats in sorted(rule_stats.items(), key=lambda x: -(x[1]["reinforced"] + x[1]["contradicted"])):
+        r = stats["reinforced"]
+        c = stats["contradicted"]
+        total = r + c
+        rate = r / total * 100 if total > 0 else 0
+        conf = rules_by_id.get(rid, {}).get("confidence", "?")
+        indicator = "🟢" if rate >= 70 else "🟡" if rate >= 40 else "🔴"
+        print(f"  {indicator} [{conf:>3}] {rate:3.0f}% followed ({r}✓/{c}✗) | {stats['trigger']}")
+
+# --- Analysis 4: Correlation signal ---
+print(f"\n\033[1mCorrelation Signal\033[0m")
+if len(with_feedback) >= 3:
+    # Compare: tasks with high adherence vs low adherence
+    high_adherence = []
+    low_adherence = []
+    for e in with_feedback:
+        score = e["evaluation"]["score"]
+        fb = e["feedback"]
+        r = fb.get("reinforced", 0)
+        c = fb.get("contradicted", 0)
+        if r + c == 0:
+            continue
+        adherence = r / (r + c)
+        if adherence >= 0.5:
+            high_adherence.append(score)
+        else:
+            low_adherence.append(score)
+    
+    if high_adherence and low_adherence:
+        avg_high = sum(high_adherence) / len(high_adherence)
+        avg_low = sum(low_adherence) / len(low_adherence)
+        delta = avg_high - avg_low
+        direction = "+" if delta > 0 else ""
+        print(f"  High adherence (≥50%): avg score {avg_high:.1f} (n={len(high_adherence)})")
+        print(f"  Low adherence (<50%):  avg score {avg_low:.1f} (n={len(low_adherence)})")
+        print(f"  Delta: {direction}{delta:.1f} points")
+        if delta > 5:
+            print(f"  \033[32m→ Positive signal: following rules correlates with better scores\033[0m")
+        elif delta < -5:
+            print(f"  \033[33m→ Negative signal: following rules correlates with WORSE scores (!)\033[0m")
+        else:
+            print(f"  \033[2m→ No clear signal yet (need more data)\033[0m")
+    else:
+        print(f"  Not enough variance in adherence yet (need both high and low adherence tasks)")
+else:
+    print(f"  Need ≥3 feedback-enriched evals for correlation analysis (have {len(with_feedback)})")
+
+print()
+PYEOF

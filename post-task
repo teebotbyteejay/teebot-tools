@@ -115,6 +115,21 @@ For each rule, was it followed (reinforced), violated (contradicted), or not rel
       done < <(echo "$verdicts" | jq -c '.[]' 2>/dev/null)
       
       echo -e "\n  ${C_DIM}Feedback: $reinforced reinforced, $contradicted contradicted, $skipped skipped${C_RESET}"
+      
+      # Persist feedback data into the eval file for later analysis
+      eval_file=$(ls -t "$WORKSPACE/memory/reflexion-evals/"*.json 2>/dev/null | head -1)
+      if [[ -n "$eval_file" ]]; then
+        matched_rules=$(jq -c '.matched_rules' "$PRETASK_FILE" 2>/dev/null || echo "[]")
+        tmp=$(mktemp)
+        jq --argjson matched "$matched_rules" \
+           --argjson verdicts "$(echo "$verdicts" | jq -c '.' 2>/dev/null || echo '[]')" \
+           --argjson reinforced "$reinforced" \
+           --argjson contradicted "$contradicted" \
+           --argjson skipped "$skipped" \
+           '. + {feedback: {matched_rules: $matched, verdicts: $verdicts, reinforced: $reinforced, contradicted: $contradicted, skipped: $skipped}}' \
+           "$eval_file" > "$tmp" 2>/dev/null && mv "$tmp" "$eval_file" && \
+          echo -e "  ${C_GREEN}✓${C_RESET} Feedback persisted to eval file" || rm -f "$tmp"
+      fi
     else
       echo -e "  ${C_YELLOW}⚠${C_RESET} OPENAI_API_KEY not set — skipping rule feedback"
     fi
