@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# nightly-consolidation — compress today's experience into a fixed-size working memory
+# Produces CURRENT_STATE.md (overwrites previous). Inspired by MEM1's bounded internal state.
+#
+# Usage: nightly-consolidation [YYYY-MM-DD]
+# Requires: OPENAI_API_KEY
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+DATE="${1:-$(date -u +%Y-%m-%d)}"
+DAILY_LOG="$WORKSPACE/memory/${DATE}.md"
+CURRENT_STATE="$WORKSPACE/CURRENT_STATE.md"
+HEARTBEAT="$WORKSPACE/HEARTBEAT.md"
+MEMORY="$WORKSPACE/MEMORY.md"
+CHAR_BUDGET=1500
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_CYAN='\033[36m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'
+
+# Ensure API key
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+  echo -e "${C_RED}Error: OPENAI_API_KEY not set${C_RESET}" >&2
+  exit 1
+fi
+
+echo -e "${C_BOLD}🌙 Nightly Consolidation — ${DATE}${C_RESET}"
+
+# --- Gather inputs ---
+daily_content=""
+if [[ -f "$DAILY_LOG" ]]; then
+  daily_content=$(cat "$DAILY_LOG")
+  echo -e "${C_DIM}Daily log: $(wc -c < "$DAILY_LOG") bytes${C_RESET}"
+else
+  echo -e "${C_YELLOW}No daily log for ${DATE} — using previous state only${C_RESET}"
+fi
+
+prev_state=""
+if [[ -f "$CURRENT_STATE" ]]; then
+  prev_state=$(cat "$CURRENT_STATE")
+  echo -e "${C_DIM}Previous state: $(wc -c < "$CURRENT_STATE") bytes${C_RESET}"
+fi
+
+priorities=""
+if [[ -f "$HEARTBEAT" ]]; then
+  priorities=$(sed -n '/## Current Priority Stack/,/^## /p' "$HEARTBEAT" | head -20)
+fi
+
+# Graph memory: recent high-signal entities
+graph_context=""
+if command -v graphmem-sqlite &>/dev/null; then
+  graph_context=$(graphmem-sqlite search "today's work priorities learnings" --limit 5 2>/dev/null | head -15 || true)
+fi
+
+# --- Build prompt ---
+SYSTEM_PROMPT="You are a memory consolidation engine for an AI agent named teebot.
+
+Your job: compress a day's experience into a compact working memory document.
+
+HARD CONSTRAINT: Output must be ≤${CHAR_BUDGET} characters. Count carefully. No exceptions.
+
+Output exactly this format (4 sections, no other text):
+
+## Active Work
+(What I'm building/doing right now. 1-3 bullet points.)
+
+## Recent Learnings  
+(Key insights from the last 24h that change how I think or act. 2-4 bullets.)
+
+## Key Context
+(Important state: blockers, pending items, people to follow up with. 1-3 bullets.)
+
+## Tomorrow's Focus
+(The single most important thing to do next. 1 bullet.)
+
+Rules:
+- DROP information that's stale, completed, or already in long-term memory (MEMORY.md)
+- PROMOTE information that's newly important or actionable
+- Be specific: names, numbers, findings — not vague summaries
+- If nothing happened today, carry forward only what's still relevant from previous state
+- Prefer recent information over old"
+
+USER_PROMPT="## Previous Working Memory (yesterday's state)
+${prev_state:-"(none — first consolidation)"}
+
+## Today's Daily Log
+${daily_content:-"(no activity logged)"}
+
+## Current Priorities (from HEARTBEAT.md)
+${priorities:-"(none)"}
+
+## Graph Memory (recent entities)
+${graph_context:-"(none)"}
+
+Synthesize into the new CURRENT_STATE.md. Remember: ≤${CHAR_BUDGET} characters total."
+
+# --- LLM call ---
+echo -e "${C_DIM}Calling gpt-4o-mini for consolidation...${C_RESET}"
+
+response=$(curl -s https://api.openai.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d "$(jq -n \
+    --arg sys "$SYSTEM_PROMPT" \
+    --arg usr "$USER_PROMPT" \
+    '{
+      model: "gpt-4o-mini",
+      messages: [
+        {role: "system", content: $sys},
+        {role: "user", content: $usr}
+      ],
+      max_tokens: 500,
+      temperature: 0.3
+    }')" 2>/dev/null)
+
+# Extract content
+new_state=$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+
+if [[ -z "$new_state" ]]; then
+  error=$(echo "$response" | jq -r '.error.message // "unknown error"' 2>/dev/null)
+  echo -e "${C_RED}LLM call failed: ${error}${C_RESET}" >&2
+  exit 1
+fi
+
+# --- Budget enforcement ---
+char_count=${#new_state}
+if (( char_count > CHAR_BUDGET + 100 )); then
+  # Allow 100 char grace, but warn
+  echo -e "${C_YELLOW}Warning: output ${char_count} chars (budget: ${CHAR_BUDGET}). Trimming...${C_RESET}"
+  # Truncate at last complete line within budget
+  new_state=$(echo "$new_state" | head -c $((CHAR_BUDGET + 100)))
+fi
+
+# --- Write output ---
+# Backup previous state for diff
+if [[ -f "$CURRENT_STATE" ]]; then
+  cp "$CURRENT_STATE" "${CURRENT_STATE}.prev"
+fi
+
+echo "$new_state" > "$CURRENT_STATE"
+final_chars=$(wc -c < "$CURRENT_STATE")
+
+echo -e "\n${C_GREEN}${C_BOLD}✓ CURRENT_STATE.md updated${C_RESET} ${C_DIM}(${final_chars} bytes)${C_RESET}"
+
+# --- Show diff if previous exists ---
+if [[ -f "${CURRENT_STATE}.prev" ]]; then
+  echo -e "\n${C_CYAN}${C_BOLD}Changes:${C_RESET}"
+  diff --color=always "${CURRENT_STATE}.prev" "$CURRENT_STATE" 2>/dev/null || true
+  rm -f "${CURRENT_STATE}.prev"
+else
+  echo -e "\n${C_CYAN}${C_BOLD}New state:${C_RESET}"
+  cat "$CURRENT_STATE"
+fi
+
+echo -e "\n${C_DIM}Consolidation complete for ${DATE}${C_RESET}"
