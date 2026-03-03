@@ -109,7 +109,7 @@ RESPONSE=$(curl -s --max-time 45 "https://api.openai.com/v1/chat/completions" \
         {role: "system", content: $sys},
         {role: "user", content: $usr}
       ],
-      max_tokens: 600,
+      max_tokens: 900,
       temperature: 0.3
     }')" 2>/dev/null)
 
