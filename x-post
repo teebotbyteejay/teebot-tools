@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# x-post — post a tweet via X API v2
+# Usage: x-post "tweet text"
+#        echo "tweet text" | x-post --stdin
+# Loads credentials from ~/.config/x-api/credentials.env
+set -euo pipefail
+
+CREDS="$HOME/.config/x-api/credentials.env"
+[[ -f "$CREDS" ]] || { echo "Error: $CREDS not found" >&2; exit 1; }
+export $(cat "$CREDS" | xargs)
+
+TEXT=""
+if [[ "${1:-}" == "--stdin" ]]; then
+  TEXT=$(cat)
+elif [[ -n "${1:-}" ]]; then
+  TEXT="$1"
+else
+  echo "Usage: x-post \"tweet text\" OR echo \"text\" | x-post --stdin" >&2; exit 1
+fi
+
+# URLs count as 23 chars on X regardless of actual length
+# But the API seems to accept up to ~400 chars with URLs
+[[ ${#TEXT} -gt 500 ]] && { echo "Error: tweet too long (${#TEXT} chars)" >&2; exit 1; }
+
+python3 -c "
+import tweepy, os, sys
+
+client = tweepy.Client(
+    bearer_token=os.environ.get('X_BEARER_TOKEN',''),
+    consumer_key=os.environ['X_API_KEY'],
+    consumer_secret=os.environ['X_API_SECRET'],
+    access_token=os.environ['X_ACCESS_TOKEN'],
+    access_token_secret=os.environ['X_ACCESS_TOKEN_SECRET']
+)
+
+text = '''$TEXT'''
+try:
+    resp = client.create_tweet(text=text)
+    tid = resp.data['id']
+    print(f'✓ https://x.com/teebot334423/status/{tid}')
+except tweepy.errors.Forbidden as e:
+    print(f'✗ 403 Forbidden — tweet may be too long or duplicate', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'✗ {e}', file=sys.stderr)
+    sys.exit(1)
+"
