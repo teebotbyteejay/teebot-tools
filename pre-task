@@ -50,12 +50,34 @@ $rules
   matched_rules_json=$(reflexion-eval match-json "$TASK" 2>/dev/null || echo "[]")
 fi
 
-# --- 2. Graph Memory (LTM) ---
+# --- 1.5. Retrieval Trigger (MemGen-inspired) ---
+# Quick probe: is retrieval likely to be useful for this task?
+# If the top graph result scores below threshold, skip full retrieval.
+RETRIEVAL_THRESHOLD=4.0
+skip_retrieval=false
+
 if command -v graphmem-sqlite &>/dev/null; then
+  probe=$(graphmem-sqlite search "$TASK" --limit 2 2>/dev/null | head -5 || true)
+  top_score=$(echo "$probe" | grep -oP 'score=\K[0-9.]+' | head -1 || echo "0")
+  
+  if [[ -n "$top_score" ]] && (( $(echo "$top_score < $RETRIEVAL_THRESHOLD" | bc -l 2>/dev/null || echo 0) )); then
+    skip_retrieval=true
+    $VERBOSE && echo -e "${C_DIM}Retrieval trigger: top score $top_score < $RETRIEVAL_THRESHOLD — skipping retrieval (novel task)${C_RESET}" >&2
+  else
+    $VERBOSE && echo -e "${C_DIM}Retrieval trigger: top score $top_score ≥ $RETRIEVAL_THRESHOLD — proceeding with retrieval${C_RESET}" >&2
+  fi
+fi
+
+# --- 2. Graph Memory (LTM) ---
+if ! $skip_retrieval && command -v graphmem-sqlite &>/dev/null; then
   raw_ltm=$(graphmem-sqlite search "$TASK" --limit 8 2>/dev/null | head -20 || true)
 fi
 
 # --- 3. Recent Daily Logs (STM) ---
+# Skip if retrieval trigger said no
+if $skip_retrieval; then
+  keywords=""
+else
 # Extract keywords from task description (stop words removed, 2+ char tokens)
 keywords=$(echo "$TASK" | tr '[:upper:]' '[:lower:]' | \
   grep -oP '\b[a-z]{3,}\b' | \
@@ -112,6 +134,7 @@ $matches
     raw_stm="$stm_results"
   fi
 fi
+fi  # end skip_retrieval else block
 
 # --- 4. LLM Distillation ---
 # Combine raw LTM + STM, then filter for relevance
@@ -186,7 +209,9 @@ jq -n \
   --arg raw_stm "${raw_stm:0:2000}" \
   --arg distilled "${distilled_context:0:2000}" \
   --argjson distilled_used "$(if [[ -n "$distilled_context" ]]; then echo true; else echo false; fi)" \
-  '{task: $task, timestamp: $ts, matched_rules: $rules, retrieval: {raw_ltm: $raw_ltm, raw_stm: $raw_stm, distilled: $distilled, distilled_used: $distilled_used}}' \
+  --argjson retrieval_skipped "$(if $skip_retrieval; then echo true; else echo false; fi)" \
+  --arg probe_score "${top_score:-0}" \
+  '{task: $task, timestamp: $ts, matched_rules: $rules, retrieval: {raw_ltm: $raw_ltm, raw_stm: $raw_stm, distilled: $distilled, distilled_used: $distilled_used, skipped: $retrieval_skipped, probe_score: $probe_score}}' \
   > "$PRETASK_FILE" 2>/dev/null || true
 
 # --- Output ---
