@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# paper-ingest — fetch an arxiv paper, extract key claims/techniques, add to graph memory
+# Usage: paper-ingest <arxiv-url-or-id> [--verbose]
+# Example: paper-ingest 2502.12110
+#          paper-ingest https://arxiv.org/abs/2502.12110
+# Requires: OPENAI_API_KEY, graphmem-sqlite
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+VERBOSE=false
+[[ "${2:-}" == "--verbose" ]] && VERBOSE=true
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_CYAN='\033[36m'; C_GREEN='\033[32m'; C_RED='\033[31m'
+
+# --- Parse arxiv ID ---
+INPUT="${1:-}"
+[[ -z "$INPUT" ]] && { echo "Usage: paper-ingest <arxiv-url-or-id> [--verbose]" >&2; exit 1; }
+
+# Extract ID from URL or use directly
+ARXIV_ID=$(echo "$INPUT" | grep -oP '(\d{4}\.\d{4,5}(v\d+)?)' | head -1)
+[[ -z "$ARXIV_ID" ]] && { echo -e "${C_RED}Could not parse arxiv ID from: $INPUT${C_RESET}" >&2; exit 1; }
+
+echo -e "${C_BOLD}📄 Ingesting arxiv:${ARXIV_ID}${C_RESET}"
+
+# --- Fetch abstract from arxiv API ---
+echo -e "${C_DIM}Fetching metadata...${C_RESET}"
+METADATA=$(curl -sL "https://export.arxiv.org/api/query?id_list=${ARXIV_ID}" 2>/dev/null)
+
+TITLE=$(echo "$METADATA" | grep -oP '<title[^>]*>\K[^<]+' | tail -1 | sed 's/^[[:space:]]*//' | tr '\n' ' ' | sed 's/  */ /g')
+ABSTRACT=$(echo "$METADATA" | sed -n '/<summary/,/<\/summary>/p' | sed 's/<[^>]*>//g' | tr '\n' ' ' | sed 's/  */ /g' | sed 's/^[[:space:]]*//')
+AUTHORS=$(echo "$METADATA" | grep -oP '<name>\K[^<]+' | head -5 | tr '\n' ', ' | sed 's/,$//')
+PUBLISHED=$(echo "$METADATA" | grep -oP '<published>\K[^<]+' | head -1 | cut -c1-10)
+
+if [[ -z "$TITLE" || -z "$ABSTRACT" ]]; then
+  echo -e "${C_RED}Failed to fetch paper metadata${C_RESET}" >&2
+  exit 1
+fi
+
+echo -e "${C_CYAN}Title:${C_RESET} $TITLE"
+echo -e "${C_DIM}Authors: $AUTHORS${C_RESET}"
+echo -e "${C_DIM}Published: $PUBLISHED${C_RESET}"
+$VERBOSE && echo -e "${C_DIM}Abstract: ${ABSTRACT:0:200}...${C_RESET}"
+
+# --- Fetch HTML for more content ---
+echo -e "${C_DIM}Fetching full text...${C_RESET}"
+FULL_TEXT=""
+# Try ar5iv (HTML version of arxiv)
+HTML=$(curl -sL "https://ar5iv.labs.arxiv.org/html/${ARXIV_ID}" --max-time 15 2>/dev/null || true)
+if [[ -n "$HTML" ]]; then
+  # Extract text from intro + method + conclusion sections (rough heuristic)
+  FULL_TEXT=$(echo "$HTML" | sed 's/<[^>]*>//g' | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-15000)
+fi
+
+# Fall back to abstract if full text unavailable
+if [[ ${#FULL_TEXT} -lt 500 ]]; then
+  FULL_TEXT="$ABSTRACT"
+  echo -e "${C_DIM}Using abstract only (full text unavailable)${C_RESET}"
+fi
+
+# --- LLM extraction ---
+echo -e "${C_DIM}Extracting structured claims...${C_RESET}"
+
+SYSTEM_PROMPT='You are a research paper analysis engine. Given a paper title, abstract, and text, extract structured knowledge.
+
+Output EXACTLY this JSON format (no other text):
+{
+  "key_techniques": ["technique 1: brief description", "technique 2: brief description"],
+  "key_findings": ["finding 1 with specific numbers", "finding 2 with specific numbers"],
+  "benchmarks_used": ["benchmark name"],
+  "compared_to": ["baseline or related work"],
+  "limitations": ["limitation 1"],
+  "domain": "one-word domain (e.g., memory, reasoning, planning, optimization)"
+}
+
+Rules:
+- Extract 2-5 techniques, 2-5 findings, 1-3 benchmarks
+- Findings MUST include specific numbers/percentages from the paper
+- Techniques should be named concepts, not vague descriptions
+- Be precise: "RL-trained memory trigger with 4.0 threshold" not "memory management"'
+
+USER_PROMPT="Title: $TITLE
+Authors: $AUTHORS
+Published: $PUBLISHED
+
+Abstract: $ABSTRACT
+
+Text excerpt: ${FULL_TEXT:0:8000}"
+
+RESPONSE=$(curl -s --max-time 30 "https://api.openai.com/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d "$(jq -n \
+    --arg sys "$SYSTEM_PROMPT" \
+    --arg usr "$USER_PROMPT" \
+    '{
+      model: "gpt-4o-mini",
+      messages: [
+        {role: "system", content: $sys},
+        {role: "user", content: $usr}
+      ],
+      max_tokens: 800,
+      temperature: 0.2
+    }')" 2>/dev/null)
+
+EXTRACTED=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+
+if [[ -z "$EXTRACTED" ]]; then
+  echo -e "${C_RED}LLM extraction failed${C_RESET}" >&2
+  exit 1
+fi
+
+# Parse JSON (strip markdown code fences if present)
+EXTRACTED=$(echo "$EXTRACTED" | sed 's/^```json//;s/^```//;s/```$//')
+$VERBOSE && echo -e "${C_DIM}Extracted: $EXTRACTED${C_RESET}"
+
+# Validate it's valid JSON
+if ! echo "$EXTRACTED" | jq . &>/dev/null; then
+  echo -e "${C_RED}Invalid JSON from extraction${C_RESET}" >&2
+  echo "$EXTRACTED" >&2
+  exit 1
+fi
+
+# --- Build graph episode ---
+TECHNIQUES=$(echo "$EXTRACTED" | jq -r '.key_techniques[]' 2>/dev/null | head -5)
+FINDINGS=$(echo "$EXTRACTED" | jq -r '.key_findings[]' 2>/dev/null | head -5)
+BENCHMARKS=$(echo "$EXTRACTED" | jq -r '.benchmarks_used[]' 2>/dev/null | head -3)
+COMPARED=$(echo "$EXTRACTED" | jq -r '.compared_to[]' 2>/dev/null | head -3)
+DOMAIN=$(echo "$EXTRACTED" | jq -r '.domain // "unknown"' 2>/dev/null)
+
+# Compose a rich episode for graphmem
+EPISODE="Research paper: \"$TITLE\" (arxiv:$ARXIV_ID, $PUBLISHED) by $AUTHORS. Domain: $DOMAIN.
+
+Key techniques proposed:"
+while IFS= read -r t; do
+  [[ -n "$t" ]] && EPISODE+="
+- $t"
+done <<< "$TECHNIQUES"
+
+EPISODE+="
+
+Key findings:"
+while IFS= read -r f; do
+  [[ -n "$f" ]] && EPISODE+="
+- $f"
+done <<< "$FINDINGS"
+
+if [[ -n "$BENCHMARKS" ]]; then
+  EPISODE+="
+
+Evaluated on:"
+  while IFS= read -r b; do
+    [[ -n "$b" ]] && EPISODE+=" $b,"
+  done <<< "$BENCHMARKS"
+fi
+
+if [[ -n "$COMPARED" ]]; then
+  EPISODE+="
+
+Compared to/extends:"
+  while IFS= read -r c; do
+    [[ -n "$c" ]] && EPISODE+=" $c,"
+  done <<< "$COMPARED"
+fi
+
+echo -e "\n${C_CYAN}${C_BOLD}Episode to ingest:${C_RESET}"
+echo "$EPISODE"
+
+# --- Add to graph ---
+echo -e "\n${C_DIM}Adding to graph memory...${C_RESET}"
+GRAPH_RESULT=$(graphmem-sqlite add "$EPISODE" 2>&1)
+echo "$GRAPH_RESULT"
+
+# --- Save extraction to file ---
+PAPER_DIR="$WORKSPACE/memory/papers"
+mkdir -p "$PAPER_DIR"
+PAPER_FILE="$PAPER_DIR/${ARXIV_ID/\//-}.json"
+jq -n \
+  --arg id "$ARXIV_ID" \
+  --arg title "$TITLE" \
+  --arg authors "$AUTHORS" \
+  --arg published "$PUBLISHED" \
+  --arg domain "$DOMAIN" \
+  --argjson extracted "$EXTRACTED" \
+  '{arxiv_id: $id, title: $title, authors: $authors, published: $published, domain: $domain, extracted: $extracted, ingested_at: (now | todate)}' > "$PAPER_FILE"
+
+echo -e "\n${C_GREEN}${C_BOLD}✓ Paper ingested${C_RESET}"
+echo -e "  ${C_DIM}Graph episode added${C_RESET}"
+echo -e "  ${C_DIM}Saved to: $PAPER_FILE${C_RESET}"
