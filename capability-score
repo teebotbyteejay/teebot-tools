@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# capability-score — measure actual capability, not proxy metrics
+# Combines: mem-test score, tool count, post count, graph density, reflexion rule quality
+# Usage: capability-score [--json]
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+JSON_OUT=false
+[[ "${1:-}" == "--json" ]] && JSON_OUT=true
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_GREEN='\033[32m'; C_RED='\033[31m'; C_CYAN='\033[36m'; C_YELLOW='\033[33m'
+
+# --- 1. Memory quality (run mem-test, weight: 30%) ---
+mem_score=0
+if command -v mem-test &>/dev/null; then
+  result=$(mem-test 2>&1 | tail -5)
+  mem_score=$(echo "$result" | sed 's/\x1b\[[0-9;]*m//g' | grep -oP 'Score:\s*\K[0-9]+' || echo 0)
+fi
+
+# --- 2. Tool inventory (count executable tools, weight: 15%) ---
+tool_count=0
+tool_dir="$WORKSPACE/teebot-tools"
+if [[ -d "$tool_dir" ]]; then
+  tool_count=$(find "$tool_dir" -maxdepth 1 -executable -type f | wc -l)
+fi
+# Score: 100 at 30+ tools, linear below
+tool_score=$(( tool_count > 30 ? 100 : tool_count * 100 / 30 ))
+
+# --- 3. Graph memory density (weight: 15%) ---
+graph_entities=0; graph_edges=0
+if command -v graphmem-sqlite &>/dev/null; then
+  stats=$(graphmem-sqlite stats 2>/dev/null || true)
+  graph_entities=$(echo "$stats" | grep -oP 'Entities:\s*\K[0-9]+' || echo 0)
+  graph_edges=$(echo "$stats" | grep -oP 'active\)' | grep -oP '[0-9]+' | head -1 || echo 0)
+  [[ -z "$graph_edges" ]] && graph_edges=$(echo "$stats" | grep -oP 'Edges:\s*\K[0-9]+' || echo 0)
+fi
+# Score: 100 at 500+ entities, linear below
+graph_score=$(( graph_entities > 500 ? 100 : graph_entities * 100 / 500 ))
+
+# --- 4. Content output (posts in last 7 days, weight: 20%) ---
+post_count=0
+site_dir="$WORKSPACE/teebotbyteejay.github.io/posts"
+if [[ -d "$site_dir" ]]; then
+  post_count=$(find "$site_dir" -name '*.html' -mtime -7 2>/dev/null | wc -l)
+fi
+# Score: 100 at 7+ posts/week (1/day), linear below  
+post_score=$(( post_count > 7 ? 100 : post_count * 100 / 7 ))
+
+# --- 5. Task performance (reflexion eval avg last 7 days, weight: 20%) ---
+task_score=50  # default if no evals
+eval_count=0
+eval_dir="$WORKSPACE/memory/reflexion-evals"
+if [[ -d "$eval_dir" ]]; then
+  total=0
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    s=$(jq -r '.score // empty' "$f" 2>/dev/null || true)
+    [[ -z "$s" || "$s" == "null" ]] && continue
+    total=$((total + s))
+    eval_count=$((eval_count + 1))
+  done < <(find "$eval_dir" -name '*.json' -mtime -7 2>/dev/null)
+  if [[ $eval_count -gt 0 ]]; then
+    task_score=$((total / eval_count))
+  fi
+fi
+
+# --- Composite ---
+composite=$(echo "scale=1; 0.30 * $mem_score + 0.15 * $tool_score + 0.15 * $graph_score + 0.20 * $post_score + 0.20 * $task_score" | bc)
+
+if $JSON_OUT; then
+  jq -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson mem "$mem_score" \
+    --argjson tools "$tool_score" \
+    --argjson graph "$graph_score" \
+    --argjson posts "$post_score" \
+    --argjson tasks "$task_score" \
+    --argjson composite "$composite" \
+    --argjson mem_raw "$(echo $mem_score)" \
+    --argjson tool_count "$tool_count" \
+    --argjson graph_entities "$graph_entities" \
+    --argjson post_count "$post_count" \
+    --argjson eval_count "$eval_count" \
+    '{timestamp: $ts, composite: $composite, components: {memory: $mem, tools: $tools, graph: $graph, posts: $posts, tasks: $tasks}, raw: {mem_test_pct: $mem_raw, tool_count: $tool_count, graph_entities: $graph_entities, posts_7d: $post_count, evals_7d: $eval_count}}'
+else
+  echo -e "${C_CYAN}${C_BOLD}🐣 Capability Scorecard${C_RESET}"
+  echo ""
+  echo -e "  ${C_BOLD}Memory quality${C_RESET}  (30%)  ${mem_score}%  ${C_DIM}(mem-test: ${mem_score}% on 15 questions)${C_RESET}"
+  echo -e "  ${C_BOLD}Tool inventory${C_RESET}  (15%)  ${tool_score}/100  ${C_DIM}(${tool_count} tools)${C_RESET}"
+  echo -e "  ${C_BOLD}Graph density${C_RESET}   (15%)  ${graph_score}/100  ${C_DIM}(${graph_entities} entities)${C_RESET}"
+  echo -e "  ${C_BOLD}Content output${C_RESET}  (20%)  ${post_score}/100  ${C_DIM}(${post_count} posts in 7 days)${C_RESET}"
+  echo -e "  ${C_BOLD}Task perf${C_RESET}       (20%)  ${task_score}/100  ${C_DIM}(${eval_count} evals in 7 days)${C_RESET}"
+  echo ""
+  echo -e "  ${C_BOLD}${C_GREEN}Composite: ${composite}${C_RESET}"
+fi
