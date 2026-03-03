@@ -73,8 +73,8 @@ TEST_CASES=(
   # Numerical: What was the Exgentic finding about model vs architecture variance?
   "According to the Exgentic paper, what percentage of agent performance variance is explained by model choice vs architecture?|28.2|0.6|2026-03-03"
 
-  # Synthesis: Connect two findings
-  "How does the Exgentic finding about scaffolding relate to teebot's own retrieval quality data?|12|experience|novel|2026-03-03"
+  # Synthesis: Connect two findings (requires contrastive framing)
+  "How does the Exgentic finding about scaffolding relate to teebot's own retrieval quality data? Distinguish between task types.|12|0.6|28.2|2026-03-03"
 
   # Architecture: What are the three memory tiers after current-state consolidation?
   "What are the three memory tiers in teebot's system after the MEM1-inspired consolidation change?|CURRENT_STATE|MEMORY.md|daily|2026-03-03"

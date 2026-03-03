@@ -205,8 +205,10 @@ system_prompt="You are a memory research assistant. Given a query, graph memory 
 CRITICAL RULES:
 1. When data conflicts across time, ALWAYS prefer the MOST RECENT data. Dates are in parentheses after graph results.
 2. Cite specific numbers, dates, and names from the evidence.
-3. Be concise — 3-8 sentences.
-4. If you're unsure, say what the most recent evidence shows rather than guessing."
+3. Use precise terminology from the source material — don't paraphrase technical terms into vague language.
+4. When the query involves comparison or contrast, explicitly state BOTH sides (e.g., 'X in case A, but Y in case B').
+5. Be concise — 3-8 sentences.
+6. If you're unsure, say what the most recent evidence shows rather than guessing."
 
 user_prompt="Query: $QUERY
 
