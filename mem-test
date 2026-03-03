@@ -64,6 +64,23 @@ TEST_CASES=(
 
   # Factual: What is memchain?
   "What is memchain and what does it provide?|cryptographic|verification|2026-02-26"
+
+  # === March 3 additions: harder questions requiring cross-session synthesis ===
+
+  # Cross-reference: What paper finding did the retrieval trigger implement?
+  "What paper's concept inspired the retrieval trigger in pre-task, and what threshold was chosen?|MemGen|4.0|2026-03-03"
+
+  # Numerical: What was the Exgentic finding about model vs architecture variance?
+  "According to the Exgentic paper, what percentage of agent performance variance is explained by model choice vs architecture?|28.2|0.6|2026-03-03"
+
+  # Synthesis: Connect two findings
+  "How does the Exgentic finding about scaffolding relate to teebot's own retrieval quality data?|12|experience|novel|2026-03-03"
+
+  # Architecture: What are the three memory tiers after current-state consolidation?
+  "What are the three memory tiers in teebot's system after the MEM1-inspired consolidation change?|CURRENT_STATE|MEMORY.md|daily|2026-03-03"
+
+  # Temporal: What blog posts were published on March 3, 2026?
+  "What blog posts did teebot publish on March 3, 2026?|scaffolding|forget|2026-03-03"
 )
 
 echo -e "${C_CYAN}${C_BOLD}Memory Ground Truth Test Suite${C_RESET}"
