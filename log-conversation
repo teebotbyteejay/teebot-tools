@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# log-conversation — append a conversation summary to today's daily log
+# Use after substantive conversations (product decisions, plans, corrections, learnings)
+#
+# Usage: log-conversation "topic" "summary"
+# Example: log-conversation "loveagents MVP" "Discussed config schema for agent deployment..."
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+DATE="$(date -u +%Y-%m-%d)"
+LOG_FILE="$WORKSPACE/memory/$DATE.md"
+TOPIC="${1:?Usage: log-conversation \"topic\" \"summary\"}"
+SUMMARY="${2:?Usage: log-conversation \"topic\" \"summary\"}"
+TIME="$(TZ=America/New_York date +%H:%M)"
+
+# Create daily log if it doesn't exist
+if [[ ! -f "$LOG_FILE" ]]; then
+  echo "# $DATE" > "$LOG_FILE"
+  echo "" >> "$LOG_FILE"
+fi
+
+# Append conversation entry
+cat >> "$LOG_FILE" <<EOF
+
+## Conversation: $TOPIC [$TIME EST]
+$SUMMARY
+EOF
+
+echo "✓ Logged conversation '$TOPIC' to $(basename "$LOG_FILE")"

@@ -52,19 +52,24 @@ fi
 
 # --- 1.5. Retrieval Trigger (MemGen-inspired) ---
 # Quick probe: is retrieval likely to be useful for this task?
-# If the top graph result scores below threshold, skip full retrieval.
-RETRIEVAL_THRESHOLD=4.0
+# Uses EMBEDDING score (semantic similarity) not composite score.
+# Composite score is inflated by FTS keyword overlap (e.g. "set up" matches everything).
+# Embedding score directly measures semantic relevance: 0.35+ = relevant, <0.35 = novel.
+# Calibrated on 9 test tasks: 0.35 gives perfect separation (2026-03-04).
+RETRIEVAL_EMB_THRESHOLD=0.35
 skip_retrieval=false
+probe_emb_score="0"
 
 if command -v graphmem-sqlite &>/dev/null; then
   probe=$(graphmem-sqlite search "$TASK" --limit 2 2>/dev/null | head -5 || true)
+  probe_emb_score=$(echo "$probe" | grep -oP 'emb=\K[0-9.]+' | head -1 || echo "0")
   top_score=$(echo "$probe" | grep -oP 'score=\K[0-9.]+' | head -1 || echo "0")
   
-  if [[ -n "$top_score" ]] && (( $(echo "$top_score < $RETRIEVAL_THRESHOLD" | bc -l 2>/dev/null || echo 0) )); then
+  if [[ -n "$probe_emb_score" ]] && (( $(echo "$probe_emb_score < $RETRIEVAL_EMB_THRESHOLD" | bc -l 2>/dev/null || echo 0) )); then
     skip_retrieval=true
-    $VERBOSE && echo -e "${C_DIM}Retrieval trigger: top score $top_score < $RETRIEVAL_THRESHOLD — skipping retrieval (novel task)${C_RESET}" >&2
+    $VERBOSE && echo -e "${C_DIM}Retrieval trigger: emb=$probe_emb_score < $RETRIEVAL_EMB_THRESHOLD — skipping (novel task)${C_RESET}" >&2
   else
-    $VERBOSE && echo -e "${C_DIM}Retrieval trigger: top score $top_score ≥ $RETRIEVAL_THRESHOLD — proceeding with retrieval${C_RESET}" >&2
+    $VERBOSE && echo -e "${C_DIM}Retrieval trigger: emb=$probe_emb_score ≥ $RETRIEVAL_EMB_THRESHOLD — retrieving${C_RESET}" >&2
   fi
 fi
 
@@ -211,7 +216,8 @@ jq -n \
   --argjson distilled_used "$(if [[ -n "$distilled_context" ]]; then echo true; else echo false; fi)" \
   --argjson retrieval_skipped "$(if $skip_retrieval; then echo true; else echo false; fi)" \
   --arg probe_score "${top_score:-0}" \
-  '{task: $task, timestamp: $ts, matched_rules: $rules, retrieval: {raw_ltm: $raw_ltm, raw_stm: $raw_stm, distilled: $distilled, distilled_used: $distilled_used, skipped: $retrieval_skipped, probe_score: $probe_score}}' \
+  --arg probe_emb "${probe_emb_score:-0}" \
+  '{task: $task, timestamp: $ts, matched_rules: $rules, retrieval: {raw_ltm: $raw_ltm, raw_stm: $raw_stm, distilled: $distilled, distilled_used: $distilled_used, skipped: $retrieval_skipped, probe_score: $probe_score, probe_emb: $probe_emb}}' \
   > "$PRETASK_FILE" 2>/dev/null || true
 
 # --- Output ---

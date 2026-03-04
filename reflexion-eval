@@ -111,10 +111,21 @@ openai_chat() {
 # ---------------------------------------------------------------------------
 
 cmd_evaluate() {
-  local task="${1:-}"
-  local outcome="${2:-}"
-  [[ -z "$task" ]] && die "Usage: reflexion-eval evaluate '<task>' '<outcome>'"
-  [[ -z "$outcome" ]] && die "Usage: reflexion-eval evaluate '<task>' '<outcome>'"
+  local task="" outcome="" trace=""
+  # Parse positional args and --trace flag
+  local positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --trace) trace="${2:-}"; shift 2 ;;
+      --trace=*) trace="${1#--trace=}"; shift ;;
+      --trace-file) [[ -f "${2:-}" ]] && trace=$(cat "$2"); shift 2 ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  task="${positional[0]:-}"
+  outcome="${positional[1]:-}"
+  [[ -z "$task" ]] && die "Usage: reflexion-eval evaluate '<task>' '<outcome>' [--trace '<execution trace>']"
+  [[ -z "$outcome" ]] && die "Usage: reflexion-eval evaluate '<task>' '<outcome>' [--trace '<execution trace>']"
 
   ensure_deps
   ensure_rules_file
@@ -133,6 +144,16 @@ cmd_evaluate() {
   # ===== STAGE 1: Task Reflection (episodic) =====
   # Score + what worked/failed. NO rule extraction here.
   # (ExpeL finding: reflection narratives confabulate causal stories that pollute rules)
+  local trace_section=""
+  if [[ -n "$trace" ]]; then
+    # Truncate trace to 2000 chars to stay within token budget
+    trace_section="
+
+## Execution Trace (tools called, decisions made, failures)
+${trace:0:2000}"
+    info "Trace provided (${#trace} chars)"
+  fi
+
   local reflect_prompt='You are a task evaluation system. Score this task and describe what happened.
 
 Return JSON:
@@ -140,15 +161,17 @@ Return JSON:
   "success": true/false,
   "score": 0-100 (overall quality),
   "what_worked": ["specific thing 1", "specific thing 2"],
-  "what_failed": ["specific thing 1", "specific thing 2"]
+  "what_failed": ["specific thing 1", "specific thing 2"],
+  "diagnostic_details": ["specific diagnostic from trace 1", "specific diagnostic from trace 2"]
 }
 
-Be specific and factual. Do NOT explain WHY things worked or failed — just describe WHAT happened.'
+Be specific and factual. Do NOT explain WHY things worked or failed — just describe WHAT happened.
+If an execution trace is provided, extract DIAGNOSTIC details: what tools were tried, what errors occurred, what decisions were made and their consequences. Include these in "diagnostic_details".'
 
   local reflect_user="Task: $task
 
 Outcome: $outcome
-
+$trace_section
 Score and describe what happened."
 
   echo -e "  ${C_DIM}Stage 1: Reflection ($LLM_MODEL)...${C_RESET}"
@@ -219,8 +242,9 @@ Do NOT duplicate existing rules.'
 
   local rule_user="Task: $task
 Outcome: $outcome
+$trace_section
 $existing_rules_section
-Extract rules ONLY if something surprising or painful happened."
+Extract rules ONLY if something surprising or painful happened. If a trace is provided, look for specific tool failures, timing issues, decision points, and unexpected behaviors — these are the richest source of rules."
 
   echo -e "  ${C_DIM}Stage 2: Rule extraction ($LLM_MODEL)...${C_RESET}"
   local rules_json
@@ -302,6 +326,10 @@ Extract rules ONLY if something surprising or painful happened."
         ok "New rule: $rule_id"
       fi
     done
+    # Auto-embed new rules for semantic matching
+    if command -v rule-matcher &>/dev/null; then
+      rule-matcher embed >/dev/null 2>&1 || true
+    fi
   else
     info "No rules extracted"
   fi
@@ -367,58 +395,56 @@ cmd_match() {
 
   section "Matching rules for task"
 
-  # Simple keyword matching: extract significant words from task, match against triggers
-  local task_lower
-  task_lower=$(echo "$task" | tr '[:upper:]' '[:lower:]')
-
-  local matches=0
-  echo -e "\n## Learned Rules (from prior tasks)" 
-
-  while IFS= read -r rule_json; do
-    local trigger action confidence
-    trigger=$(echo "$rule_json" | jq -r '.trigger')
-    action=$(echo "$rule_json" | jq -r '.action')
-    confidence=$(echo "$rule_json" | jq -r '.confidence')
-    local evidence_count
-    evidence_count=$(echo "$rule_json" | jq '.evidence | length')
-
-    # Check confidence threshold
-    [[ "$confidence" -lt 40 ]] && continue
-
-    # Keyword matching: split trigger into words, check if any significant words appear in task
-    local trigger_lower
-    trigger_lower=$(echo "$trigger" | tr '[:upper:]' '[:lower:]')
-
-    # Extract content words (skip stop words)
-    local match_found=false
-    for word in $(echo "$trigger_lower" | tr -cs '[:alpha:]' '\n' | grep -vE '^(when|the|a|an|is|are|in|on|at|to|for|of|with|and|or|it|this|that|do|be|have|from|by)$'); do
-      [[ ${#word} -lt 3 ]] && continue
-      if echo "$task_lower" | grep -qw "$word"; then
-        match_found=true
-        break
-      fi
-    done
-
-    if [[ "$match_found" == "true" ]]; then
-      echo "- $trigger: $action (confidence: $confidence, evidence: $evidence_count tasks)"
-      matches=$((matches + 1))
-    fi
-  done < <(jq -c '.rules[]' "$RULES_FILE" 2>/dev/null)
-
-  if [[ "$matches" -eq 0 ]]; then
-    info "No matching rules found"
+  # Use semantic matching via rule-matcher if available and embeddings exist
+  if command -v rule-matcher &>/dev/null && [[ -f "$WORKSPACE/memory/rule-embeddings.bin" ]]; then
+    rule-matcher match "$task"
   else
-    echo ""
-    info "$matches rules matched"
+    # Fallback: keyword matching
+    local task_lower
+    task_lower=$(echo "$task" | tr '[:upper:]' '[:lower:]')
+    local matches=0
+    echo -e "\n## Learned Rules (from prior tasks)"
+
+    while IFS= read -r rule_json; do
+      local trigger action confidence
+      trigger=$(echo "$rule_json" | jq -r '.trigger')
+      action=$(echo "$rule_json" | jq -r '.action')
+      confidence=$(echo "$rule_json" | jq -r '.confidence')
+      local evidence_count
+      evidence_count=$(echo "$rule_json" | jq '.evidence | length')
+      [[ "$confidence" -lt 40 ]] && continue
+
+      local trigger_lower match_found=false
+      trigger_lower=$(echo "$trigger" | tr '[:upper:]' '[:lower:]')
+      for word in $(echo "$trigger_lower" | tr -cs '[:alpha:]' '\n' | grep -vE '^(when|the|a|an|is|are|in|on|at|to|for|of|with|and|or|it|this|that|do|be|have|from|by)$'); do
+        [[ ${#word} -lt 3 ]] && continue
+        if echo "$task_lower" | grep -qw "$word"; then
+          match_found=true; break
+        fi
+      done
+
+      if [[ "$match_found" == "true" ]]; then
+        echo "- $trigger: $action (confidence: $confidence, evidence: $evidence_count tasks)"
+        matches=$((matches + 1))
+      fi
+    done < <(jq -c '.rules[]' "$RULES_FILE" 2>/dev/null)
+
+    [[ "$matches" -eq 0 ]] && info "No matching rules found" || { echo ""; info "$matches rules matched"; }
   fi
 }
 
 cmd_match_json() {
-  # Like match but outputs JSON array of matched rule IDs + text for machine consumption
   local task="${1:-}"
   [[ -z "$task" ]] && die "Usage: reflexion-eval match-json '<task_description>'"
   ensure_rules_file
 
+  # Use semantic matching if available
+  if command -v rule-matcher &>/dev/null && [[ -f "$WORKSPACE/memory/rule-embeddings.bin" ]]; then
+    rule-matcher match-json "$task"
+    return
+  fi
+
+  # Fallback: keyword matching
   local task_lower
   task_lower=$(echo "$task" | tr '[:upper:]' '[:lower:]')
 

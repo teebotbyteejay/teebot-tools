@@ -22,27 +22,51 @@ if command -v graphmem-sqlite &>/dev/null; then
   GRAPH_RESULTS=$(graphmem-sqlite search "$QUERY" --limit 10 2>/dev/null || true)
 fi
 
-# --- 2. Find relevant paper JSONs ---
+# --- 2. Find relevant paper JSONs (LLM-based relevance scoring) ---
 echo -e "${C_DIM}[2/3] Searching paper extractions...${C_RESET}" >&2
 PAPER_CONTEXT=""
+MAX_PAPERS=5
+
 if [[ -d "$PAPERS_DIR" ]]; then
-  # Search paper titles and extracted content for query terms
-  # Extract key terms from query (remove common words)
-  TERMS=$(echo "$QUERY" | tr '[:upper:]' '[:lower:]' | tr -s ' ' '\n' | grep -vwE 'how|do|does|the|a|an|in|of|to|and|or|is|are|what|which|their|for|with|from|between|compare|differ|approach' | head -8)
-  
+  # Build a list of paper titles + domains for quick LLM scoring
+  PAPER_LIST=""
+  declare -a PAPER_FILES=()
+  idx=0
   for paper_file in "$PAPERS_DIR"/*.json; do
     [[ -f "$paper_file" ]] || continue
-    paper_text=$(cat "$paper_file")
-    match=false
-    while IFS= read -r term; do
-      [[ -z "$term" ]] && continue
-      if echo "$paper_text" | grep -qi "$term"; then
-        match=true
-        break
-      fi
-    done <<< "$TERMS"
-    
-    if $match; then
+    title=$(jq -r '.title // "unknown"' "$paper_file")
+    domain=$(jq -r '.extracted.domain // "unknown"' "$paper_file")
+    techniques=$(jq -r '(.extracted.key_techniques // [])[:2] | join("; ")' "$paper_file" | cut -c1-100)
+    PAPER_LIST+="[$idx] $title ($domain): $techniques
+"
+    PAPER_FILES+=("$paper_file")
+    idx=$((idx + 1))
+  done
+  
+  # Ask LLM to pick the most relevant papers (cheap, fast call)
+  PICK_RESPONSE=$(curl -s --max-time 15 "https://api.openai.com/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -d "$(jq -n \
+      --arg query "$QUERY" \
+      --arg papers "$PAPER_LIST" \
+      '{
+        model: "gpt-4o-mini",
+        messages: [{role: "user", content: ("Which of these papers are most relevant to answering this question? Return ONLY the bracket numbers (e.g. 0,2,5) of the top 1-5 most relevant papers. If fewer than 3 are relevant, return fewer.\n\nQuestion: " + $query + "\n\nPapers:\n" + $papers)}],
+        max_tokens: 50,
+        temperature: 0
+      }')" 2>/dev/null)
+  
+  PICKS=$(echo "$PICK_RESPONSE" | jq -r '.choices[0].message.content // ""' 2>/dev/null | grep -oE '[0-9]+')
+  
+  if [[ -n "$PICKS" ]]; then
+    while IFS= read -r pick_idx; do
+      [[ -z "$pick_idx" ]] && continue
+      [[ "$pick_idx" -ge "${#PAPER_FILES[@]}" ]] && continue
+      paper_file="${PAPER_FILES[$pick_idx]}"
+      [[ -f "$paper_file" ]] || continue
+      
+      paper_text=$(cat "$paper_file")
       title=$(echo "$paper_text" | jq -r '.title // "unknown"')
       arxiv_id=$(echo "$paper_text" | jq -r '.arxiv_id // "unknown"')
       extracted=$(echo "$paper_text" | jq -r '.extracted // {}')
@@ -56,8 +80,11 @@ $(echo "$extracted" | jq -r '
 "**Compared to:** " + (.compared_to // [] | join(", ")) + "\n" +
 "**Limitations:** " + (.limitations // [] | join("; "))
 ')"
-    fi
-  done
+    done <<< "$PICKS"
+  fi
+  
+  matched=$(echo "$PICKS" | grep -c '.' 2>/dev/null || echo 0)
+  echo -e "${C_DIM}  Matched ${matched}/${#PAPER_FILES[@]} papers${C_RESET}" >&2
 fi
 
 # --- 3. Also search daily logs for manual paper analyses ---
@@ -70,19 +97,93 @@ if [[ -f "$ICLR_DOC" ]]; then
   fi
 fi
 
-# --- 4. LLM synthesis ---
-echo -e "${C_DIM}[3/3] Synthesizing cross-paper answer...${C_RESET}" >&2
+# --- 4. Classify question type ---
+echo -e "${C_DIM}[3/4] Classifying question type...${C_RESET}" >&2
 
-SYSTEM_PROMPT='You are a research synthesis engine for an AI agent. Given a question, graph memory context, and structured paper extractions, produce a COMPARATIVE analysis.
+# Detect question type from keywords
+QTYPE="comparison"  # default
+if echo "$QUERY" | grep -qiE "what benchmarks|what techniques|what.*exist|inventory|list|enumerate|survey"; then
+  QTYPE="inventory"
+elif echo "$QUERY" | grep -qiE "what does the research say|what is known|when to|when should|should I"; then
+  QTYPE="evidence-synthesis"
+elif echo "$QUERY" | grep -qiE "relationship between|how does.*relate|connection between|what's the.*between.*and.*my"; then
+  QTYPE="mapping"
+elif echo "$QUERY" | grep -qiE "most important|biggest|what's missing|unsolved|gap|frontier"; then
+  QTYPE="gap-analysis"
+fi
+echo -e "${C_DIM}  Question type: $QTYPE${C_RESET}" >&2
 
-CRITICAL RULES:
+# --- 5. LLM synthesis ---
+echo -e "${C_DIM}[4/4] Synthesizing answer...${C_RESET}" >&2
+
+# Base rules that apply to ALL question types
+BASE_RULES='UNIVERSAL RULES:
+- Use specific numbers from findings. No vague "outperforms existing methods."
+- Use precise terminology from the papers. Do not paraphrase technical terms.
+- End with: "For my system (teebot/graphmem-sqlite): [specific actionable implication with concrete next step]"
+- The "For my system" section must reference MY architecture and propose a SPECIFIC change I have NOT already built. See system description below.
+- Be concise: 200-400 words. Dense, not padded.
+
+MY SYSTEM (teebot/graphmem-sqlite):
+- SQLite-based graph memory: ~400 entities, ~650 edges, FTS5 + embedding hybrid search
+- Three-tier memory: CURRENT_STATE.md (1KB working memory, nightly overwritten) / MEMORY.md (curated long-term) / daily logs (archive)
+- Nightly consolidation: compresses daily logs into CURRENT_STATE.md (already implemented)
+- Pre/post-task pipeline: LTM+STM retrieval before tasks, distillation after (88% context reduction, already implemented)
+- Bounded memory by design: fixed-size working memory, edge dedup at 0.85 threshold
+- Hard context budget: max tokens for pre-task injection (already implemented)
+- Reflexion loop: 12 rules extracted from outcomes, auto-reinforces
+- memchain: cryptographic verification of memory integrity (already implemented)
+- No real-time updates — batch processing via crons (heartbeat/1hr, deep-work/2hr, nightly)
+The system already has: nightly consolidation, hard context budgets, pre/post-task pipelines, bounded memory, cryptographic verification, and a reflexion loop. These are SOLVED problems.
+Your "For my system" suggestion MUST be something genuinely new — a capability that does not exist yet. Ask: "Would this person say they already have that?" If yes, think harder.
+Examples of GOOD suggestions: retrieval confidence scoring, multi-graph schema, memory quality decay tracking, task-type-specific retrieval strategies, collaborative refinement from multiple agent outputs.
+Examples of BAD suggestions (already built): nightly consolidation, hard context budget, compress daily logs, token limits, rule extraction from outcomes.'
+
+case "$QTYPE" in
+  comparison)
+    TYPE_RULES='You are a research synthesis engine producing a COMPARATIVE analysis.
+SPECIFIC RULES:
 1. COMPARE papers side-by-side. Do NOT summarize each paper separately then add a bland conclusion.
 2. Structure by DIMENSION (technique type, performance, approach), not by paper.
-3. Use specific numbers from findings. No vague "outperforms existing methods."
-4. Identify: what is SHARED across papers, what is UNIQUE to each, what is MISSING from all.
-5. End with: "For my system (teebot/graphmem-sqlite): [specific actionable implication]"
-6. Use precise terminology from the papers. Do not paraphrase technical terms into vague language.
-7. Be concise: 200-400 words. Dense, not padded.'
+3. Identify: what is SHARED across papers, what is UNIQUE to each, what is MISSING from all.'
+    ;;
+  inventory)
+    TYPE_RULES='You are a research synthesis engine producing a COMPREHENSIVE INVENTORY.
+SPECIFIC RULES:
+1. The question asks WHAT EXISTS. List all relevant items from the papers with specifics (names, metrics, scope).
+2. Organize by category, not by paper. Group similar items together.
+3. For each item: name, source paper, key characteristics, and limitations.
+4. Identify GAPS: what categories are underrepresented or missing entirely?'
+    ;;
+  evidence-synthesis)
+    TYPE_RULES='You are a research synthesis engine producing an EVIDENCE SYNTHESIS.
+SPECIFIC RULES:
+1. The question asks what the EVIDENCE says. Present findings as claims with supporting/contradicting evidence.
+2. For each claim: which papers support it, which contradict, and the strength of evidence (how many papers, how rigorous).
+3. Distinguish between empirically tested claims and theoretical arguments.
+4. When evidence is mixed or thin, say so explicitly. Do not pretend consensus exists where it does not.'
+    ;;
+  mapping)
+    TYPE_RULES='You are a research synthesis engine producing a RELATIONSHIP MAPPING.
+SPECIFIC RULES:
+1. The question asks how concepts RELATE. Map the specific connections between them.
+2. Identify: shared foundations, key differences, what one does that the other cannot.
+3. If mapping to "my system," be SPECIFIC about which components correspond and where the analogy breaks down.
+4. Focus on functional relationships (what enables what, what depends on what), not surface similarity.'
+    ;;
+  gap-analysis)
+    TYPE_RULES='You are a research synthesis engine producing a GAP ANALYSIS.
+SPECIFIC RULES:
+1. The question asks about what is MISSING or most important. Synthesize across ALL available papers.
+2. Identify problems that multiple papers mention but none solve.
+3. Distinguish between acknowledged limitations and blind spots (things no paper even discusses).
+4. Rank by importance: what gap, if closed, would unlock the most progress?'
+    ;;
+esac
+
+SYSTEM_PROMPT="${TYPE_RULES}
+
+${BASE_RULES}"
 
 USER_PROMPT="Question: $QUERY
 
@@ -95,7 +196,7 @@ ${PAPER_CONTEXT:-"(no matching papers found in local store)"}
 ## Additional Context
 ${RAW_LOG_CONTEXT:+"$RAW_LOG_CONTEXT"}
 
-Synthesize a comparative answer."
+Answer the question using the approach specified in your instructions."
 
 RESPONSE=$(curl -s --max-time 45 "https://api.openai.com/v1/chat/completions" \
   -H "Content-Type: application/json" \
@@ -104,12 +205,12 @@ RESPONSE=$(curl -s --max-time 45 "https://api.openai.com/v1/chat/completions" \
     --arg sys "$SYSTEM_PROMPT" \
     --arg usr "$USER_PROMPT" \
     '{
-      model: "gpt-4o-mini",
+      model: "gpt-4o",
       messages: [
         {role: "system", content: $sys},
         {role: "user", content: $usr}
       ],
-      max_tokens: 900,
+      max_tokens: 1000,
       temperature: 0.3
     }')" 2>/dev/null)
 

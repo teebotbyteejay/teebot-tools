@@ -7,35 +7,59 @@ set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
 DATE="${1:-$(date -u +%Y-%m-%d)}"
-LOG_FILE="$WORKSPACE/memory/$DATE.md"
 
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
 C_GREEN='\033[32m'; C_CYAN='\033[36m'; C_YELLOW='\033[33m'
-
-if [[ ! -f "$LOG_FILE" ]]; then
-  echo -e "${C_DIM}No daily log for $DATE${C_RESET}"
-  exit 0
-fi
 
 if ! command -v graphmem-sqlite &>/dev/null; then
   echo "graphmem-sqlite not found" >&2
   exit 1
 fi
 
-# Check if we already ingested today (marker file)
+# Collect all files matching this date: YYYY-MM-DD.md, YYYY-MM-DD-*.md
+LOG_FILES=()
+for f in "$WORKSPACE/memory/$DATE"*.md; do
+  [[ -f "$f" ]] && LOG_FILES+=("$f")
+done
+
+if [[ ${#LOG_FILES[@]} -eq 0 ]]; then
+  echo -e "${C_DIM}No files for $DATE${C_RESET}"
+  exit 0
+fi
+
+# Check if we already ingested today (marker stores hash of file list)
 MARKER_DIR="$WORKSPACE/memory/.ingest-markers"
 mkdir -p "$MARKER_DIR"
 MARKER="$MARKER_DIR/$DATE.done"
 
+# Build a fingerprint of all matching files (names + sizes)
+CURRENT_FINGERPRINT=""
+for f in "${LOG_FILES[@]}"; do
+  CURRENT_FINGERPRINT+="$(basename "$f"):$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null);"
+done
+
 if [[ -f "$MARKER" ]]; then
-  echo -e "${C_DIM}Already ingested $DATE (marker exists)${C_RESET}"
-  exit 0
+  OLD_FINGERPRINT=$(cat "$MARKER" | tail -1)
+  if [[ "$CURRENT_FINGERPRINT" == "$OLD_FINGERPRINT" ]]; then
+    echo -e "${C_DIM}Already ingested $DATE (${#LOG_FILES[@]} files, unchanged)${C_RESET}"
+    exit 0
+  else
+    echo -e "${C_YELLOW}Files changed since last ingest — re-ingesting new files${C_RESET}"
+  fi
 fi
 
-echo -e "${C_CYAN}${C_BOLD}Ingesting daily log: $DATE${C_RESET}"
+echo -e "${C_CYAN}${C_BOLD}Ingesting $DATE — ${#LOG_FILES[@]} file(s):${C_RESET}"
+for f in "${LOG_FILES[@]}"; do
+  echo -e "  ${C_DIM}$(basename "$f")${C_RESET}"
+done
 
-# Read the log file
-LOG_CONTENT=$(cat "$LOG_FILE")
+# Concatenate all files with file headers
+LOG_CONTENT=""
+for f in "${LOG_FILES[@]}"; do
+  fname=$(basename "$f")
+  LOG_CONTENT+="--- $fname ---"$'\n'
+  LOG_CONTENT+="$(cat "$f")"$'\n\n'
+done
 LOG_SIZE=${#LOG_CONTENT}
 
 if [[ $LOG_SIZE -lt 50 ]]; then
@@ -88,7 +112,8 @@ echo -e "  ${C_GREEN}✓${C_RESET} Ingested $SUCCESS chunks ($FAIL failed)"
 
 # Write marker if any chunks succeeded
 if [[ $SUCCESS -gt 0 ]]; then
-  date -u +%Y-%m-%dT%H:%M:%SZ > "$MARKER"
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER"
+  echo "$CURRENT_FINGERPRINT" >> "$MARKER"
   echo -e "  ${C_DIM}Marker written: $MARKER${C_RESET}"
 else
   echo -e "  ${C_YELLOW}⚠${C_RESET} All chunks failed, no marker written (will retry next heartbeat)"

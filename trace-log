@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# trace-log — append execution trace entries during a work session
+# Builds up a trace file that can be passed to post-task --trace-file
+#
+# Usage:
+#   trace-log tool "paper-ingest x3 (MoA, memory-eval, taxonomy)"
+#   trace-log decision "Stopped at 77% — diminishing returns"
+#   trace-log failure "Shell quoting bug: single quote broke script"
+#   trace-log timing "90min for +7 total points"
+#   trace-log show                    # print current trace
+#   trace-log clear                   # reset trace
+#   trace-log path                    # print trace file path
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+TRACE_FILE="$WORKSPACE/memory/current-trace.log"
+
+case "${1:-show}" in
+  tool|decision|failure|timing|note)
+    category="${1^^}"
+    shift
+    echo "[$category $(date +%H:%M)] $*" >> "$TRACE_FILE"
+    echo "  ✓ Logged: [$category] $*"
+    ;;
+  show)
+    if [[ -f "$TRACE_FILE" ]]; then
+      cat "$TRACE_FILE"
+    else
+      echo "(no trace entries yet)"
+    fi
+    ;;
+  clear)
+    rm -f "$TRACE_FILE"
+    echo "  ✓ Trace cleared"
+    ;;
+  path)
+    echo "$TRACE_FILE"
+    ;;
+  *)
+    echo "Usage: trace-log {tool|decision|failure|timing|note|show|clear|path} [message]" >&2
+    exit 1
+    ;;
+esac

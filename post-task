@@ -11,19 +11,28 @@
 #   --no-feedback   Skip rule feedback loop
 set -euo pipefail
 
-TASK="${1:-}"
-OUTCOME="${2:-}"
+TASK=""
+OUTCOME=""
+TRACE=""
 SCORE_ONLY=false
 NO_GRAPH=false
 NO_FEEDBACK=false
 
-for arg in "$@"; do
-  case "$arg" in
-    --score-only) SCORE_ONLY=true ;;
-    --no-graph) NO_GRAPH=true ;;
-    --no-feedback) NO_FEEDBACK=true ;;
+# Parse args: positional + flags
+positional=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --score-only) SCORE_ONLY=true; shift ;;
+    --no-graph) NO_GRAPH=true; shift ;;
+    --no-feedback) NO_FEEDBACK=true; shift ;;
+    --trace) TRACE="${2:-}"; shift 2 ;;
+    --trace=*) TRACE="${1#--trace=}"; shift ;;
+    --trace-file) [[ -f "${2:-}" ]] && TRACE=$(cat "$2"); shift 2 ;;
+    *) positional+=("$1"); shift ;;
   esac
 done
+TASK="${positional[0]:-}"
+OUTCOME="${positional[1]:-}"
 
 [[ -z "$TASK" ]] && { echo "Usage: post-task '<task>' '<outcome>'" >&2; exit 1; }
 [[ -z "$OUTCOME" ]] && { echo "Usage: post-task '<task>' '<outcome>'" >&2; exit 1; }
@@ -35,7 +44,9 @@ C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_CYAN='\033[36m'; C_YE
 # --- Run reflexion evaluation (extract new rules) ---
 eval_id=""
 if command -v reflexion-eval &>/dev/null; then
-  eval_output=$(reflexion-eval evaluate "$TASK" "$OUTCOME" 2>&1)
+  trace_args=()
+  [[ -n "$TRACE" ]] && trace_args=(--trace "$TRACE")
+  eval_output=$(reflexion-eval evaluate "$TASK" "$OUTCOME" "${trace_args[@]}" 2>&1)
   
   if $SCORE_ONLY; then
     echo "$eval_output" | grep -oP 'score=\K[0-9]+' || echo "unknown"
@@ -64,10 +75,16 @@ if ! $NO_FEEDBACK && [[ -f "$PRETASK_FILE" ]] && command -v reflexion-eval &>/de
     if [[ -n "${OPENAI_API_KEY:-}" ]]; then
       system_prompt="You evaluate whether behavioral rules were followed during a task. For each rule, respond with a JSON array of objects: {\"id\": \"rule-id\", \"verdict\": \"reinforced\" or \"contradicted\" or \"not_applicable\", \"reason\": \"brief explanation\"}. Only output the JSON array, nothing else."
       
+      trace_for_feedback=""
+      [[ -n "$TRACE" ]] && trace_for_feedback="
+
+Execution Trace:
+${TRACE:0:1500}"
+
       user_prompt="Task: $TASK
 
 Outcome: $OUTCOME
-
+$trace_for_feedback
 Rules that were available during this task:
 $rules_summary
 

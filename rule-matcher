@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Embedding-based rule matching for reflexion-eval.
+Pre-computes rule trigger embeddings, then matches by cosine similarity.
+
+Usage:
+  rule-matcher embed          Pre-compute embeddings for all rules
+  rule-matcher match "task"   Find semantically matching rules (threshold 0.4)
+  rule-matcher match-json "task"  Same but JSON output
+"""
+import json, sys, os, struct
+import numpy as np
+
+WORKSPACE = os.environ.get("WORKSPACE", os.path.expanduser("~/.openclaw/workspace"))
+RULES_FILE = os.path.join(WORKSPACE, "memory", "reflexion-rules.json")
+EMBED_FILE = os.path.join(WORKSPACE, "memory", "rule-embeddings.bin")
+MATCH_THRESHOLD = 0.40  # Cosine similarity threshold
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBED_DIM = 1536
+
+def get_embedding(text: str) -> np.ndarray:
+    from openai import OpenAI
+    client = OpenAI()
+    resp = client.embeddings.create(input=[text], model=EMBEDDING_MODEL)
+    return np.array(resp.data[0].embedding, dtype=np.float32)
+
+def get_embeddings_batch(texts: list) -> list:
+    from openai import OpenAI
+    client = OpenAI()
+    resp = client.embeddings.create(input=texts, model=EMBEDDING_MODEL)
+    return [np.array(d.embedding, dtype=np.float32) for d in sorted(resp.data, key=lambda x: x.index)]
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    dot = np.dot(a, b)
+    norm = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(dot / norm) if norm > 0 else 0.0
+
+def save_embeddings(rule_ids: list, embeddings: list):
+    """Save as binary: [count:u32] then [id_len:u16][id:bytes][embedding:1536*f32] per rule."""
+    with open(EMBED_FILE, "wb") as f:
+        f.write(struct.pack("<I", len(rule_ids)))
+        for rid, emb in zip(rule_ids, embeddings):
+            rid_bytes = rid.encode("utf-8")
+            f.write(struct.pack("<H", len(rid_bytes)))
+            f.write(rid_bytes)
+            f.write(emb.tobytes())
+
+def load_embeddings() -> dict:
+    """Load rule embeddings. Returns {rule_id: np.array}."""
+    if not os.path.exists(EMBED_FILE):
+        return {}
+    result = {}
+    with open(EMBED_FILE, "rb") as f:
+        count = struct.unpack("<I", f.read(4))[0]
+        for _ in range(count):
+            id_len = struct.unpack("<H", f.read(2))[0]
+            rid = f.read(id_len).decode("utf-8")
+            emb = np.frombuffer(f.read(EMBED_DIM * 4), dtype=np.float32).copy()
+            result[rid] = emb
+    return result
+
+def cmd_embed():
+    """Pre-compute embeddings for all active rules."""
+    with open(RULES_FILE) as f:
+        data = json.load(f)
+    
+    rules = data.get("rules", [])
+    if not rules:
+        print("No rules to embed.")
+        return
+    
+    # Only embed rules that don't already have embeddings
+    existing = load_embeddings()
+    to_embed = [(r["id"], f"{r['trigger']} → {r['action']}") for r in rules if r["id"] not in existing]
+    
+    if not to_embed:
+        print(f"All {len(rules)} rules already embedded.")
+        return
+    
+    print(f"Embedding {len(to_embed)} new rules ({len(existing)} already cached)...")
+    ids, texts = zip(*to_embed)
+    new_embeddings = get_embeddings_batch(list(texts))
+    
+    # Merge with existing
+    all_active_ids = {r["id"] for r in rules}
+    merged_ids = []
+    merged_embs = []
+    for rid, emb in existing.items():
+        if rid in all_active_ids:  # Keep only active rules
+            merged_ids.append(rid)
+            merged_embs.append(emb)
+    for rid, emb in zip(ids, new_embeddings):
+        merged_ids.append(rid)
+        merged_embs.append(emb)
+    
+    save_embeddings(merged_ids, merged_embs)
+    print(f"✓ Embedded {len(to_embed)} new, {len(merged_ids)} total active rules.")
+
+def cmd_match(task: str, as_json: bool = False):
+    """Match task against rules using cosine similarity."""
+    embeddings = load_embeddings()
+    if not embeddings:
+        print("No embeddings found. Run 'rule-matcher embed' first.", file=sys.stderr)
+        sys.exit(1)
+    
+    with open(RULES_FILE) as f:
+        data = json.load(f)
+    rules_by_id = {r["id"]: r for r in data.get("rules", [])}
+    
+    # Get task embedding
+    task_emb = get_embedding(task)
+    
+    # Score all rules
+    scored = []
+    for rid, rule_emb in embeddings.items():
+        if rid not in rules_by_id:
+            continue
+        rule = rules_by_id[rid]
+        if rule.get("confidence", 0) < 40:
+            continue
+        sim = cosine_similarity(task_emb, rule_emb)
+        if sim >= MATCH_THRESHOLD:
+            scored.append((sim, rule))
+    
+    scored.sort(key=lambda x: -x[0])
+    
+    if as_json:
+        result = []
+        for sim, rule in scored:
+            result.append({
+                "id": rule["id"],
+                "trigger": rule["trigger"],
+                "action": rule["action"],
+                "confidence": rule.get("confidence", 50),
+                "similarity": round(sim, 3),
+                "evidence": len(rule.get("evidence", []))
+            })
+        print(json.dumps(result))
+    else:
+        if not scored:
+            print("  No semantically matching rules found.")
+        else:
+            print(f"\n## Learned Rules (semantic match, threshold {MATCH_THRESHOLD})")
+            for sim, rule in scored:
+                conf = rule.get("confidence", 50)
+                ev = len(rule.get("evidence", []))
+                print(f"- {rule['trigger']}: {rule['action']} (sim: {sim:.2f}, confidence: {conf}, evidence: {ev} tasks)")
+            print(f"\n  {len(scored)} rules matched")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    cmd = sys.argv[1]
+    if cmd == "embed":
+        cmd_embed()
+    elif cmd == "match":
+        if len(sys.argv) < 3:
+            print("Usage: rule-matcher match '<task>'", file=sys.stderr)
+            sys.exit(1)
+        cmd_match(sys.argv[2])
+    elif cmd == "match-json":
+        if len(sys.argv) < 3:
+            print("Usage: rule-matcher match-json '<task>'", file=sys.stderr)
+            sys.exit(1)
+        cmd_match(sys.argv[2], as_json=True)
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        sys.exit(1)
