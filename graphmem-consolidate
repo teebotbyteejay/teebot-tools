@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# graphmem-consolidate — merge duplicate entities + prune noise from graph memory
+# Usage: graphmem-consolidate [--dry-run]
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+DB="$WORKSPACE/graphmem/data/graphmem.db"
+DRY_RUN=false
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_GREEN='\033[32m'; C_CYAN='\033[36m'; C_YELLOW='\033[33m'; C_RED='\033[31m'
+
+if [[ ! -f "$DB" ]]; then
+  echo -e "${C_RED}Database not found: $DB${C_RESET}" >&2
+  exit 1
+fi
+
+echo -e "${C_BOLD}🔗 Graph Memory Consolidation${C_RESET}"
+[[ "$DRY_RUN" == "true" ]] && echo -e "${C_YELLOW}DRY RUN — no changes will be made${C_RESET}"
+
+# Backup
+if [[ "$DRY_RUN" == "false" ]]; then
+  cp "$DB" "${DB}.bak-$(date +%Y%m%d%H%M%S)"
+  echo -e "${C_DIM}Backup created${C_RESET}"
+fi
+
+python3 - "$DB" "$DRY_RUN" << 'PYEOF'
+import sqlite3, sys, numpy as np
+from collections import defaultdict
+
+db_path, dry_run = sys.argv[1], sys.argv[2] == "true"
+db = sqlite3.connect(db_path)
+
+# --- Phase 1: Find merge candidates ---
+rows = db.execute('SELECT id, name, type, summary, embedding FROM entities WHERE embedding IS NOT NULL').fetchall()
+print(f"\n📊 {len(rows)} entities with embeddings")
+
+entities = {}
+for id, name, etype, summary, emb_blob in rows:
+    emb = np.frombuffer(emb_blob, dtype=np.float32)
+    edges = db.execute('SELECT COUNT(*) FROM edges WHERE source_id=? OR target_id=?', (id, id)).fetchone()[0]
+    entities[id] = {"id": id, "name": name, "type": etype, "summary": summary, "emb": emb, "edges": edges}
+
+# --- Phase 2: Exact name merges (case-insensitive) ---
+by_lower = defaultdict(list)
+for e in entities.values():
+    by_lower[e["name"].lower().strip()].append(e)
+
+merges = []
+for key, group in by_lower.items():
+    if len(group) > 1:
+        # Keep the one with most edges
+        group.sort(key=lambda x: -x["edges"])
+        keep = group[0]
+        for discard in group[1:]:
+            merges.append((keep, discard, "exact-name"))
+
+# --- Phase 2b: Normalized name merges (case + hyphens + underscores) ---
+by_normalized = defaultdict(list)
+for e in entities.values():
+    key = e["name"].lower().replace("-", " ").replace("_", " ").strip()
+    by_normalized[key].append(e)
+
+for key, group in by_normalized.items():
+    if len(group) > 1:
+        group.sort(key=lambda x: -x["edges"])
+        keep = group[0]
+        for discard in group[1:]:
+            if discard["id"] not in {m[1]["id"] for m in merges}:
+                merges.append((keep, discard, "normalized-name"))
+
+# --- Phase 3: Semantic merges (>0.92 similarity, same type or compatible) ---
+elist = list(entities.values())
+for i in range(len(elist)):
+    for j in range(i + 1, len(elist)):
+        e1, e2 = elist[i], elist[j]
+        # Skip if already queued for merge
+        merge_ids = {m[1]["id"] for m in merges}
+        if e1["id"] in merge_ids or e2["id"] in merge_ids:
+            continue
+        # Skip if different types (unless one is 'other')
+        if e1["type"] != e2["type"] and e1["type"] != "other" and e2["type"] != "other":
+            continue
+        sim = np.dot(e1["emb"], e2["emb"]) / (np.linalg.norm(e1["emb"]) * np.linalg.norm(e2["emb"]))
+        if sim > 0.92:
+            # Additional check: names should be related (not just similar embeddings)
+            n1, n2 = e1["name"].lower(), e2["name"].lower()
+            # At least one name should be a substring of the other, or they share significant tokens
+            tokens1 = set(n1.replace("-", " ").replace("_", " ").split())
+            tokens2 = set(n2.replace("-", " ").replace("_", " ").split())
+            overlap = tokens1 & tokens2
+            # Require >50% token overlap or one is substring of other
+            max_tokens = max(len(tokens1), len(tokens2))
+            if max_tokens > 0 and len(overlap) / max_tokens <= 0.5 and n1 not in n2 and n2 not in n1:
+                continue
+            keep = e1 if e1["edges"] >= e2["edges"] else e2
+            discard = e2 if keep == e1 else e1
+            merges.append((keep, discard, f"semantic-{sim:.3f}"))
+
+print(f"\n🔗 {len(merges)} merge(s) to apply:")
+for keep, discard, reason in merges:
+    print(f"  {reason}: \"{discard['name']}\" [{discard['edges']}e] → \"{keep['name']}\" [{keep['edges']}e]")
+
+# --- Phase 4: Identify noise entities to delete ---
+noise = []
+for e in entities.values():
+    # Workers from self-moa
+    if e["name"].startswith("Worker ") and e["type"] == "person":
+        noise.append((e, "self-moa worker"))
+        continue
+    # Paper authors with 1 edge and no other connections
+    if e["type"] == "person" and e["edges"] <= 1:
+        edge = db.execute(
+            'SELECT fact FROM edges WHERE (source_id=? OR target_id=?) AND expired_at IS NULL',
+            (e["id"], e["id"])
+        ).fetchone()
+        if edge and any(w in (edge[0] or "").lower() for w in ["co-authored", "authored", "wrote paper", "paper by"]):
+            noise.append((e, "single-edge paper author"))
+
+print(f"\n🗑️  {len(noise)} noise entities to delete:")
+for e, reason in noise[:20]:
+    print(f"  {reason}: \"{e['name']}\" [{e['type']}, {e['edges']}e]")
+if len(noise) > 20:
+    print(f"  ... and {len(noise) - 20} more")
+
+if dry_run:
+    print("\n⏸️  DRY RUN — no changes applied")
+    sys.exit(0)
+
+# --- Phase 5: Apply merges ---
+merged_count = 0
+for keep, discard, reason in merges:
+    # Reassign all edges from discard to keep
+    db.execute('UPDATE edges SET source_id=? WHERE source_id=?', (keep["id"], discard["id"]))
+    db.execute('UPDATE edges SET target_id=? WHERE target_id=?', (keep["id"], discard["id"]))
+    # Delete self-referencing edges that may have been created
+    db.execute('DELETE FROM edges WHERE source_id=? AND target_id=?', (keep["id"], keep["id"]))
+    # Merge summary if keep has none
+    if not keep["summary"] and discard["summary"]:
+        db.execute('UPDATE entities SET summary=? WHERE id=?', (discard["summary"], keep["id"]))
+    # Delete the duplicate entity
+    db.execute('DELETE FROM entities WHERE id=?', (discard["id"],))
+    merged_count += 1
+
+# --- Phase 6: Delete noise ---
+deleted_count = 0
+for e, reason in noise:
+    # Delete edges first
+    db.execute('DELETE FROM edges WHERE source_id=? OR target_id=?', (e["id"], e["id"]))
+    db.execute('DELETE FROM entities WHERE id=?', (e["id"],))
+    deleted_count += 1
+
+# --- Phase 7: Deduplicate edges (same source+target, similar description) ---
+edges = db.execute('''
+    SELECT e1.id, e2.id, e1.source_id, e1.target_id, e1.relation, e2.relation
+    FROM edges e1
+    JOIN edges e2 ON e1.source_id = e2.source_id AND e1.target_id = e2.target_id AND e1.id < e2.id
+    WHERE e1.expired_at IS NULL AND e2.expired_at IS NULL
+''').fetchall()
+
+deduped_edges = 0
+seen = set()
+for e1_id, e2_id, src, tgt, rel1, rel2 in edges:
+    if e2_id in seen:
+        continue
+    if rel1 and rel2 and rel1.lower() == rel2.lower():
+        db.execute('DELETE FROM edges WHERE id=?', (e2_id,))
+        deduped_edges += 1
+        seen.add(e2_id)
+
+db.commit()
+
+# Final stats
+final_entities = db.execute('SELECT COUNT(*) FROM entities').fetchone()[0]
+final_edges = db.execute('SELECT COUNT(*) FROM edges WHERE expired_at IS NULL').fetchone()[0]
+print(f"\n✅ Done: {merged_count} merged, {deleted_count} deleted, {deduped_edges} edges deduped")
+print(f"   Entities: {len(rows)} → {final_entities}")
+print(f"   Active edges: {final_edges}")
+PYEOF
+
+echo -e "\n${C_DIM}Consolidation complete${C_RESET}"

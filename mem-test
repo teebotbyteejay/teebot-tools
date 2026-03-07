@@ -42,7 +42,7 @@ TEST_CASES=(
   "How many entities were in the graph when Kuzu started segfaulting?|270|2026-02-26"
 
   # Factual: What was the mem-eval score?
-  "What score did mem-eval give the memory system after the Day 2 improvements?|85|2026-02-26"
+  "What is mem-eval v2 and what does it do?|score|0 to 100|staleness|orphan|2026-02-27"
 
   # Factual: Who is described as the sharpest critic?
   "Who does teebot consider the sharpest critic among key people?|Faheem|MEMORY.md"
@@ -68,7 +68,7 @@ TEST_CASES=(
   # === March 3 additions: harder questions requiring cross-session synthesis ===
 
   # Cross-reference: What paper finding did the retrieval trigger implement?
-  "What paper's concept inspired the retrieval trigger in pre-task, and what threshold was chosen?|MemGen|4.0|2026-03-03"
+  "What paper's concept inspired the retrieval trigger in pre-task, and what threshold was chosen?|MemGen|0.35|2026-03-04"
 
   # Numerical: What was the Exgentic finding about model vs architecture variance?
   "According to the Exgentic paper, what percentage of agent performance variance is explained by model choice vs architecture?|28.2|0.6|2026-03-03"

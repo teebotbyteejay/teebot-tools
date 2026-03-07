@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Retrieve similar past task evaluations as in-context examples.
+Inspired by SiriuS (repaired trajectories) and Self-Generated In-Context Examples
+(Sarukkai et al., 73%→93% on ALFWorld).
+
+Usage:
+  eval-examples embed           Pre-compute embeddings for all eval tasks
+  eval-examples match "task"    Find similar past evals (JSON output)
+  eval-examples format "task"   Human-readable formatted examples
+"""
+import json, sys, os, struct, glob
+import numpy as np
+
+WORKSPACE = os.environ.get("WORKSPACE", os.path.expanduser("~/.openclaw/workspace"))
+EVALS_DIR = os.path.join(WORKSPACE, "memory", "reflexion-evals")
+EMBED_FILE = os.path.join(WORKSPACE, "memory", "eval-embeddings.bin")
+MATCH_THRESHOLD = 0.50  # Higher than rules — we want genuinely similar tasks
+MAX_EXAMPLES = 2
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBED_DIM = 1536
+
+def get_embeddings_batch(texts: list) -> list:
+    from openai import OpenAI
+    client = OpenAI()
+    # Batch in chunks of 50
+    all_embs = []
+    for i in range(0, len(texts), 50):
+        batch = texts[i:i+50]
+        resp = client.embeddings.create(input=batch, model=EMBEDDING_MODEL)
+        embs = [np.array(d.embedding, dtype=np.float32) for d in sorted(resp.data, key=lambda x: x.index)]
+        all_embs.extend(embs)
+    return all_embs
+
+def get_embedding(text: str) -> np.ndarray:
+    from openai import OpenAI
+    client = OpenAI()
+    resp = client.embeddings.create(input=[text], model=EMBEDDING_MODEL)
+    return np.array(resp.data[0].embedding, dtype=np.float32)
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    dot = np.dot(a, b)
+    norm = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(dot / norm) if norm > 0 else 0.0
+
+def save_embeddings(eval_ids: list, embeddings: list):
+    with open(EMBED_FILE, "wb") as f:
+        f.write(struct.pack("<I", len(eval_ids)))
+        for eid, emb in zip(eval_ids, embeddings):
+            eid_bytes = eid.encode("utf-8")
+            f.write(struct.pack("<H", len(eid_bytes)))
+            f.write(eid_bytes)
+            f.write(emb.tobytes())
+
+def load_embeddings() -> dict:
+    if not os.path.exists(EMBED_FILE):
+        return {}
+    result = {}
+    with open(EMBED_FILE, "rb") as f:
+        count = struct.unpack("<I", f.read(4))[0]
+        for _ in range(count):
+            id_len = struct.unpack("<H", f.read(2))[0]
+            eid = f.read(id_len).decode("utf-8")
+            emb = np.frombuffer(f.read(EMBED_DIM * 4), dtype=np.float32).copy()
+            result[eid] = emb
+    return result
+
+def load_eval(eval_id: str) -> dict:
+    """Load an eval file by ID (filename without .json)."""
+    path = os.path.join(EVALS_DIR, f"{eval_id}.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+def get_all_evals() -> list:
+    """Load all evals with scores."""
+    evals = []
+    for path in glob.glob(os.path.join(EVALS_DIR, "*.json")):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            task = data.get("task", "")
+            if not task:
+                continue
+            score = None
+            if "evaluation" in data and isinstance(data["evaluation"], dict):
+                score = data["evaluation"].get("score")
+            elif "score" in data:
+                score = data.get("score")
+            eval_id = os.path.basename(path).replace(".json", "")
+            evals.append({"id": eval_id, "task": task, "score": score, "data": data})
+        except:
+            continue
+    return evals
+
+def cmd_embed():
+    evals = get_all_evals()
+    existing = load_embeddings()
+    
+    new_evals = [e for e in evals if e["id"] not in existing]
+    if not new_evals:
+        print(f"All {len(evals)} evals already embedded.")
+        return
+    
+    print(f"Embedding {len(new_evals)} new evals ({len(existing)} existing)...")
+    texts = [e["task"] for e in new_evals]
+    embeddings = get_embeddings_batch(texts)
+    
+    # Merge with existing
+    all_ids = list(existing.keys()) + [e["id"] for e in new_evals]
+    all_embs = list(existing.values()) + embeddings
+    
+    save_embeddings(all_ids, all_embs)
+    print(f"Embedded {len(new_evals)} new. Total: {len(all_ids)}")
+
+def cmd_match(task: str) -> list:
+    embeddings = load_embeddings()
+    if not embeddings:
+        return []
+    
+    task_emb = get_embedding(task)
+    
+    # Score all evals
+    scored = []
+    for eval_id, emb in embeddings.items():
+        sim = cosine_similarity(task_emb, emb)
+        if sim >= MATCH_THRESHOLD:
+            scored.append((sim, eval_id))
+    
+    scored.sort(reverse=True)
+    
+    results = []
+    for sim, eval_id in scored[:MAX_EXAMPLES]:
+        eval_data = load_eval(eval_id)
+        if not eval_data:
+            continue
+        
+        evaluation = eval_data.get("evaluation", {})
+        if not isinstance(evaluation, dict):
+            continue
+        
+        result = {
+            "eval_id": eval_id,
+            "similarity": round(sim, 3),
+            "task": eval_data.get("task", ""),
+            "outcome": eval_data.get("outcome", ""),
+            "score": evaluation.get("score"),
+            "what_worked": evaluation.get("what_worked", []),
+            "what_failed": evaluation.get("what_failed", []),
+        }
+        results.append(result)
+    
+    return results
+
+def cmd_format(task: str) -> str:
+    matches = cmd_match(task)
+    if not matches:
+        return ""
+    
+    output = "## Past Examples (similar tasks)\n"
+    for i, m in enumerate(matches, 1):
+        score_label = "✓" if (m["score"] or 0) >= 80 else "✗"
+        output += f"\n### Example {i} ({score_label} score={m['score']}, similarity={m['similarity']})\n"
+        output += f"**Task:** {m['task'][:200]}\n"
+        if m['outcome']:
+            output += f"**Outcome:** {m['outcome'][:300]}\n"
+        if m['what_worked']:
+            output += "**What worked:** " + "; ".join(m['what_worked'][:3]) + "\n"
+        if m['what_failed']:
+            output += "**What failed:** " + "; ".join(m['what_failed'][:3]) + "\n"
+    
+    return output
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    cmd = sys.argv[1]
+    if cmd == "embed":
+        cmd_embed()
+    elif cmd == "match":
+        task = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not task:
+            print("Usage: eval-examples match 'task description'")
+            sys.exit(1)
+        results = cmd_match(task)
+        print(json.dumps(results, indent=2))
+    elif cmd == "format":
+        task = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not task:
+            print("Usage: eval-examples format 'task description'")
+            sys.exit(1)
+        output = cmd_format(task)
+        if output:
+            print(output)
+        else:
+            print("No similar past examples found.")
+    else:
+        print(f"Unknown command: {cmd}")
+        print(__doc__)
+        sys.exit(1)

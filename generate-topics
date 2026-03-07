@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# generate-topics — build a lightweight topic index from MEMORY.md + graph memory
+# Output: TOPICS.md (~300 bytes) — always loaded in context
+# Usage: generate-topics
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+MEMORY="$WORKSPACE/MEMORY.md"
+DB="$WORKSPACE/graphmem/data/graphmem.db"
+TOPICS="$WORKSPACE/TOPICS.md"
+
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  echo "ANTHROPIC_API_KEY not set" >&2
+  exit 1
+fi
+
+# Gather inputs
+memory_content=""
+[[ -f "$MEMORY" ]] && memory_content=$(cat "$MEMORY")
+
+graph_top=""
+if [[ -f "$DB" ]]; then
+  graph_top=$(python3 -c "
+import sqlite3
+db = sqlite3.connect('$DB')
+entities = db.execute('''
+    SELECT e.name, e.type, COUNT(ed.id) as c
+    FROM entities e
+    LEFT JOIN edges ed ON (ed.source_id = e.id OR ed.target_id = e.id) AND ed.expired_at IS NULL
+    GROUP BY e.id HAVING c >= 5
+    ORDER BY c DESC LIMIT 50
+''').fetchall()
+for name, etype, count in entities:
+    print(f'{name} [{etype}] ({count} connections)')
+" 2>/dev/null)
+fi
+
+# Single LLM call to generate topic index
+result=$(curl -s https://api.anthropic.com/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -d "$(jq -n \
+    --arg memory "$memory_content" \
+    --arg graph "$graph_top" \
+    '{
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 512,
+      system: "Generate a topic index for an AI agent'\''s memory. Output ONLY the index, nothing else.\n\nFormat: TOPIC: keyword1, keyword2, keyword3\n\nRules:\n- Max 10 clusters, no overlap between them\n- Each line under 60 chars\n- Keywords = search queries, not descriptions\n- Cover: active projects, people, tools, key findings\n- Sort by importance",
+      messages: [{role: "user", content: ("## MEMORY.md\n" + $memory + "\n\n## Top Graph Entities\n" + $graph + "\n\nGenerate the topic index.")}]
+    }')" 2>/dev/null)
+
+topics=$(echo "$result" | jq -r '.content[0].text // empty' 2>/dev/null)
+
+if [[ -z "$topics" ]]; then
+  echo "Failed to generate topics" >&2
+  exit 1
+fi
+
+# Write TOPICS.md
+cat > "$TOPICS" << EOF
+# TOPICS.md
+When a conversation touches one of these topics, search graph memory for details.
+Use: graphmem-sqlite search "<keyword>" --limit 5
+
+$topics
+EOF
+
+echo "✓ TOPICS.md generated ($(wc -c < "$TOPICS") bytes)"
+cat "$TOPICS"

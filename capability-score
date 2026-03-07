@@ -55,7 +55,7 @@ if [[ -d "$eval_dir" ]]; then
   total=0
   while IFS= read -r f; do
     [[ -f "$f" ]] || continue
-    s=$(jq -r '.score // empty' "$f" 2>/dev/null || true)
+    s=$(jq -r '(.evaluation.score // .score) // empty' "$f" 2>/dev/null || true)
     [[ -z "$s" || "$s" == "null" ]] && continue
     total=$((total + s))
     eval_count=$((eval_count + 1))

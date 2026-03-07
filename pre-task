@@ -50,7 +50,18 @@ $rules
   matched_rules_json=$(reflexion-eval match-json "$TASK" 2>/dev/null || echo "[]")
 fi
 
-# --- 1.5. Retrieval Trigger (MemGen-inspired) ---
+# --- 1.5. Past Examples (SiriuS/Self-Generated Examples inspired) ---
+# Retrieve similar past task evaluations as in-context examples.
+# Research shows 73%→93% gains on ALFWorld from trajectory examples.
+if command -v eval-examples &>/dev/null && [[ -f "$WORKSPACE/memory/eval-embeddings.bin" ]]; then
+  examples=$(eval-examples format "$TASK" 2>/dev/null || true)
+  if [[ -n "$examples" && ! "$examples" =~ "No similar" ]]; then
+    output+="$examples
+"
+  fi
+fi
+
+# --- 1.6. Retrieval Trigger (MemGen-inspired) ---
 # Quick probe: is retrieval likely to be useful for this task?
 # Uses EMBEDDING score (semantic similarity) not composite score.
 # Composite score is inflated by FTS keyword overlap (e.g. "set up" matches everything).

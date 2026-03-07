@@ -206,3 +206,8 @@ if ! $NO_GRAPH && command -v graphmem-sqlite &>/dev/null; then
       echo -e "\n  ${C_GREEN}✓${C_RESET} Added to graph memory" || true
   fi
 fi
+
+# --- Update eval embeddings (for trajectory examples) ---
+if command -v eval-examples &>/dev/null; then
+  eval-examples embed &>/dev/null &
+fi

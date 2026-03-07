@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# retrofix-evals — Re-run semantic rule matching on historical evals
+# Replaces keyword-matched rules with proper embedding-based matches.
+# Also recalculates confidence scores based on corrected verdicts.
+#
+# Usage: retrofix-evals [--dry-run] [--verbose]
+set -euo pipefail
+
+export PATH="$HOME/.openclaw/workspace/teebot-tools:$HOME/.openclaw/workspace/graphmem:$PATH"
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+EVALS_DIR="$WORKSPACE/memory/reflexion-evals"
+RULES_FILE="$WORKSPACE/memory/reflexion-rules.json"
+
+DRY_RUN=false
+VERBOSE=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --verbose) VERBOSE=true ;;
+  esac
+done
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_GREEN='\033[32m'; C_RED='\033[31m'; C_YELLOW='\033[33m'
+
+echo -e "${C_BOLD}Retrofix: Re-matching historical evals with semantic rule matcher${C_RESET}"
+
+# Check prerequisites
+if ! command -v rule-matcher &>/dev/null; then
+  echo "Error: rule-matcher not found" >&2; exit 1
+fi
+if [[ ! -f "$WORKSPACE/memory/rule-embeddings.bin" ]]; then
+  echo "Error: rule-embeddings.bin not found. Run: rule-matcher embed" >&2; exit 1
+fi
+
+fixed=0
+skipped=0
+already_semantic=0
+no_feedback=0
+
+for eval_file in "$EVALS_DIR"/*.json; do
+  [[ -f "$eval_file" ]] || continue
+  
+  # Check if this eval has feedback with matched rules
+  rule_count=$(jq '.feedback.matched_rules | length' "$eval_file" 2>/dev/null || echo 0)
+  if [[ "$rule_count" == "0" || "$rule_count" == "null" ]]; then
+    no_feedback=$((no_feedback + 1))
+    continue
+  fi
+  
+  # Check if already semantic (has real numeric similarity scores > 0)
+  max_sim=$(jq '[.feedback.matched_rules[]?.similarity // 0 | numbers] | max // 0' "$eval_file" 2>/dev/null || echo 0)
+  if [[ $(echo "$max_sim > 0" | bc 2>/dev/null || echo 0) == "1" ]]; then
+    already_semantic=$((already_semantic + 1))
+    continue
+  fi
+  
+  # Get the task description
+  task=$(jq -r '.task // empty' "$eval_file" 2>/dev/null)
+  if [[ -z "$task" ]]; then
+    skipped=$((skipped + 1))
+    continue
+  fi
+  
+  # Get old rule IDs for comparison
+  old_ids=$(jq -r '.feedback.matched_rules[].id' "$eval_file" 2>/dev/null | sort)
+  old_count=$(echo "$old_ids" | grep -c . || echo 0)
+  
+  # Re-run semantic matching
+  new_rules=$(rule-matcher match-json "$task" 2>/dev/null || echo "[]")
+  new_count=$(echo "$new_rules" | jq 'length')
+  new_ids=$(echo "$new_rules" | jq -r '.[].id' 2>/dev/null | sort)
+  
+  # Count overlap
+  overlap=$(comm -12 <(echo "$old_ids") <(echo "$new_ids") 2>/dev/null | grep -c . || echo 0)
+  
+  if $VERBOSE; then
+    echo -e "\n${C_BOLD}$(basename "$eval_file")${C_RESET}: ${task:0:60}"
+    echo -e "  Old (keyword): $old_count rules"
+    echo -e "  New (semantic): $new_count rules"
+    echo -e "  Overlap: $overlap"
+  fi
+  
+  if $DRY_RUN; then
+    echo -e "  ${C_YELLOW}[DRY RUN]${C_RESET} Would update feedback"
+    fixed=$((fixed + 1))
+    continue
+  fi
+  
+  # Get the evaluation verdicts from the LLM-generated eval
+  # The verdicts need to be regenerated for the new rules
+  # For now, just reset verdicts (they'll be recalculated on next post-task)
+  eval_data=$(jq -r '.evaluation // empty' "$eval_file" 2>/dev/null)
+  
+  # Update the file: replace matched_rules and reset verdicts
+  jq --argjson new_rules "$new_rules" '
+    .feedback.matched_rules = $new_rules |
+    .feedback.verdicts = [] |
+    .feedback.reinforced = 0 |
+    .feedback.contradicted = 0 |
+    .feedback.skipped = (.feedback.matched_rules | length) |
+    .feedback.retrofixed = true
+  ' "$eval_file" > "${eval_file}.tmp" && mv "${eval_file}.tmp" "$eval_file"
+  
+  fixed=$((fixed + 1))
+  
+  if $VERBOSE; then
+    echo -e "  ${C_GREEN}✓${C_RESET} Updated: $old_count keyword → $new_count semantic"
+  fi
+done
+
+echo -e "\n${C_BOLD}Results:${C_RESET}"
+echo -e "  Fixed (keyword → semantic): $fixed"
+echo -e "  Already semantic: $already_semantic"
+echo -e "  No feedback data: $no_feedback"
+echo -e "  Skipped: $skipped"
+
+if [[ $fixed -gt 0 ]] && ! $DRY_RUN; then
+  echo -e "\n${C_YELLOW}Note:${C_RESET} Verdicts were reset. Rule confidence scores may need recalculation."
+  echo -e "Run: reflexion-eval stats  to check rule health"
+fi

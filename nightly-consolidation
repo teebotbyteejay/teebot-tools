@@ -159,4 +159,10 @@ if [[ -n "$archive" && "$archive" != "none" && "$archive" != "None" ]]; then
   fi
 fi
 
+# --- Regenerate topic index ---
+if command -v generate-topics &>/dev/null; then
+  echo -e "${C_DIM}Regenerating TOPICS.md...${C_RESET}"
+  generate-topics 2>/dev/null && echo -e "${C_GREEN}✓${C_RESET} TOPICS.md updated" || echo -e "${C_YELLOW}⚠ TOPICS.md generation failed${C_RESET}"
+fi
+
 echo -e "\n${C_DIM}Consolidation complete for ${DATE}${C_RESET}"

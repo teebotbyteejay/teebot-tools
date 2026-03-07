@@ -120,6 +120,11 @@ for d in $dates_from_graph; do
   [[ -f "$f" ]] && relevant_files="$relevant_files"$'\n'"$f"
 done
 
+# Always include core memory files
+for core_file in "$WORKSPACE/MEMORY.md" "$WORKSPACE/MEMORY-ARCHIVE.md"; do
+  [[ -f "$core_file" ]] && relevant_files="$relevant_files"$'\n'"$core_file"
+done
+
 # Deduplicate
 relevant_files=$(echo "$relevant_files" | sort -u | grep -v '^$')
 
@@ -157,8 +162,8 @@ for sec in sections:
     sec_lower = sec.lower()
     score = sum(1 for w in query_words if w in sec_lower)
     if score > 0:
-        trimmed = sec.strip()[:600]
-        if len(sec.strip()) > 600:
+        trimmed = sec.strip()[:1200]
+        if len(sec.strip()) > 1200:
             trimmed += '...'
         matches.append((score, trimmed))
 
@@ -204,19 +209,21 @@ system_prompt="You are a memory research assistant. Given a query, graph memory 
 
 CRITICAL RULES:
 1. When data conflicts across time, ALWAYS prefer the MOST RECENT data. Dates are in parentheses after graph results.
-2. Cite specific numbers, dates, and names from the evidence.
-3. Use precise terminology from the source material — don't paraphrase technical terms into vague language.
-4. When the query involves comparison or contrast, explicitly state BOTH sides (e.g., 'X in case A, but Y in case B').
+2. ALWAYS include specific numbers, percentages, thresholds, and scores from the evidence. If you see '28.2%' or '0.35' in the sources, include it verbatim.
+3. Use precise terminology from the source material — don't paraphrase technical terms into vague language. Use exact names (e.g., 'MemGen', not 'a paper').
+4. When the query involves comparison or contrast, explicitly state BOTH sides with their specific numbers (e.g., 'model choice explains 28.2% of variance, while scaffolding adds +12 points').
 5. Be concise — 3-8 sentences.
-6. If you're unsure, say what the most recent evidence shows rather than guessing."
+6. If you're unsure, say what the most recent evidence shows rather than guessing.
+7. When the query asks about multiple facts, make sure ALL are addressed. Don't summarize away requested details.
+8. Prioritize RAW LOG EXCERPTS over graph summaries for factual claims. Logs contain the ground truth; graph edges are summaries that can be imprecise."
 
 user_prompt="Query: $QUERY
 
-Graph memory results:
-$graph_output
+Raw log excerpts (PRIMARY SOURCE — trust these over graph summaries):
+$raw_context
 
-Raw log excerpts:
-$raw_context"
+Graph memory index (SECONDARY — use for dates and entity names, but prefer raw logs for facts):
+$graph_output"
 
 response=$(curl -s --max-time 30 "https://api.openai.com/v1/chat/completions" \
   -H "Content-Type: application/json" \

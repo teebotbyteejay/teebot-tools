@@ -229,15 +229,22 @@ Return JSON:
 
 CRITICAL: Only extract rules from SURPRISING or PAINFUL outcomes. Not from routine success.
 
+Rules must be GENERALIZABLE — they should apply to a CLASS of situations, not just this exact incident. Ask: "will this trigger match future tasks?"
+
 BAD rules (DO NOT generate):
-- "when developing a system → ensure clear communication" (platitude)
-- "when completing a task → implement error handling" (obvious)
+- "when developing a system → ensure clear communication" (platitude — too vague)
+- "when completing a task → implement error handling" (obvious — not learned)
+- "when encountering a scoring schema mismatch" (too specific — one-time incident, trigger won'\''t match future tasks)
+- "when context ordering affects synthesis results" (restates the finding as a trigger — not a reusable pattern)
+- "when truncation limits are silently dropping facts" (describes THIS bug, not a class of bugs)
 
 GOOD rules:
-- "when a bash script uses set -e with grep → add || true" (specific, from pain)
-- "when migrating databases → prefer SQLite over novel options" (learned from failure)
+- "when a bash script uses set -e with grep → add || true" (specific technique, reusable)
+- "when migrating databases → prefer SQLite over novel options" (class of decisions, learned from failure)
+- "when measurement metrics don'\''t match expectations → check the measurement tool first" (general pattern from specific incident)
+- "when two data sources conflict → check if one is truncated" (generalizes truncation finding)
 
-If nothing surprising happened, return {"rules": []}. Zero rules is correct for routine tasks.
+If nothing surprising happened, return {"rules": []}. Zero rules is CORRECT and PREFERRED for routine tasks.
 Do NOT duplicate existing rules.'
 
   local rule_user="Task: $task
