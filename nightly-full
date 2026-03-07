@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# nightly-full — complete nightly maintenance cycle
+# Called by the nightly cron after consolidation.
+# Runs: graphmem maintenance, reflexion decay, capability tracking.
+# Usage: nightly-full [YYYY-MM-DD]
+set -euo pipefail
+
+export PATH="$HOME/.openclaw/workspace/teebot-tools:$HOME/.openclaw/workspace/graphmem:$PATH"
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+DATE="${1:-$(date +%Y-%m-%d)}"
+SCORES_LOG="$WORKSPACE/memory/capability-scores.jsonl"
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'
+
+echo -e "${C_BOLD}🔧 Nightly Full Maintenance — ${DATE}${C_RESET}"
+
+errors=0
+
+# --- 1. Heartbeat ingest (feed today's logs into graphmem) ---
+echo -e "\n${C_DIM}[1/5] Heartbeat ingest...${C_RESET}"
+if heartbeat-ingest "$DATE" 2>&1; then
+  echo -e "${C_GREEN}✓${C_RESET} Heartbeat ingest complete"
+else
+  echo -e "${C_YELLOW}⚠ Heartbeat ingest failed (non-fatal)${C_RESET}"
+  ((errors++)) || true
+fi
+
+# --- 2. Graphmem consolidation (merge dupes, prune noise) ---
+echo -e "\n${C_DIM}[2/5] Graphmem consolidation...${C_RESET}"
+if graphmem-consolidate 2>&1; then
+  echo -e "${C_GREEN}✓${C_RESET} Graphmem consolidation complete"
+else
+  echo -e "${C_YELLOW}⚠ Graphmem consolidation failed (non-fatal)${C_RESET}"
+  ((errors++)) || true
+fi
+
+# --- 3. Reflexion rule decay (age stale rules) ---
+echo -e "\n${C_DIM}[3/5] Reflexion rule decay...${C_RESET}"
+if reflexion-eval decay 2>&1; then
+  echo -e "${C_GREEN}✓${C_RESET} Reflexion decay complete"
+else
+  echo -e "${C_YELLOW}⚠ Reflexion decay failed (non-fatal)${C_RESET}"
+  ((errors++)) || true
+fi
+
+# --- 4. Capability score snapshot ---
+echo -e "\n${C_DIM}[4/5] Capability score snapshot...${C_RESET}"
+# Run mem-test with timeout to prevent hangs
+score_json=$(timeout 120 capability-score --json 2>/dev/null | jq -c '.' 2>/dev/null || echo "")
+if [[ -n "$score_json" ]]; then
+  # Append to JSONL log for tracking over time
+  echo "$score_json" >> "$SCORES_LOG"
+  composite=$(echo "$score_json" | jq -r '.composite // "?"')
+  echo -e "${C_GREEN}✓${C_RESET} Capability score: ${composite}"
+else
+  echo -e "${C_YELLOW}⚠ Capability score failed or timed out${C_RESET}"
+  ((errors++)) || true
+fi
+
+# --- 5. Graph stats snapshot ---
+echo -e "\n${C_DIM}[5/5] Graph memory stats...${C_RESET}"
+if command -v graphmem-sqlite &>/dev/null; then
+  graphmem-sqlite stats 2>/dev/null || true
+fi
+
+# --- Summary ---
+echo -e "\n${C_BOLD}Nightly maintenance complete.${C_RESET}"
+if [[ $errors -gt 0 ]]; then
+  echo -e "${C_YELLOW}${errors} step(s) had warnings.${C_RESET}"
+else
+  echo -e "${C_GREEN}All steps succeeded.${C_RESET}"
+fi
