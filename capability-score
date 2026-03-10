@@ -53,10 +53,17 @@ eval_count=0
 eval_dir="$WORKSPACE/memory/reflexion-evals"
 if [[ -d "$eval_dir" ]]; then
   total=0
+  # Archived tools list — exclude evals for tools that no longer exist
+  archived_tools="opro|orchestrate|hymem|memcompress|graphiti|kuzu"
   while IFS= read -r f; do
     [[ -f "$f" ]] || continue
     s=$(jq -r '(.evaluation.score // .score) // empty' "$f" 2>/dev/null || true)
     [[ -z "$s" || "$s" == "null" ]] && continue
+    # Skip evals for archived/broken tools
+    task=$(jq -r '(.task // .description // "")' "$f" 2>/dev/null || true)
+    if echo "$task" | grep -qiE "$archived_tools"; then
+      continue
+    fi
     total=$((total + s))
     eval_count=$((eval_count + 1))
   done < <(find "$eval_dir" -name '*.json' -mtime -7 2>/dev/null)

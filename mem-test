@@ -81,6 +81,32 @@ TEST_CASES=(
 
   # Temporal: What blog posts were published on March 3, 2026?
   "What blog posts did teebot publish on March 3, 2026?|scaffolding|forget|2026-03-03"
+
+  # === March 10 additions: harder questions requiring recent context + deeper synthesis ===
+
+  # Recent: What did the SICA self-edit system produce?
+  "What is SICA and what pipeline does the self-edit tool implement?|propose|apply|evaluate|decide|2026-03-08"
+
+  # Cross-reference: What did SiriuS inspire in teebot's system?
+  "What technique from SiriuS was implemented in teebot's eval system, and how many repaired trajectories exist?|repaired|trajector|5|2026-03-08"
+
+  # Quantitative: What was the capability score trend from March 3 to March 10?
+  "What were the capability-score composite values on March 5, March 9, and March 10?|87|93|2026-03-10"
+
+  # Synthesis: Connect rule count changes over time
+  "How did the number of active reflexion rules change from the initial count through the platitude prune to the current state?|37|70|5|2026-03-10"
+
+  # Architecture: What safety mechanisms does the self-edit system have?
+  "What safety guardrails does the SICA self-edit tool include?|backup|cooldown|1 cycle|2026-03-08"
+
+  # People: What is Shujaat's connection to teebot's work?
+  "What is Shujaat researching and what is teebot's involvement?|DCEGM|economic|Mississauga|2026-03-07"
+
+  # Meta: What key finding changed how teebot does retrieval?
+  "What finding about keyword matching led teebot to switch retrieval methods, and what was the measured impact?|keyword|corrupt|false positive|embedding|2026-03-04"
+
+  # Cross-system: How does the nightly consolidation work end-to-end?
+  "Describe the nightly consolidation pipeline: what tools run, what files are updated, and what gets archived?|CURRENT_STATE|MEMORY|MEMORY-ARCHIVE|Sonnet|8KB|2026-03-07"
 )
 
 echo -e "${C_CYAN}${C_BOLD}Memory Ground Truth Test Suite${C_RESET}"

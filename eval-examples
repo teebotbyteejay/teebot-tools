@@ -147,6 +147,7 @@ def cmd_match(task: str) -> list:
             "score": evaluation.get("score"),
             "what_worked": evaluation.get("what_worked", []),
             "what_failed": evaluation.get("what_failed", []),
+            "repaired_trajectory": eval_data.get("repaired_trajectory", ""),
         }
         results.append(result)
     
@@ -168,6 +169,8 @@ def cmd_format(task: str) -> str:
             output += "**What worked:** " + "; ".join(m['what_worked'][:3]) + "\n"
         if m['what_failed']:
             output += "**What failed:** " + "; ".join(m['what_failed'][:3]) + "\n"
+        if m.get('repaired_trajectory'):
+            output += f"\n**🔧 Repaired Trajectory (what I should have done):**\n{m['repaired_trajectory'][:800]}\n"
     
     return output
 

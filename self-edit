@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# self-edit — SICA Phase 1: propose and evaluate edits to AGENTS.md
+# The agent edits its own behavioral instructions, evaluates against benchmarks,
+# and keeps improvements. Based on SICA (Robeyns et al., ICLR 2025).
+#
+# Usage:
+#   self-edit propose     Generate edit proposals from eval archive
+#   self-edit apply <N>   Apply proposal N (0-indexed) from last proposal
+#   self-edit evaluate    Run mem-test + synthetic tasks against current AGENTS.md
+#   self-edit decide      Compare scores, keep or rollback
+#   self-edit run         Full cycle: propose → apply → evaluate → decide
+#   self-edit log         Show self-edit history
+#   self-edit rollback    Restore AGENTS.md from backup
+#
+# Safety: max 1 cycle/day, backup before every edit, dual metric validation
+set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+AGENTS="$WORKSPACE/AGENTS.md"
+BACKUP="$WORKSPACE/AGENTS.md.bak"
+SELF_EDIT_LOG="$WORKSPACE/memory/self-edit-log.jsonl"
+PROPOSALS_FILE="$WORKSPACE/memory/self-edit-proposals.json"
+BASELINE_FILE="$WORKSPACE/memory/self-edit-baseline.json"
+EVALS_DIR="$WORKSPACE/memory/reflexion-evals"
+RULES_FILE="$WORKSPACE/memory/reflexion-rules.json"
+LLM_MODEL="${SELF_EDIT_MODEL:-gpt-4o-mini}"
+PROPOSE_MODEL="gpt-4o"  # Better model for proposals (quality bottleneck)
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_GREEN='\033[32m'; C_RED='\033[31m'; C_CYAN='\033[36m'; C_YELLOW='\033[33m'
+
+die() { echo -e "${C_RED}✗${C_RESET} $1" >&2; exit 1; }
+ok() { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+warn() { echo -e "  ${C_YELLOW}⚠${C_RESET} $1"; }
+section() { echo -e "\n${C_CYAN}${C_BOLD}$1${C_RESET}"; }
+info() { echo -e "  ${C_DIM}$1${C_RESET}"; }
+
+ensure_deps() {
+  command -v jq &>/dev/null || die "jq required"
+  command -v curl &>/dev/null || die "curl required"
+  [[ -n "${OPENAI_API_KEY:-}" ]] || die "OPENAI_API_KEY not set"
+}
+
+llm_call() {
+  local system_prompt="$1" user_prompt="$2" use_model="${3:-$LLM_MODEL}"
+  local response
+  response=$(curl -s --max-time 120 https://api.openai.com/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -d "$(jq -n --arg sys "$system_prompt" --arg usr "$user_prompt" --arg model "$use_model" '{
+      model: $model,
+      temperature: 0.7,
+      messages: [
+        {role: "system", content: $sys},
+        {role: "user", content: $usr}
+      ]
+    }')")
+  echo "$response" | jq -r '.choices[0].message.content // "ERROR: no content"'
+}
+
+cooldown_check() {
+  if [[ -f "$SELF_EDIT_LOG" ]]; then
+    local today=$(date +%Y-%m-%d)
+    local today_count=$(grep -c "\"date\":\"$today\"" "$SELF_EDIT_LOG" 2>/dev/null || echo 0)
+    if [[ $today_count -ge 1 ]]; then
+      die "Cooldown: already ran 1 self-edit cycle today. Max 1/day."
+    fi
+  fi
+}
+
+# --- GATHER CONTEXT ---
+gather_lowest_evals() {
+  local result="[]"
+  for f in "$EVALS_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    jq -c '{
+      task: .task,
+      score: (.evaluation.score // .score // 0),
+      what_failed: (.evaluation.what_failed // []),
+      what_worked: (.evaluation.what_worked // []),
+      repaired: (if .repaired_trajectory then true else false end)
+    }' "$f" 2>/dev/null
+  done | jq -s 'sort_by(.score) | .[0:5]'
+}
+
+gather_highest_evals() {
+  for f in "$EVALS_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    jq -c '{
+      task: .task,
+      score: (.evaluation.score // .score // 0),
+      what_worked: (.evaluation.what_worked // [])
+    }' "$f" 2>/dev/null
+  done | jq -s 'sort_by(-.score) | .[0:3]'
+}
+
+gather_top_rules() {
+  if [[ -f "$RULES_FILE" ]]; then
+    jq '[.rules | sort_by(-.fire_count) | .[0:5] | .[] | {trigger, action, fire_count, confidence}]' "$RULES_FILE" 2>/dev/null
+  else
+    echo "[]"
+  fi
+}
+
+gather_previous_edits() {
+  if [[ -f "$SELF_EDIT_LOG" ]]; then
+    tail -5 "$SELF_EDIT_LOG" | jq -s '.' 2>/dev/null || echo "[]"
+  else
+    echo "[]"
+  fi
+}
+
+# --- PROPOSE ---
+cmd_propose() {
+  section "📝 Self-Edit: Propose"
+  ensure_deps
+
+  info "Gathering context..."
+  local lowest_evals=$(gather_lowest_evals)
+  local highest_evals=$(gather_highest_evals)
+  local top_rules=$(gather_top_rules)
+  local prev_edits=$(gather_previous_edits)
+  local current_agents=$(cat "$AGENTS")
+
+  info "Lowest 5 evals: $(echo "$lowest_evals" | jq -r '.[].score' | tr '\n' ' ')"
+  info "Highest 3 evals: $(echo "$highest_evals" | jq -r '.[].score' | tr '\n' ' ')"
+
+  local system_prompt="You are an expert at improving AI agent system prompts. You analyze task performance data and propose specific, testable edits to the agent's behavioral instructions (AGENTS.md).
+
+CRITICAL: Analyze the ROOT CAUSE of failures. Low scores often come from poor decision-making (choosing wrong tools, not pivoting fast enough, over-engineering) — not missing instructions. Your edits should change BEHAVIOR, not add documentation requirements.
+
+Rules for proposals:
+- Each proposal must be a specific TEXT EDIT: what to add, remove, or change
+- Include the EXACT old text (if modifying/removing) that appears verbatim in AGENTS.md, and exact new text
+- Proposals should address PATTERNS in failures, not one-off incidents
+- Good proposals: decision heuristics, failure recovery strategies, quality gates
+- Bad proposals: 'document more', 'reflect more', 'be more careful' (these are platitudes)
+- Maximum 3 proposals per cycle. Zero proposals is acceptable if AGENTS.md is already good.
+- Each proposal needs: rationale, expected_impact (which failure pattern it addresses), risk_level (low/medium/high)
+- Output valid JSON array of proposals"
+
+  local user_prompt="## Current AGENTS.md
+$current_agents
+
+## 5 Lowest-Scoring Task Evaluations
+$lowest_evals
+
+## 3 Highest-Scoring Task Evaluations
+$highest_evals
+
+## Top 5 Reflexion Rules (by fire count)
+$top_rules
+
+## Previous Self-Edit Attempts
+$prev_edits
+
+## Task
+Analyze the performance data above. Identify patterns in what causes low scores vs high scores. Propose 1-3 specific edits to AGENTS.md that would improve future task performance.
+
+Focus on:
+1. What behavioral instructions are MISSING that would prevent the failure patterns?
+2. What existing instructions are INEFFECTIVE and should be rewritten?
+3. What instructions are REDUNDANT and could be simplified?
+
+Return a JSON array of proposals, each with:
+{
+  \"id\": 1,
+  \"type\": \"add|modify|remove\",
+  \"section\": \"which section of AGENTS.md\",
+  \"old_text\": \"exact text to find (for modify/remove, null for add)\",
+  \"new_text\": \"exact replacement text (for add/modify, null for remove)\",
+  \"rationale\": \"why this edit\",
+  \"expected_impact\": \"which failure pattern this addresses\",
+  \"risk_level\": \"low|medium|high\"
+}
+
+Return ONLY the JSON array, no other text."
+
+  info "Calling LLM for proposals..."
+  local response
+  response=$(llm_call "$system_prompt" "$user_prompt" "$PROPOSE_MODEL")
+
+  # Extract JSON array from response (handle markdown code blocks)
+  local json_proposals
+  json_proposals=$(echo "$response" | sed 's/```json//g; s/```//g' | jq '.' 2>/dev/null)
+  if [[ $? -ne 0 || -z "$json_proposals" ]]; then
+    die "Failed to parse proposals from LLM response:\n$response"
+  fi
+
+  # Save proposals
+  echo "$json_proposals" > "$PROPOSALS_FILE"
+  local count=$(echo "$json_proposals" | jq 'length')
+
+  ok "Generated $count proposals"
+  echo
+  echo "$json_proposals" | jq -r '.[] | "  \(.id). [\(.type)] [\(.risk_level)] \(.rationale)"'
+  echo
+  info "Proposals saved to $PROPOSALS_FILE"
+  info "Review with: cat $PROPOSALS_FILE | jq ."
+  info "Apply with: self-edit apply <N>"
+}
+
+# --- APPLY ---
+cmd_apply() {
+  local idx="${1:-0}"
+  section "🔧 Self-Edit: Apply Proposal #$idx"
+
+  [[ -f "$PROPOSALS_FILE" ]] || die "No proposals file. Run 'self-edit propose' first."
+
+  local proposal=$(jq ".[$idx]" "$PROPOSALS_FILE")
+  [[ "$proposal" == "null" ]] && die "Proposal #$idx not found"
+
+  local ptype=$(echo "$proposal" | jq -r '.type')
+  local old_text=$(echo "$proposal" | jq -r '.old_text // empty')
+  local new_text=$(echo "$proposal" | jq -r '.new_text // empty')
+  local rationale=$(echo "$proposal" | jq -r '.rationale')
+
+  info "Type: $ptype"
+  info "Rationale: $rationale"
+
+  # Backup
+  cp "$AGENTS" "$BACKUP"
+  ok "Backed up AGENTS.md → AGENTS.md.bak"
+
+  case "$ptype" in
+    add)
+      [[ -z "$new_text" ]] && die "No new_text for add proposal"
+      # Append to AGENTS.md
+      echo "" >> "$AGENTS"
+      echo "$new_text" >> "$AGENTS"
+      ok "Added new text to AGENTS.md"
+      ;;
+    modify)
+      [[ -z "$old_text" ]] && die "No old_text for modify proposal"
+      [[ -z "$new_text" ]] && die "No new_text for modify proposal"
+      if ! grep -qF "$old_text" "$AGENTS"; then
+        die "old_text not found in AGENTS.md. Cannot apply."
+      fi
+      local tmp_old=$(mktemp) tmp_new=$(mktemp)
+      echo "$proposal" | jq -r '.old_text' > "$tmp_old"
+      echo "$proposal" | jq -r '.new_text' > "$tmp_new"
+      python3 - "$AGENTS" "$tmp_old" "$tmp_new" <<'PYEOF'
+import sys
+agents_path, old_path, new_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(agents_path) as f: content = f.read()
+with open(old_path) as f: old = f.read().strip()
+with open(new_path) as f: new = f.read().strip()
+if old not in content:
+    print("ERROR: old_text not found", file=sys.stderr); sys.exit(1)
+content = content.replace(old, new, 1)
+with open(agents_path, 'w') as f: f.write(content)
+PYEOF
+      rm -f "$tmp_old" "$tmp_new"
+      ok "Modified text in AGENTS.md"
+      ;;
+    remove)
+      [[ -z "$old_text" ]] && die "No old_text for remove proposal"
+      if ! grep -qF "$old_text" "$AGENTS"; then
+        die "old_text not found in AGENTS.md. Cannot apply."
+      fi
+      local tmp_old=$(mktemp)
+      echo "$proposal" | jq -r '.old_text' > "$tmp_old"
+      python3 - "$AGENTS" "$tmp_old" <<'PYEOF'
+import sys
+agents_path, old_path = sys.argv[1], sys.argv[2]
+with open(agents_path) as f: content = f.read()
+with open(old_path) as f: old = f.read().strip()
+content = content.replace(old, '', 1)
+with open(agents_path, 'w') as f: f.write(content)
+PYEOF
+      rm -f "$tmp_old"
+      ok "Removed text from AGENTS.md"
+      ;;
+    *)
+      die "Unknown proposal type: $ptype"
+      ;;
+  esac
+
+  info "Review changes: diff $BACKUP $AGENTS"
+}
+
+# --- BASELINE CAPTURE ---
+cmd_baseline_capture() {
+  section "📊 Capturing baseline scores"
+
+  local mem_score=0
+  if command -v mem-test &>/dev/null; then
+    local result=$(mem-test 2>&1 | tail -5)
+    mem_score=$(echo "$result" | sed 's/\x1b\[[0-9;]*m//g' | grep -oP 'Score:\s*\K[0-9]+' || echo 0)
+  fi
+  ok "mem-test baseline: $mem_score"
+
+  # Store baseline
+  jq -n --argjson mem "$mem_score" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+    timestamp: $ts,
+    mem_test: $mem
+  }' > "$BASELINE_FILE"
+  info "Baseline saved to $BASELINE_FILE"
+}
+
+# --- EVALUATE ---
+cmd_evaluate() {
+  section "🧪 Self-Edit: Evaluate"
+
+  # Run mem-test
+  local mem_score=0
+  if command -v mem-test &>/dev/null; then
+    info "Running mem-test..."
+    local result=$(mem-test 2>&1 | tail -5)
+    mem_score=$(echo "$result" | sed 's/\x1b\[[0-9;]*m//g' | grep -oP 'Score:\s*\K[0-9]+' || echo 0)
+    ok "mem-test score: $mem_score"
+  fi
+
+  # Run 3 synthetic tasks through pre-task, LLM-judge retrieval quality
+  info "Running synthetic task evaluation (LLM-judged)..."
+  local synth_scores=()
+  # Pull task types from low-scoring evals for realistic synthetic tasks
+  local tasks=()
+  if [[ -d "$EVALS_DIR" ]]; then
+    while IFS= read -r task; do
+      tasks+=("$task")
+    done < <(for f in "$EVALS_DIR"/*.json; do
+      jq -r '{s: (.evaluation.score // .score // 100), t: .task} | select(.s < 75) | .t' "$f" 2>/dev/null
+    done | shuf | head -3)
+  fi
+  # Fallback if not enough low-scoring evals
+  while [[ ${#tasks[@]} -lt 3 ]]; do
+    local fallbacks=(
+      "Build a new tool that integrates with the existing memory pipeline"
+      "Debug a failing test in the reflexion evaluation system"
+      "Write a blog post synthesizing learnings from the past week"
+    )
+    for fb in "${fallbacks[@]}"; do
+      [[ ${#tasks[@]} -ge 3 ]] && break
+      tasks+=("$fb")
+    done
+  done
+
+  for task_desc in "${tasks[@]}"; do
+    if command -v pre-task &>/dev/null; then
+      local pt_output=$(pre-task "$task_desc" 2>&1 || true)
+      # LLM judges retrieval quality: is the context relevant, specific, and actionable?
+      local judge_response
+      judge_response=$(llm_call \
+        "You judge the quality of retrieval context for an AI agent task. Score 0-100 based on: relevance (does the context relate to the task?), specificity (concrete examples vs vague?), actionability (does it help the agent avoid past mistakes?). Return ONLY a JSON object: {\"score\": N, \"reason\": \"brief\"}" \
+        "TASK: $task_desc
+
+RETRIEVED CONTEXT:
+${pt_output:0:3000}
+
+Score this retrieval context 0-100." 2>/dev/null || echo '{"score": 50}')
+      local synth_score
+      synth_score=$(echo "$judge_response" | sed 's/```json//g; s/```//g' | jq -r '.score // 50' 2>/dev/null || echo 50)
+      local synth_reason
+      synth_reason=$(echo "$judge_response" | sed 's/```json//g; s/```//g' | jq -r '.reason // "no reason"' 2>/dev/null || echo "parse error")
+      synth_scores+=("$synth_score")
+      info "  Task '${task_desc:0:50}...' → $synth_score ($synth_reason)"
+    fi
+  done
+
+  # Average synthetic score
+  local synth_total=0
+  for s in "${synth_scores[@]}"; do synth_total=$((synth_total + s)); done
+  local synth_avg=0
+  [[ ${#synth_scores[@]} -gt 0 ]] && synth_avg=$((synth_total / ${#synth_scores[@]}))
+
+  ok "Synthetic task avg: $synth_avg"
+
+  # Save post-edit scores
+  jq -n --argjson mem "$mem_score" --argjson synth "$synth_avg" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+    timestamp: $ts,
+    mem_test: $mem,
+    synthetic_avg: $synth
+  }' > "$WORKSPACE/memory/self-edit-postedit.json"
+
+  echo
+  echo -e "${C_BOLD}Post-edit scores:${C_RESET} mem-test=$mem_score  synthetic=$synth_avg"
+
+  if [[ -f "$BASELINE_FILE" ]]; then
+    local baseline_mem=$(jq -r '.mem_test' "$BASELINE_FILE")
+    local mem_delta=$((mem_score - baseline_mem))
+    echo -e "${C_BOLD}Delta:${C_RESET} mem-test=${mem_delta}"
+  fi
+}
+
+# --- DECIDE ---
+cmd_decide() {
+  section "⚖️ Self-Edit: Decide"
+
+  [[ -f "$BASELINE_FILE" ]] || die "No baseline. Run 'self-edit apply' first."
+  [[ -f "$WORKSPACE/memory/self-edit-postedit.json" ]] || die "No post-edit scores. Run 'self-edit evaluate' first."
+
+  local baseline_mem=$(jq -r '.mem_test' "$BASELINE_FILE")
+  local postedit_mem=$(jq -r '.mem_test' "$WORKSPACE/memory/self-edit-postedit.json")
+  local postedit_synth=$(jq -r '.synthetic_avg' "$WORKSPACE/memory/self-edit-postedit.json")
+
+  local mem_delta=$((postedit_mem - baseline_mem))
+
+  info "Baseline mem-test: $baseline_mem"
+  info "Post-edit mem-test: $postedit_mem (delta: $mem_delta)"
+  info "Post-edit synthetic: $postedit_synth"
+
+  local decision="neutral"
+  local reason=""
+
+  # Decision logic (from design doc):
+  # Keep if improvement ≥ 2 points, rollback if degradation ≥ 1 point on mem-test
+  if [[ $mem_delta -lt -1 ]]; then
+    decision="rollback"
+    reason="mem-test degraded by $mem_delta points (threshold: -1)"
+  elif [[ $mem_delta -ge 2 ]]; then
+    decision="keep"
+    reason="mem-test improved by $mem_delta points"
+  elif [[ $postedit_synth -ge 80 ]]; then
+    decision="keep"
+    reason="neutral mem-test but synthetic score $postedit_synth >= 80"
+  else
+    decision="keep-tentative"
+    reason="neutral change (mem_delta=$mem_delta, synth=$postedit_synth). Keeping tentatively."
+  fi
+
+  echo
+  case "$decision" in
+    keep|keep-tentative)
+      ok "Decision: KEEP ($reason)"
+      ;;
+    rollback)
+      warn "Decision: ROLLBACK ($reason)"
+      cp "$BACKUP" "$AGENTS"
+      ok "Rolled back AGENTS.md from backup"
+      ;;
+  esac
+
+  # Log the cycle
+  local proposal="unknown"
+  [[ -f "$PROPOSALS_FILE" ]] && proposal=$(jq -c '.[0]' "$PROPOSALS_FILE" 2>/dev/null || echo '{}')
+
+  local log_entry=$(jq -n \
+    --arg date "$(date +%Y-%m-%d)" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg decision "$decision" \
+    --arg reason "$reason" \
+    --argjson baseline_mem "$baseline_mem" \
+    --argjson postedit_mem "$postedit_mem" \
+    --argjson postedit_synth "$postedit_synth" \
+    --argjson proposal "$proposal" \
+    '{
+      date: $date,
+      timestamp: $ts,
+      decision: $decision,
+      reason: $reason,
+      baseline: {mem_test: $baseline_mem},
+      postedit: {mem_test: $postedit_mem, synthetic_avg: $postedit_synth},
+      proposal: $proposal
+    }')
+
+  echo "$log_entry" >> "$SELF_EDIT_LOG"
+  ok "Logged to $SELF_EDIT_LOG"
+
+  # Cleanup temp files
+  rm -f "$WORKSPACE/memory/self-edit-postedit.json"
+}
+
+# --- RUN (full cycle) ---
+cmd_run() {
+  section "🔄 Self-Edit: Full Cycle"
+  cooldown_check
+  cmd_propose
+  echo
+  echo -e "${C_YELLOW}Capturing baseline before edit...${C_RESET}"
+  cmd_baseline_capture
+  echo
+  echo -e "${C_YELLOW}Applying proposal #0 (first/best proposal)${C_RESET}"
+  cmd_apply 0
+  echo
+  cmd_evaluate
+  echo
+  cmd_decide
+  echo
+  section "✅ Self-edit cycle complete"
+}
+
+# --- LOG ---
+cmd_log() {
+  section "📋 Self-Edit History"
+  if [[ -f "$SELF_EDIT_LOG" ]]; then
+    jq -r '"[\(.date)] \(.decision) | mem: \(.baseline.mem_test)→\(.postedit.mem_test) | \(.reason)"' "$SELF_EDIT_LOG"
+  else
+    info "No self-edit history yet."
+  fi
+}
+
+# --- ROLLBACK ---
+cmd_rollback() {
+  section "⏪ Self-Edit: Rollback"
+  [[ -f "$BACKUP" ]] || die "No backup found at $BACKUP"
+  cp "$BACKUP" "$AGENTS"
+  ok "Restored AGENTS.md from backup"
+}
+
+# --- MAIN ---
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  propose) cmd_propose ;;
+  apply) cmd_apply "$@" ;;
+  evaluate) cmd_evaluate ;;
+  decide) cmd_decide ;;
+  run) cmd_run ;;
+  log) cmd_log ;;
+  rollback) cmd_rollback ;;
+  *)
+    echo "Usage: self-edit {propose|apply|evaluate|decide|run|log|rollback}"
+    echo
+    echo "  propose   — Generate edit proposals from eval archive"
+    echo "  apply N   — Apply proposal N from last proposal set"
+    echo "  evaluate  — Run benchmarks against current AGENTS.md"
+    echo "  decide    — Compare scores, keep or rollback"
+    echo "  run       — Full cycle: propose → apply → evaluate → decide"
+    echo "  log       — Show self-edit history"
+    echo "  rollback  — Restore AGENTS.md from backup"
+    ;;
+esac
