@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+# system-test — automated test suite for core teebot pipeline components
+# Catches silent breakage: tool failures, OAuth expiry, pipeline regressions,
+# stale state, graphmem corruption.
+#
+# Usage: system-test              Run all tests
+#        system-test --quick      Run only fast tests (< 10 seconds)
+#        system-test --verbose    Show detailed output
+#        system-test <category>   Run specific category: tools, pipeline, memory, infra
+#
+# Exit code: 0 if all tests pass, 1 if any fail
+set -uo pipefail
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+MEMORY_DIR="$WORKSPACE/memory"
+TODAY=$(date -u +%Y-%m-%d)
+VERBOSE=false
+QUICK=false
+CATEGORY=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --verbose|-v) VERBOSE=true ;;
+    --quick|-q) QUICK=true ;;
+    tools|pipeline|memory|infra) CATEGORY="$arg" ;;
+  esac
+done
+
+export PATH="$WORKSPACE/teebot-tools:$WORKSPACE/graphmem:$PATH"
+
+# --- Test Framework ---
+PASS=0
+FAIL=0
+SKIP=0
+FAILURES=()
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_GREEN='\033[32m'
+C_RED='\033[31m'
+C_YELLOW='\033[33m'
+C_DIM='\033[2m'
+
+pass() { ((PASS++)) || true; echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+fail() { ((FAIL++)) || true; FAILURES+=("$1: $2"); echo -e "  ${C_RED}✗${C_RESET} $1 — ${C_DIM}$2${C_RESET}"; }
+skip() { ((SKIP++)) || true; echo -e "  ${C_YELLOW}⊘${C_RESET} $1 — ${C_DIM}$2${C_RESET}"; }
+section() { echo -e "\n${C_BOLD}$1${C_RESET}"; }
+
+# === TOOL EXISTENCE & EXECUTABILITY ===
+test_tools() {
+  section "🔧 Tool Existence & Executability"
+
+  local core_tools=(
+    pre-task post-task log-conversation heartbeat-ingest
+    workspace-status mailcheck nightly-consolidation
+    graphmem-sqlite mem-test capability-score
+    moltbook-read reflexion-eval eval-examples
+    graphmem-consolidate rule-matcher
+  )
+
+  for tool in "${core_tools[@]}"; do
+    if command -v "$tool" &>/dev/null; then
+      local tool_path
+      tool_path=$(command -v "$tool")
+      if [[ -x "$tool_path" ]]; then
+        pass "$tool"
+      else
+        fail "$tool" "exists but not executable"
+      fi
+    else
+      fail "$tool" "not found on PATH"
+    fi
+  done
+}
+
+# === PIPELINE TESTS ===
+test_pipeline() {
+  section "⚙️  Pipeline Tests"
+
+  # Test 1: graphmem-sqlite responds and has entities
+  local entity_count
+  entity_count=$(graphmem-sqlite stats 2>/dev/null | grep -oP 'Entities:\s*\K\d+' || echo "0")
+  if [[ "$entity_count" -gt 100 ]]; then
+    pass "graphmem-sqlite: $entity_count entities"
+  elif [[ "$entity_count" -gt 0 ]]; then
+    fail "graphmem-sqlite" "only $entity_count entities (expected >100)"
+  else
+    fail "graphmem-sqlite" "cannot get entity count"
+  fi
+
+  # Test 2: graphmem-sqlite search returns results
+  local search_result
+  search_result=$(graphmem-sqlite search "teebot memory" --limit 3 2>/dev/null || echo "")
+  if echo "$search_result" | grep -q "score="; then
+    pass "graphmem search: returns scored results"
+  else
+    fail "graphmem search" "no scored results returned"
+  fi
+
+  # Test 3: pre-task — novel task gets refinement loop
+  local novel_output
+  novel_output=$(pre-task "design a quantum error correction decoder for topological codes" 2>/dev/null || echo "")
+  if echo "$novel_output" | grep -qi "refinement loop\|novel task\|first principles"; then
+    pass "pre-task novel: injects refinement loop"
+  else
+    # Check if it just didn't detect as novel
+    if echo "$novel_output" | grep -qi "similar past"; then
+      skip "pre-task novel" "task matched existing examples (not truly novel for this graph)"
+    else
+      fail "pre-task novel" "no refinement loop or examples — unexpected output"
+    fi
+  fi
+
+  # Test 4: pre-task — familiar task gets examples
+  if ! $QUICK; then
+    local familiar_output
+    familiar_output=$(pre-task "build a bash tool for memory retrieval" 2>/dev/null || echo "")
+    if echo "$familiar_output" | grep -qiE "example|past experience|rule|context"; then
+      pass "pre-task familiar: retrieves context"
+    else
+      fail "pre-task familiar" "no context retrieved for familiar-type task"
+    fi
+  fi
+
+  # Test 5: reflexion-eval responds (even with 0 rules)
+  local refl_result
+  refl_result=$(reflexion-eval match "test task" 2>&1 || echo "ERROR")
+  if echo "$refl_result" | grep -qiE "matched|rules|no rules"; then
+    local rule_count
+    rule_count=$(echo "$refl_result" | grep -oP '\d+(?=\s*rules?\s*matched)' || echo "?")
+    pass "reflexion-eval: responds ($rule_count rules)"
+  elif echo "$refl_result" | grep -qi "error"; then
+    fail "reflexion-eval" "returned error"
+  else
+    pass "reflexion-eval: responds"
+  fi
+
+  # Test 6: eval-examples has embeddings
+  if [[ -f "$MEMORY_DIR/eval-embeddings.bin" ]]; then
+    local embed_size
+    embed_size=$(wc -c < "$MEMORY_DIR/eval-embeddings.bin")
+    if [[ "$embed_size" -gt 1000 ]]; then
+      pass "eval-embeddings: ${embed_size}B"
+    else
+      fail "eval-embeddings" "file too small (${embed_size}B)"
+    fi
+  else
+    fail "eval-embeddings" "file missing"
+  fi
+}
+
+# === MEMORY TESTS ===
+test_memory() {
+  section "🧠 Memory Tests"
+
+  # Test 1: CURRENT_STATE.md exists and is recent
+  if [[ -f "$WORKSPACE/CURRENT_STATE.md" ]]; then
+    local state_age
+    state_age=$(( $(date +%s) - $(stat -c %Y "$WORKSPACE/CURRENT_STATE.md") ))
+    if [[ "$state_age" -lt 172800 ]]; then  # 48 hours
+      pass "CURRENT_STATE.md: fresh ($(( state_age / 3600 ))h old)"
+    else
+      fail "CURRENT_STATE.md" "stale ($(( state_age / 86400 ))d old)"
+    fi
+  else
+    fail "CURRENT_STATE.md" "file missing"
+  fi
+
+  # Test 2: MEMORY.md exists and within budget
+  if [[ -f "$WORKSPACE/MEMORY.md" ]]; then
+    local mem_size
+    mem_size=$(wc -c < "$WORKSPACE/MEMORY.md")
+    if [[ "$mem_size" -gt 10240 ]]; then
+      fail "MEMORY.md" "over 10KB (${mem_size}B — needs pruning, 8KB budget)"
+    elif [[ "$mem_size" -lt 500 ]]; then
+      fail "MEMORY.md" "suspiciously small (${mem_size}B)"
+    else
+      pass "MEMORY.md: ${mem_size}B (within budget)"
+    fi
+  else
+    fail "MEMORY.md" "file missing"
+  fi
+
+  # Test 3: Today's daily log exists
+  # Check both UTC and EST dates
+  local est_today
+  est_today=$(TZ=America/New_York date +%Y-%m-%d)
+  if [[ -f "$MEMORY_DIR/$TODAY.md" ]]; then
+    local log_size
+    log_size=$(wc -c < "$MEMORY_DIR/$TODAY.md")
+    pass "Daily log ($TODAY): ${log_size}B"
+    if [[ "$log_size" -gt 50000 ]]; then
+      fail "Daily log size" "over 50KB — may cause boot overhead"
+    fi
+  elif [[ -f "$MEMORY_DIR/$est_today.md" ]]; then
+    local log_size
+    log_size=$(wc -c < "$MEMORY_DIR/$est_today.md")
+    pass "Daily log ($est_today EST): ${log_size}B"
+  else
+    fail "Daily log" "no log for today ($TODAY or $est_today)"
+  fi
+
+  # Test 4: Memchain integrity
+  local memchain_file="$WORKSPACE/.memchain.json"
+  [[ ! -f "$memchain_file" ]] && memchain_file="$MEMORY_DIR/.memchain.json"
+  if [[ -f "$memchain_file" ]]; then
+    local chain_entries
+    chain_entries=$(python3 -c "import json; print(len(json.load(open('$memchain_file'))['entries']))" 2>/dev/null || echo "0")
+    if [[ "$chain_entries" -gt 0 ]]; then
+      pass "Memchain: $chain_entries entries"
+    else
+      fail "Memchain" "0 entries or parse error"
+    fi
+  else
+    skip "Memchain" "no chain file"
+  fi
+
+  # Test 5: TOPICS.md exists
+  if [[ -f "$WORKSPACE/TOPICS.md" ]]; then
+    pass "TOPICS.md exists"
+  else
+    fail "TOPICS.md" "missing"
+  fi
+
+  # Test 6: heartbeat-ingest delta tracking
+  local markers_dir="$MEMORY_DIR/.ingest-markers"
+  if [[ -d "$markers_dir" ]]; then
+    local marker_count
+    marker_count=$(find "$markers_dir" -name "*.offsets" | wc -l)
+    if [[ "$marker_count" -gt 0 ]]; then
+      pass "heartbeat-ingest: delta tracking ($marker_count offset files)"
+    else
+      fail "heartbeat-ingest" "markers dir exists but no offset files"
+    fi
+  else
+    skip "heartbeat-ingest" "no .ingest-markers directory"
+  fi
+
+  # Test 7: graphmem edge count sanity
+  local edge_count
+  edge_count=$(graphmem-sqlite stats 2>/dev/null | grep -oP 'Edges:\s*\K\d+' || echo "0")
+  if [[ "$edge_count" -gt 500 ]]; then
+    pass "graphmem edges: $edge_count"
+  elif [[ "$edge_count" -gt 0 ]]; then
+    fail "graphmem edges" "only $edge_count (expected >500)"
+  else
+    fail "graphmem edges" "cannot get count"
+  fi
+}
+
+# === INFRASTRUCTURE TESTS ===
+test_infra() {
+  section "🏗️  Infrastructure Tests"
+
+  # Test 1: Gmail OAuth (quick check — try to list, timeout fast)
+  if ! $QUICK; then
+    local gmail_result
+    gmail_result=$(timeout 15 bash -c 'export GOG_KEYRING_PASSWORD=teebot GOG_ACCOUNT=teebot.by.teejay@gmail.com; gog gmail list "is:unread" -a teebot.by.teejay@gmail.com 2>&1' || echo "TIMEOUT_OR_ERROR")
+    if echo "$gmail_result" | grep -qi "error\|expired\|invalid.*grant\|TIMEOUT_OR_ERROR"; then
+      if echo "$gmail_result" | grep -qi "TIMEOUT"; then
+        fail "Gmail OAuth" "timed out (may be expired or slow)"
+      else
+        fail "Gmail OAuth" "authentication error — needs renewal"
+      fi
+    else
+      pass "Gmail OAuth: working"
+    fi
+  else
+    skip "Gmail OAuth" "skipped in quick mode"
+  fi
+
+  # Test 2: OpenAI API key accessible
+  if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+    pass "OPENAI_API_KEY: set"
+  else
+    fail "OPENAI_API_KEY" "not set (needed for pre-task distillation, eval-examples)"
+  fi
+
+  # Test 3: Context-inject hook exists
+  if [[ -f "$HOME/.openclaw/hooks/context-inject/handler.ts" ]]; then
+    pass "context-inject hook: installed"
+    # Check if it's been writing
+    local inject_dir="$WORKSPACE/injected-context"
+    if [[ -d "$inject_dir" ]]; then
+      local file_count
+      file_count=$(find "$inject_dir" -name "*.md" -mmin -120 | wc -l)
+      if [[ "$file_count" -gt 0 ]]; then
+        pass "context-inject: $file_count active file(s) (updated <2h)"
+      else
+        fail "context-inject" "no files updated in last 2 hours"
+      fi
+    else
+      fail "context-inject" "output directory missing"
+    fi
+  else
+    fail "context-inject hook" "not installed"
+  fi
+
+  # Test 4: Cron jobs exist
+  local cron_count
+  cron_count=$(crontab -l 2>/dev/null | grep -c "openclaw\|teebot" || echo "0")
+  if [[ "$cron_count" -gt 0 ]]; then
+    pass "Cron jobs: $cron_count registered"
+  else
+    skip "Cron jobs" "no user cron found (may use openclaw scheduler)"
+  fi
+
+  # Test 5: Git repos clean (no uncommitted changes in critical repos)
+  for repo in "$WORKSPACE" "$WORKSPACE/graphmem"; do
+    if [[ -d "$repo/.git" ]]; then
+      local repo_name
+      repo_name=$(basename "$repo")
+      [[ "$repo_name" == "workspace" ]] && repo_name="workspace"
+      local uncommitted
+      uncommitted=$(cd "$repo" && git status --porcelain 2>/dev/null | wc -l)
+      if [[ "$uncommitted" -gt 20 ]]; then
+        fail "git:$repo_name" "$uncommitted uncommitted changes (consider committing)"
+      else
+        pass "git:$repo_name: $uncommitted uncommitted"
+      fi
+    fi
+  done
+
+  # Test 6: Disk space
+  local avail_kb
+  avail_kb=$(df -k "$WORKSPACE" | tail -1 | awk '{print $4}')
+  local avail_gb=$(( avail_kb / 1048576 ))
+  if [[ "$avail_kb" -gt 1048576 ]]; then  # > 1GB
+    pass "Disk: ${avail_gb}GB available"
+  elif [[ "$avail_kb" -gt 524288 ]]; then  # > 512MB
+    fail "Disk" "only ${avail_gb}GB available — getting low"
+  else
+    fail "Disk" "critically low: ${avail_gb}GB"
+  fi
+
+  # Test 7: Boot context size
+  local total_boot=0
+  for f in SOUL.md MEMORY.md HEARTBEAT.md CURRENT_STATE.md TOPICS.md AGENTS.md; do
+    if [[ -f "$WORKSPACE/$f" ]]; then
+      local fsize
+      fsize=$(wc -c < "$WORKSPACE/$f")
+      total_boot=$((total_boot + fsize))
+    fi
+  done
+  local boot_kb=$((total_boot / 1024))
+  if [[ "$total_boot" -lt 30720 ]]; then  # < 30KB
+    pass "Boot context: ${boot_kb}KB (6 files)"
+  elif [[ "$total_boot" -lt 51200 ]]; then  # < 50KB
+    fail "Boot context" "${boot_kb}KB — consider trimming (30KB target)"
+  else
+    fail "Boot context" "${boot_kb}KB — too large, degrading performance"
+  fi
+}
+
+# === RUN TESTS ===
+echo -e "${C_BOLD}🐣 system-test${C_RESET} — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo -e "${C_DIM}Workspace: $WORKSPACE${C_RESET}"
+[[ "$QUICK" == true ]] && echo -e "${C_DIM}Mode: quick${C_RESET}"
+[[ -n "$CATEGORY" ]] && echo -e "${C_DIM}Category: $CATEGORY${C_RESET}"
+
+START_TIME=$(date +%s)
+
+case "$CATEGORY" in
+  tools)    test_tools ;;
+  pipeline) test_pipeline ;;
+  memory)   test_memory ;;
+  infra)    test_infra ;;
+  *)
+    test_tools
+    test_pipeline
+    test_memory
+    test_infra
+    ;;
+esac
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+# === SUMMARY ===
+section "📊 Summary"
+TOTAL=$((PASS + FAIL + SKIP))
+echo -e "  ${C_GREEN}$PASS passed${C_RESET} / ${C_RED}$FAIL failed${C_RESET} / ${C_YELLOW}$SKIP skipped${C_RESET} (${TOTAL} total, ${DURATION}s)"
+
+if [[ ${#FAILURES[@]} -gt 0 ]]; then
+  echo -e "\n${C_RED}${C_BOLD}Failures:${C_RESET}"
+  for f in "${FAILURES[@]}"; do
+    echo -e "  ${C_RED}•${C_RESET} $f"
+  done
+fi
+
+echo ""
+if [[ "$FAIL" -gt 0 ]]; then
+  exit 1
+else
+  exit 0
+fi

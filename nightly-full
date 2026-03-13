@@ -59,9 +59,22 @@ else
 fi
 
 # --- 5. Graph stats snapshot ---
-echo -e "\n${C_DIM}[5/5] Graph memory stats...${C_RESET}"
+echo -e "\n${C_DIM}[5/6] Graph memory stats...${C_RESET}"
 if command -v graphmem-sqlite &>/dev/null; then
   graphmem-sqlite stats 2>/dev/null || true
+fi
+
+# --- 6. System health check ---
+echo -e "\n${C_DIM}[6/6] System health check...${C_RESET}"
+if command -v system-test &>/dev/null; then
+  if system-test --quick 2>&1; then
+    echo -e "${C_GREEN}✓${C_RESET} System test: all passed"
+  else
+    echo -e "${C_YELLOW}⚠ System test: failures detected (see above)${C_RESET}"
+    ((errors++)) || true
+  fi
+else
+  echo -e "${C_YELLOW}⚠ system-test not found${C_RESET}"
 fi
 
 # --- Summary ---
