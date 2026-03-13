@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# alert-teejay: Send infrastructure alerts ONLY to Teejay
+# Usage: alert-teejay "message"
+# This exists because I once sent an OAuth alert to the wrong person.
+
+set -euo pipefail
+MESSAGE="${1:?Usage: alert-teejay \"message\"}"
+TEEJAY="+18029896729"
+
+echo "⚠️ Sending alert to Teejay ($TEEJAY) only"
+echo "Message: $MESSAGE"
+
+# This outputs the target — the calling session should use message tool with this target
+echo "TARGET=$TEEJAY"
+echo "MESSAGE=$MESSAGE"

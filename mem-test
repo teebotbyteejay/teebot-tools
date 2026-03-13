@@ -11,11 +11,13 @@ set -euo pipefail
 
 VERBOSE=false
 TOOL="mem-research"
+RAW_CHECK=false
 
 for arg in "$@"; do
   case "$arg" in
     --verbose) VERBOSE=true ;;
     --tool) shift; TOOL="${2:-mem-research}" ;;
+    --raw-check) RAW_CHECK=true ;;
   esac
 done
 
@@ -110,7 +112,11 @@ TEST_CASES=(
 )
 
 echo -e "${C_CYAN}${C_BOLD}Memory Ground Truth Test Suite${C_RESET}"
-echo -e "  Tool: $TOOL"
+if $RAW_CHECK; then
+  echo -e "  Mode: ${C_YELLOW}raw-check${C_RESET} (deterministic, bypasses LLM synthesis)"
+else
+  echo -e "  Tool: $TOOL"
+fi
 echo -e "  Test cases: ${#TEST_CASES[@]}"
 echo ""
 
@@ -136,21 +142,27 @@ for test_case in "${TEST_CASES[@]}"; do
   echo -ne "  ${C_DIM}Testing:${C_RESET} ${question:0:70}... "
 
   # Run retrieval
-  case "$TOOL" in
-    graphmem)
-      output=$(graphmem-sqlite search "$question" --limit 10 2>/dev/null || echo "ERROR")
-      ;;
-    mem-research)
-      output=$(mem-research "$question" 2>/dev/null || echo "ERROR")
-      ;;
-    pre-task)
-      output=$(pre-task "$question" 2>/dev/null || echo "ERROR")
-      ;;
-    *)
-      echo -e "${C_RED}Unknown tool: $TOOL${C_RESET}"
-      exit 1
-      ;;
-  esac
+  if $RAW_CHECK; then
+    # Raw check mode: use mem-research --raw to bypass LLM synthesis
+    # This tests retrieval quality deterministically
+    output=$(mem-research "$question" --raw 2>/dev/null || echo "ERROR")
+  else
+    case "$TOOL" in
+      graphmem)
+        output=$(graphmem-sqlite search "$question" --limit 10 2>/dev/null || echo "ERROR")
+        ;;
+      mem-research)
+        output=$(mem-research "$question" 2>/dev/null || echo "ERROR")
+        ;;
+      pre-task)
+        output=$(pre-task "$question" 2>/dev/null || echo "ERROR")
+        ;;
+      *)
+        echo -e "${C_RED}Unknown tool: $TOOL${C_RESET}"
+        exit 1
+        ;;
+    esac
+  fi
 
   if [[ "$output" == "ERROR" ]]; then
     echo -e "${C_RED}ERROR${C_RESET}"
