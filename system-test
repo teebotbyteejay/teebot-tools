@@ -5,6 +5,7 @@
 #
 # Usage: system-test              Run all tests
 #        system-test --quick      Run only fast tests (< 10 seconds)
+#        system-test --benchmark  Run quality benchmarks (mem-test, ~2min)
 #        system-test --verbose    Show detailed output
 #        system-test <category>   Run specific category: tools, pipeline, memory, infra
 #
@@ -16,15 +17,20 @@ MEMORY_DIR="$WORKSPACE/memory"
 TODAY=$(date -u +%Y-%m-%d)
 VERBOSE=false
 QUICK=false
+BENCHMARK=false
 CATEGORY=""
 
 for arg in "$@"; do
   case "$arg" in
     --verbose|-v) VERBOSE=true ;;
     --quick|-q) QUICK=true ;;
-    tools|pipeline|memory|infra) CATEGORY="$arg" ;;
+    --benchmark|-b) BENCHMARK=true ;;
+    tools|pipeline|memory|infra|benchmark) CATEGORY="$arg" ;;
   esac
 done
+
+# "benchmark" category also sets BENCHMARK flag
+[[ "$CATEGORY" == "benchmark" ]] && BENCHMARK=true
 
 export PATH="$WORKSPACE/teebot-tools:$WORKSPACE/graphmem:$PATH"
 
@@ -352,24 +358,149 @@ test_infra() {
   fi
 }
 
+# === BENCHMARK TESTS (quality, not just presence) ===
+test_benchmark() {
+  section "📏 Quality Benchmarks"
+
+  local benchmark_log="$MEMORY_DIR/benchmark-history.jsonl"
+
+  # Test 1: mem-test --raw-check (retrieval accuracy)
+  echo -e "  ${C_DIM}Running mem-test --raw-check (this takes ~60s)...${C_RESET}"
+  local memtest_output
+  memtest_output=$(timeout 180 mem-test --raw-check 2>/dev/null || echo "TIMEOUT")
+
+  if [[ "$memtest_output" == "TIMEOUT" ]]; then
+    fail "mem-test --raw-check" "timed out after 180s"
+  else
+    # Strip ANSI codes for reliable parsing
+    local clean_output
+    clean_output=$(echo "$memtest_output" | sed 's/\x1b\[[0-9;]*m//g')
+    # Parse score from output: "Score: 52%"
+    local score
+    score=$(echo "$clean_output" | grep -oP 'Score:\s*\K\d+' || echo "0")
+    local passed_count
+    passed_count=$(echo "$clean_output" | grep -oP '\K\d+(?= passed)' || echo "0")
+    local failed_count
+    failed_count=$(echo "$clean_output" | grep -oP '\K\d+(?= failed)' || echo "0")
+    local total_count=$((passed_count + failed_count))
+
+    # Load last known baseline
+    local baseline=86  # Initial baseline from March 11 measurement
+    if [[ -f "$benchmark_log" ]]; then
+      local last_score
+      last_score=$(tail -1 "$benchmark_log" | python3 -c "import json,sys; print(json.load(sys.stdin).get('retrieval_score', $baseline))" 2>/dev/null || echo "$baseline")
+      baseline="$last_score"
+    fi
+
+    # Calculate delta
+    local delta=$((score - baseline))
+    local delta_str=""
+    if [[ "$delta" -gt 0 ]]; then
+      delta_str=" (${C_GREEN}+${delta}${C_RESET} from baseline ${baseline}%)"
+    elif [[ "$delta" -lt 0 ]]; then
+      delta_str=" (${C_RED}${delta}${C_RESET} from baseline ${baseline}%)"
+    else
+      delta_str=" (unchanged from baseline ${baseline}%)"
+    fi
+
+    if [[ "$score" -ge 75 ]]; then
+      pass "Retrieval accuracy: ${score}% ($passed_count/$total_count)${delta_str}"
+    elif [[ "$score" -ge 50 ]]; then
+      fail "Retrieval accuracy" "${score}% ($passed_count/$total_count) — below 75% threshold${delta_str}"
+    else
+      fail "Retrieval accuracy" "${score}% ($passed_count/$total_count) — critically low${delta_str}"
+    fi
+
+    # Record to benchmark history
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local est_date
+    est_date=$(TZ=America/New_York date +%Y-%m-%d)
+    echo "{\"date\":\"$est_date\",\"timestamp\":\"$timestamp\",\"retrieval_score\":$score,\"passed\":$passed_count,\"failed\":$failed_count,\"total\":$total_count,\"baseline\":$baseline,\"delta\":$delta}" >> "$benchmark_log"
+
+    # Show failures if verbose or score dropped
+    if [[ "$delta" -lt -5 ]] || $VERBOSE; then
+      local failures
+      failures=$(echo "$memtest_output" | grep "FAIL" || true)
+      if [[ -n "$failures" ]]; then
+        echo -e "  ${C_DIM}Failures:${C_RESET}"
+        echo "$failures" | while read -r line; do
+          echo -e "    ${C_RED}•${C_RESET} ${C_DIM}$line${C_RESET}"
+        done
+      fi
+    fi
+
+    # Alert on significant regression (>10 point drop)
+    if [[ "$delta" -le -10 ]]; then
+      echo -e "\n  ${C_RED}${C_BOLD}⚠ REGRESSION ALERT: Retrieval score dropped ${delta} points!${C_RESET}"
+      echo -e "  ${C_DIM}Likely cause: MEMORY.md consolidation trimmed critical facts.${C_RESET}"
+      echo -e "  ${C_DIM}Action: check MEMORY.md diff, restore essential Key Findings.${C_RESET}"
+    fi
+  fi
+
+  # Test 2: graphmem search relevance (spot check with known good queries)
+  local relevance_pass=0
+  local relevance_total=0
+
+  # Known queries with expected high-relevance results
+  declare -A relevance_checks=(
+    ["Kuzu segfault migration"]="SQLite|kuzu|270"
+    ["reflexion rules pruned platitudes"]="70|platitude|prune"
+    ["Shujaat research DCEGM"]="Shujaat|DCEGM|Mississauga"
+  )
+
+  for query in "${!relevance_checks[@]}"; do
+    relevance_total=$((relevance_total + 1))
+    local expected_terms="${relevance_checks[$query]}"
+    local search_result
+    search_result=$(graphmem-sqlite search "$query" --limit 5 2>/dev/null || echo "")
+
+    local found_any=false
+    IFS='|' read -ra terms <<< "$expected_terms"
+    for term in "${terms[@]}"; do
+      if echo "$search_result" | grep -qi "$term"; then
+        found_any=true
+        break
+      fi
+    done
+
+    if $found_any; then
+      relevance_pass=$((relevance_pass + 1))
+    fi
+  done
+
+  if [[ "$relevance_pass" -eq "$relevance_total" ]]; then
+    pass "graphmem relevance: ${relevance_pass}/${relevance_total} spot checks"
+  elif [[ "$relevance_pass" -gt 0 ]]; then
+    fail "graphmem relevance" "${relevance_pass}/${relevance_total} — some queries returning irrelevant results"
+  else
+    fail "graphmem relevance" "0/${relevance_total} — search appears broken"
+  fi
+}
+
 # === RUN TESTS ===
 echo -e "${C_BOLD}🐣 system-test${C_RESET} — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo -e "${C_DIM}Workspace: $WORKSPACE${C_RESET}"
 [[ "$QUICK" == true ]] && echo -e "${C_DIM}Mode: quick${C_RESET}"
+[[ "$BENCHMARK" == true ]] && echo -e "${C_DIM}Mode: benchmark (includes quality checks)${C_RESET}"
 [[ -n "$CATEGORY" ]] && echo -e "${C_DIM}Category: $CATEGORY${C_RESET}"
 
 START_TIME=$(date +%s)
 
 case "$CATEGORY" in
-  tools)    test_tools ;;
-  pipeline) test_pipeline ;;
-  memory)   test_memory ;;
-  infra)    test_infra ;;
+  tools)     test_tools ;;
+  pipeline)  test_pipeline ;;
+  memory)    test_memory ;;
+  infra)     test_infra ;;
+  benchmark) test_benchmark ;;
   *)
     test_tools
     test_pipeline
     test_memory
     test_infra
+    if $BENCHMARK; then
+      test_benchmark
+    fi
     ;;
 esac
 
