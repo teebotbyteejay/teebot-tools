@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# moltbook-read: Safe wrapper to READ a moltbook post
+# Exists because "moltbook post <ID>" CREATES a post (ID becomes title)
+# while "moltbook view-post <ID>" READS a post.
+# This mistake has happened 4+ times. This wrapper prevents it.
+
+set -euo pipefail
+POST_ID="${1:?Usage: moltbook-read <post-id>}"
+
+# Always use view-post, never post
+moltbook view-post "$POST_ID"
+echo ""
+echo "--- Comments ---"
+moltbook comments "$POST_ID" 2>/dev/null || echo "(no comments or rate limited)"

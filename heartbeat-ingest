@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # heartbeat-ingest — ingest today's daily log into graphmem-sqlite
-# Safe to run multiple times; graphmem deduplicates by content.
+# Uses byte-offset tracking to only process NEW content since last ingest.
 #
 # Usage: heartbeat-ingest [YYYY-MM-DD]
 set -euo pipefail
@@ -27,54 +27,68 @@ if [[ ${#LOG_FILES[@]} -eq 0 ]]; then
   exit 0
 fi
 
-# Check if we already ingested today (marker stores hash of file list)
+# Offset tracking — per-file byte offsets so we only ingest new content
 MARKER_DIR="$WORKSPACE/memory/.ingest-markers"
 mkdir -p "$MARKER_DIR"
-MARKER="$MARKER_DIR/$DATE.done"
+OFFSET_FILE="$MARKER_DIR/$DATE.offsets"
 
-# Build a fingerprint of all matching files (names + sizes)
-CURRENT_FINGERPRINT=""
-for f in "${LOG_FILES[@]}"; do
-  CURRENT_FINGERPRINT+="$(basename "$f"):$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null);"
-done
-
-if [[ -f "$MARKER" ]]; then
-  OLD_FINGERPRINT=$(cat "$MARKER" | tail -1)
-  if [[ "$CURRENT_FINGERPRINT" == "$OLD_FINGERPRINT" ]]; then
-    echo -e "${C_DIM}Already ingested $DATE (${#LOG_FILES[@]} files, unchanged)${C_RESET}"
-    exit 0
-  else
-    echo -e "${C_YELLOW}Files changed since last ingest — re-ingesting new files${C_RESET}"
-  fi
+# Load existing offsets (format: filename:byte_offset per line)
+declare -A FILE_OFFSETS
+if [[ -f "$OFFSET_FILE" ]]; then
+  while IFS=: read -r fname offset; do
+    [[ -n "$fname" ]] && FILE_OFFSETS["$fname"]="$offset"
+  done < "$OFFSET_FILE"
 fi
 
-echo -e "${C_CYAN}${C_BOLD}Ingesting $DATE — ${#LOG_FILES[@]} file(s):${C_RESET}"
-for f in "${LOG_FILES[@]}"; do
-  echo -e "  ${C_DIM}$(basename "$f")${C_RESET}"
-done
+# Collect only NEW content across all files
+NEW_CONTENT=""
+declare -A NEW_OFFSETS
+HAS_NEW=false
 
-# Concatenate all files with file headers
-LOG_CONTENT=""
 for f in "${LOG_FILES[@]}"; do
   fname=$(basename "$f")
-  LOG_CONTENT+="--- $fname ---"$'\n'
-  LOG_CONTENT+="$(cat "$f")"$'\n\n'
+  file_size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
+  old_offset=${FILE_OFFSETS["$fname"]:-0}
+  
+  if [[ $file_size -le $old_offset ]]; then
+    # File hasn't grown (or shrunk — reset would catch this)
+    NEW_OFFSETS["$fname"]="$old_offset"
+    continue
+  fi
+  
+  # Extract only the new bytes
+  new_bytes=$((file_size - old_offset))
+  if [[ $new_bytes -gt 0 ]]; then
+    chunk=$(tail -c +"$((old_offset + 1))" "$f")
+    if [[ -n "$chunk" && ${#chunk} -gt 20 ]]; then
+      NEW_CONTENT+="--- $fname (new, +${new_bytes} bytes) ---"$'\n'
+      NEW_CONTENT+="$chunk"$'\n\n'
+      HAS_NEW=true
+    fi
+  fi
+  
+  NEW_OFFSETS["$fname"]="$file_size"
 done
-LOG_SIZE=${#LOG_CONTENT}
 
-if [[ $LOG_SIZE -lt 50 ]]; then
-  echo -e "${C_DIM}Log too short ($LOG_SIZE chars), skipping${C_RESET}"
+if [[ "$HAS_NEW" != "true" ]]; then
+  echo -e "${C_DIM}No new content for $DATE (${#LOG_FILES[@]} files, all up to date)${C_RESET}"
   exit 0
 fi
 
-# Split into chunks if large (graphmem works best with focused episodes)
-# ~2000 char chunks with section-aware splitting
+NEW_SIZE=${#NEW_CONTENT}
+echo -e "${C_CYAN}${C_BOLD}Ingesting $DATE — new content: ${NEW_SIZE} chars from ${#LOG_FILES[@]} file(s)${C_RESET}"
+
+if [[ $NEW_SIZE -lt 50 ]]; then
+  echo -e "${C_DIM}New content too short ($NEW_SIZE chars), skipping${C_RESET}"
+  exit 0
+fi
+
+# Split into chunks (~2000 char, section-aware)
 CHUNK_SIZE=2000
 CHUNKS=()
 current_chunk=""
 
 while IFS= read -r line; do
-  # If this line is a header and current chunk is substantial, flush
   if [[ "$line" =~ ^## && ${#current_chunk} -gt 200 ]]; then
     CHUNKS+=("$current_chunk")
     current_chunk="$line"$'\n'
@@ -85,37 +99,36 @@ while IFS= read -r line; do
       current_chunk=""
     fi
   fi
-done <<< "$LOG_CONTENT"
+done <<< "$NEW_CONTENT"
 
-# Don't forget the last chunk
 [[ -n "$current_chunk" ]] && CHUNKS+=("$current_chunk")
 
-echo -e "  ${C_DIM}Log size: $LOG_SIZE chars, split into ${#CHUNKS[@]} chunks${C_RESET}"
+echo -e "  ${C_DIM}Split into ${#CHUNKS[@]} chunks${C_RESET}"
 
 SUCCESS=0
 FAIL=0
 for i in "${!CHUNKS[@]}"; do
   chunk="${CHUNKS[$i]}"
-  # Skip tiny chunks
   [[ ${#chunk} -lt 50 ]] && continue
   
-  if graphmem-sqlite add "Daily log $DATE (part $((i+1))/${#CHUNKS[@]}): $chunk" 2>/dev/null; then
-    ((SUCCESS++))
+  if graphmem-sqlite add "Daily log $DATE (delta $((i+1))/${#CHUNKS[@]}): $chunk" 2>/dev/null; then
+    SUCCESS=$((SUCCESS + 1))
   else
-    ((FAIL++))
+    FAIL=$((FAIL + 1))
   fi
-  # Small delay to avoid rate limits
   sleep 2
 done
 
-echo -e "  ${C_GREEN}✓${C_RESET} Ingested $SUCCESS chunks ($FAIL failed)"
+echo -e "  ${C_GREEN}✓${C_RESET} Ingested $SUCCESS new chunks ($FAIL failed)"
 
-# Write marker if any chunks succeeded
+# Save offsets only if at least some chunks succeeded
 if [[ $SUCCESS -gt 0 ]]; then
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER"
-  echo "$CURRENT_FINGERPRINT" >> "$MARKER"
-  echo -e "  ${C_DIM}Marker written: $MARKER${C_RESET}"
+  : > "$OFFSET_FILE"  # truncate
+  for fname in "${!NEW_OFFSETS[@]}"; do
+    echo "$fname:${NEW_OFFSETS[$fname]}" >> "$OFFSET_FILE"
+  done
+  echo -e "  ${C_DIM}Offsets updated in $OFFSET_FILE${C_RESET}"
 else
-  echo -e "  ${C_YELLOW}⚠${C_RESET} All chunks failed, no marker written (will retry next heartbeat)"
+  echo -e "  ${C_YELLOW}⚠${C_RESET} All chunks failed — offsets NOT updated (will retry)"
   exit 1
 fi

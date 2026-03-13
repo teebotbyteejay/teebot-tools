@@ -50,23 +50,16 @@ $rules
   matched_rules_json=$(reflexion-eval match-json "$TASK" 2>/dev/null || echo "[]")
 fi
 
-# --- 1.5. Past Examples (SiriuS/Self-Generated Examples inspired) ---
-# Retrieve similar past task evaluations as in-context examples.
-# Research shows 73%→93% gains on ALFWorld from trajectory examples.
-if command -v eval-examples &>/dev/null && [[ -f "$WORKSPACE/memory/eval-embeddings.bin" ]]; then
-  examples=$(eval-examples format "$TASK" 2>/dev/null || true)
-  if [[ -n "$examples" && ! "$examples" =~ "No similar" ]]; then
-    output+="$examples
-"
-  fi
-fi
-
-# --- 1.6. Retrieval Trigger (MemGen-inspired) ---
+# --- 1.5. Retrieval Trigger (MemGen-inspired) ---
 # Quick probe: is retrieval likely to be useful for this task?
 # Uses EMBEDDING score (semantic similarity) not composite score.
 # Composite score is inflated by FTS keyword overlap (e.g. "set up" matches everything).
 # Embedding score directly measures semantic relevance: 0.35+ = relevant, <0.35 = novel.
 # Calibrated on 9 test tasks: 0.35 gives perfect separation (2026-03-04).
+#
+# IMPORTANT: This check MUST happen before eval-examples retrieval.
+# For novel tasks, injecting "closest" past examples reduces generalization difficulty
+# and promotes template-matching over genuine reasoning. (Chollet/ARC insight, 2026-03-12)
 RETRIEVAL_EMB_THRESHOLD=0.35
 skip_retrieval=false
 probe_emb_score="0"
@@ -78,9 +71,49 @@ if command -v graphmem-sqlite &>/dev/null; then
   
   if [[ -n "$probe_emb_score" ]] && (( $(echo "$probe_emb_score < $RETRIEVAL_EMB_THRESHOLD" | bc -l 2>/dev/null || echo 0) )); then
     skip_retrieval=true
-    $VERBOSE && echo -e "${C_DIM}Retrieval trigger: emb=$probe_emb_score < $RETRIEVAL_EMB_THRESHOLD — skipping (novel task)${C_RESET}" >&2
+    $VERBOSE && echo -e "${C_DIM}Retrieval trigger: emb=$probe_emb_score < $RETRIEVAL_EMB_THRESHOLD — novel task detected${C_RESET}" >&2
   else
     $VERBOSE && echo -e "${C_DIM}Retrieval trigger: emb=$probe_emb_score ≥ $RETRIEVAL_EMB_THRESHOLD — retrieving${C_RESET}" >&2
+  fi
+fi
+
+# --- 1.6. Past Examples OR Refinement Loop ---
+# For FAMILIAR tasks (emb ≥ 0.35): retrieve similar past evals as templates (SiriuS-inspired)
+# For NOVEL tasks (emb < 0.35): inject refinement-loop instructions instead (ARC-inspired)
+#
+# The ARC Prize 2025 finding: top approaches use iterative refinement (generate → verify → refine),
+# not one-shot template matching. For novel problems, reasoning from principles beats retrieval.
+if $skip_retrieval; then
+  # Novel task — inject refinement loop instructions
+  output+="## Novel Task — Refinement Loop (no similar past experience)
+Embedding similarity: ${probe_emb_score} (below ${RETRIEVAL_EMB_THRESHOLD} threshold)
+This task has no close match in your experience. Do NOT pattern-match.
+
+**Use refinement loop instead of template retrieval:**
+1. **GENERATE** 3 candidate approaches from first principles
+2. **EVALUATE** each against the task requirements — what could fail? what are the assumptions?
+3. **SELECT** the strongest candidate and **REFINE** it — address identified weaknesses
+4. **BUILD** from the refined approach, testing as you go
+
+Reason from structure, not from similarity. If you catch yourself thinking 'this is like X I did before,' stop and ask: is it really, or am I forcing a match?
+
+**If this task involves pattern-finding, rule induction, or abstract reasoning — use Type 2 (program synthesis):**
+- Do NOT reason about patterns in prose. Formalize each hypothesis as a **concrete function or rule** (pseudocode or Python).
+- **VERIFY** each hypothesis against ALL data points — exact match required. If it fails on ONE example, the hypothesis is wrong. Don't explain away the failure — revise the hypothesis.
+- Use verification failures as **constraints** that narrow the search space for the next hypothesis.
+- Prefer the **simplest program** that exactly fits all examples (Minimum Description Length principle).
+- Type 1 (intuition) picks the candidates. Type 2 (verification) eliminates the wrong ones. Both are needed.
+
+"
+  $VERBOSE && echo -e "${C_DIM}Injected refinement-loop instructions (novel task)${C_RESET}" >&2
+else
+  # Familiar task — retrieve past examples as templates
+  if command -v eval-examples &>/dev/null && [[ -f "$WORKSPACE/memory/eval-embeddings.bin" ]]; then
+    examples=$(eval-examples format "$TASK" 2>/dev/null || true)
+    if [[ -n "$examples" && ! "$examples" =~ "No similar" ]]; then
+      output+="$examples
+"
+    fi
   fi
 fi
 
@@ -226,9 +259,10 @@ jq -n \
   --arg distilled "${distilled_context:0:2000}" \
   --argjson distilled_used "$(if [[ -n "$distilled_context" ]]; then echo true; else echo false; fi)" \
   --argjson retrieval_skipped "$(if $skip_retrieval; then echo true; else echo false; fi)" \
+  --argjson refinement_loop "$(if $skip_retrieval; then echo true; else echo false; fi)" \
   --arg probe_score "${top_score:-0}" \
   --arg probe_emb "${probe_emb_score:-0}" \
-  '{task: $task, timestamp: $ts, matched_rules: $rules, retrieval: {raw_ltm: $raw_ltm, raw_stm: $raw_stm, distilled: $distilled, distilled_used: $distilled_used, skipped: $retrieval_skipped, probe_score: $probe_score, probe_emb: $probe_emb}}' \
+  '{task: $task, timestamp: $ts, matched_rules: $rules, retrieval: {raw_ltm: $raw_ltm, raw_stm: $raw_stm, distilled: $distilled, distilled_used: $distilled_used, skipped: $retrieval_skipped, refinement_loop_injected: $refinement_loop, probe_score: $probe_score, probe_emb: $probe_emb}}' \
   > "$PRETASK_FILE" 2>/dev/null || true
 
 # --- Output ---
