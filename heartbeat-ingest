@@ -105,6 +105,15 @@ done <<< "$NEW_CONTENT"
 
 echo -e "  ${C_DIM}Split into ${#CHUNKS[@]} chunks${C_RESET}"
 
+# Write offsets EARLY — before processing chunks.
+# If we get SIGTERM'd mid-extraction, we lose some chunks but avoid
+# re-ingesting the same 15KB on every heartbeat (the worse outcome).
+: > "$OFFSET_FILE"
+for fname in "${!NEW_OFFSETS[@]}"; do
+  echo "$fname:${NEW_OFFSETS[$fname]}" >> "$OFFSET_FILE"
+done
+echo -e "  ${C_DIM}Offsets pre-saved (${#NEW_OFFSETS[@]} files)${C_RESET}"
+
 SUCCESS=0
 FAIL=0
 for i in "${!CHUNKS[@]}"; do
@@ -121,14 +130,10 @@ done
 
 echo -e "  ${C_GREEN}✓${C_RESET} Ingested $SUCCESS new chunks ($FAIL failed)"
 
-# Save offsets only if at least some chunks succeeded
+# Report results (offsets already saved above)
 if [[ $SUCCESS -gt 0 ]]; then
-  : > "$OFFSET_FILE"  # truncate
-  for fname in "${!NEW_OFFSETS[@]}"; do
-    echo "$fname:${NEW_OFFSETS[$fname]}" >> "$OFFSET_FILE"
-  done
-  echo -e "  ${C_DIM}Offsets updated in $OFFSET_FILE${C_RESET}"
+  echo -e "  ${C_DIM}Offsets confirmed (${SUCCESS} chunks succeeded)${C_RESET}"
 else
-  echo -e "  ${C_YELLOW}⚠${C_RESET} All chunks failed — offsets NOT updated (will retry)"
+  echo -e "  ${C_YELLOW}⚠${C_RESET} All chunks failed — offsets were pre-saved, content won't be retried"
   exit 1
 fi
