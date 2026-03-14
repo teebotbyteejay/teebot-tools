@@ -109,6 +109,29 @@ TEST_CASES=(
 
   # Cross-system: How does the nightly consolidation work end-to-end?
   "Describe the nightly consolidation pipeline: what tools run, what files are updated, and what gets archived?|CURRENT_STATE|MEMORY|MEMORY-ARCHIVE|Sonnet|8KB|2026-03-07"
+
+  # === March 14 additions: harder questions requiring multi-hop, temporal, and precise recall ===
+
+  # Multi-hop: Connect person → finding → system change (3 hops)
+  "What specific finding from Hazel_OC influenced teebot's approach to behavioral change, and what percentage was cited?|70|reversion|structural|2026-03-13"
+
+  # Temporal precision: Distinguish between similar events at different times
+  "How many times has teebot leaked information to wrong recipients, and who were the affected parties?|Shujaat|credential|routing|2026-03-14"
+
+  # Quantitative chain: Track a metric across 3+ measurements
+  "What was the graph entity count at key milestones: during Kuzu segfault, after initial graphmem-sqlite build, and most recently?|270|260|953|2026-03-14"
+
+  # Causal chain: Why did X lead to Y lead to Z?
+  "What chain of events led from the Kuzu segfault to the current SQLite-based graph memory system?|segfault|Claude Code|SQLite|pivot|2026-02-27"
+
+  # Disambiguation: Two concepts with overlapping keywords
+  "What is the difference between capability-score and BRS? Which measures skill and which measures intelligence?|skill|intelligence|76|83.2|2026-03-12"
+
+  # Recency test: Does retrieval prefer recent data when appropriate?
+  "How many active reflexion rules exist currently, and how many existed before the March 12 audit?|2|15|archived|2026-03-12"
+
+  # Cross-domain: Connect research paper to implementation detail
+  "What specific threshold value was derived from the MemGen paper, and what does it control in the pre-task pipeline?|0.35|embedding|novel|retrieval trigger|2026-03-04"
 )
 
 echo -e "${C_CYAN}${C_BOLD}Memory Ground Truth Test Suite${C_RESET}"
@@ -172,10 +195,15 @@ for test_case in "${TEST_CASES[@]}"; do
   fi
 
   # Check each required fact
+  # NOTE: Using here-string (<<<) instead of echo|pipe to avoid SIGPIPE race
+  # condition with grep -q. With pipefail, if grep -q exits early on large
+  # output (~29KB), echo gets SIGPIPE (exit 141) and the pipeline returns
+  # non-zero even though grep found the match. This caused 20-40% false
+  # negatives depending on timing. Here-strings avoid pipes entirely.
   all_found=true
   missing=()
   for fact in "${facts[@]}"; do
-    if ! echo "$output" | grep -qi "$fact"; then
+    if ! grep -qi "$fact" <<< "$output"; then
       all_found=false
       missing+=("$fact")
     fi

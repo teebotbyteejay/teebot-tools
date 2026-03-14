@@ -97,7 +97,7 @@ test_pipeline() {
   # Test 2: graphmem-sqlite search returns results
   local search_result
   search_result=$(graphmem-sqlite search "teebot memory" --limit 3 2>/dev/null || echo "")
-  if echo "$search_result" | grep -q "score="; then
+  if grep -q "score=" <<< "$search_result"; then
     pass "graphmem search: returns scored results"
   else
     fail "graphmem search" "no scored results returned"
@@ -106,11 +106,11 @@ test_pipeline() {
   # Test 3: pre-task — novel task gets refinement loop
   local novel_output
   novel_output=$(pre-task "design a quantum error correction decoder for topological codes" 2>/dev/null || echo "")
-  if echo "$novel_output" | grep -qi "refinement loop\|novel task\|first principles"; then
+  if grep -qi "refinement loop\|novel task\|first principles" <<< "$novel_output"; then
     pass "pre-task novel: injects refinement loop"
   else
     # Check if it just didn't detect as novel
-    if echo "$novel_output" | grep -qi "similar past"; then
+    if grep -qi "similar past" <<< "$novel_output"; then
       skip "pre-task novel" "task matched existing examples (not truly novel for this graph)"
     else
       fail "pre-task novel" "no refinement loop or examples — unexpected output"
@@ -121,7 +121,7 @@ test_pipeline() {
   if ! $QUICK; then
     local familiar_output
     familiar_output=$(pre-task "build a bash tool for memory retrieval" 2>/dev/null || echo "")
-    if echo "$familiar_output" | grep -qiE "example|past experience|rule|context"; then
+    if grep -qiE "example|past experience|rule|context" <<< "$familiar_output"; then
       pass "pre-task familiar: retrieves context"
     else
       fail "pre-task familiar" "no context retrieved for familiar-type task"
@@ -131,11 +131,11 @@ test_pipeline() {
   # Test 5: reflexion-eval responds (even with 0 rules)
   local refl_result
   refl_result=$(reflexion-eval match "test task" 2>&1 || echo "ERROR")
-  if echo "$refl_result" | grep -qiE "matched|rules|no rules"; then
+  if grep -qiE "matched|rules|no rules" <<< "$refl_result"; then
     local rule_count
     rule_count=$(echo "$refl_result" | grep -oP '\d+(?=\s*rules?\s*matched)' || echo "?")
     pass "reflexion-eval: responds ($rule_count rules)"
-  elif echo "$refl_result" | grep -qi "error"; then
+  elif grep -qi "error" <<< "$refl_result"; then
     fail "reflexion-eval" "returned error"
   else
     pass "reflexion-eval: responds"
@@ -308,8 +308,8 @@ test_infra() {
   if ! $QUICK; then
     local gmail_result
     gmail_result=$(timeout 15 bash -c 'export GOG_KEYRING_PASSWORD=teebot GOG_ACCOUNT=teebot.by.teejay@gmail.com; gog gmail list "is:unread" -a teebot.by.teejay@gmail.com 2>&1' || echo "TIMEOUT_OR_ERROR")
-    if echo "$gmail_result" | grep -qi "error\|expired\|invalid.*grant\|TIMEOUT_OR_ERROR"; then
-      if echo "$gmail_result" | grep -qi "TIMEOUT"; then
+    if grep -qi "error\|expired\|invalid.*grant\|TIMEOUT_OR_ERROR" <<< "$gmail_result"; then
+      if grep -qi "TIMEOUT" <<< "$gmail_result"; then
         fail "Gmail OAuth" "timed out (may be expired or slow)"
       else
         fail "Gmail OAuth" "authentication error — needs renewal"
@@ -504,7 +504,7 @@ test_benchmark() {
     local found_any=false
     IFS='|' read -ra terms <<< "$expected_terms"
     for term in "${terms[@]}"; do
-      if echo "$search_result" | grep -qi "$term"; then
+      if grep -qi "$term" <<< "$search_result"; then
         found_any=true
         break
       fi
