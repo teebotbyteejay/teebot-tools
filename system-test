@@ -242,7 +242,53 @@ test_memory() {
     skip "heartbeat-ingest" "no .ingest-markers directory"
   fi
 
-  # Test 7: graphmem edge count sanity
+  # Test 7: File hygiene — no stale files in memory/ root
+  local stale_count=0
+  for f in "$MEMORY_DIR"/*.md; do
+    [[ ! -f "$f" ]] && continue
+    local fname=$(basename "$f")
+    # Skip daily logs (YYYY-MM-DD.md pattern) and active files
+    [[ "$fname" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]] && continue
+    [[ "$fname" == "moltbook-log.md" ]] && continue
+    local file_age=$(( $(date +%s) - $(stat -c %Y "$f") ))
+    if [[ "$file_age" -gt 1209600 ]]; then  # 14 days
+      stale_count=$((stale_count + 1))
+    fi
+  done
+  if [[ "$stale_count" -eq 0 ]]; then
+    pass "File hygiene: no stale files (>14d) in memory/"
+  else
+    fail "File hygiene" "$stale_count files in memory/ older than 14 days — archive them"
+  fi
+
+  # Test 8: MEMORY.md under 8KB budget
+  if [[ -f "$WORKSPACE/MEMORY.md" ]]; then
+    local mem_bytes
+    mem_bytes=$(wc -c < "$WORKSPACE/MEMORY.md")
+    if [[ "$mem_bytes" -le 8192 ]]; then
+      pass "MEMORY.md budget: ${mem_bytes}B / 8192B"
+    else
+      fail "MEMORY.md budget" "${mem_bytes}B exceeds 8KB budget"
+    fi
+  fi
+
+  # Test 9: No stray project files in workspace root
+  local stray_count=0
+  for f in "$WORKSPACE"/*.md; do
+    [[ ! -f "$f" ]] && continue
+    local fname=$(basename "$f")
+    case "$fname" in
+      AGENTS.md|CURRENT_STATE.md|HEARTBEAT.md|IDENTITY.md|MEMORY.md|MEMORY-ARCHIVE.md|SOUL.md|TOOLS.md|TOPICS.md|USER.md|BOOTSTRAP.md) continue ;;
+      *) stray_count=$((stray_count + 1)) ;;
+    esac
+  done
+  if [[ "$stray_count" -eq 0 ]]; then
+    pass "Workspace root: clean (no stray .md files)"
+  else
+    fail "Workspace root" "$stray_count stray .md files — move to projects/ or memory/"
+  fi
+
+  # Test 10: graphmem edge count sanity (renumbered)
   local edge_count
   edge_count=$(graphmem-sqlite stats 2>/dev/null | grep -oP 'Edges:\s*\K\d+' || echo "0")
   if [[ "$edge_count" -gt 500 ]]; then
