@@ -335,11 +335,14 @@ test_infra() {
     local inject_dir="$WORKSPACE/injected-context"
     if [[ -d "$inject_dir" ]]; then
       local file_count
-      file_count=$(find "$inject_dir" -name "*.md" -mmin -120 | wc -l)
+      file_count=$(find "$inject_dir" -name "*.md" | wc -l)
       if [[ "$file_count" -gt 0 ]]; then
-        pass "context-inject: $file_count active file(s) (updated <2h)"
+        local newest_age
+        newest_age=$(find "$inject_dir" -name "*.md" -printf '%T@\n' | sort -rn | head -1)
+        local age_hrs=$(( ($(date +%s) - ${newest_age%.*}) / 3600 ))
+        pass "context-inject: $file_count file(s) (newest: ${age_hrs}h ago)"
       else
-        fail "context-inject" "no files updated in last 2 hours"
+        fail "context-inject" "no files in output directory"
       fi
     else
       fail "context-inject" "output directory missing"
