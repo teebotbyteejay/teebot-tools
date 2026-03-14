@@ -106,6 +106,17 @@ Reason from structure, not from similarity. If you catch yourself thinking 'this
 
 "
   $VERBOSE && echo -e "${C_DIM}Injected refinement-loop instructions (novel task)${C_RESET}" >&2
+
+  # Concept library: inject relevant reasoning strategies for novel tasks
+  if command -v concept-search &>/dev/null && [[ -f "$WORKSPACE/memory/concept-library.yaml" ]]; then
+    concepts=$(concept-search "$TASK" --limit 3 2>/dev/null || true)
+    if [[ -n "$concepts" && "$concepts" != "No concepts matched"* ]]; then
+      output+="
+$concepts
+"
+      $VERBOSE && echo -e "${C_DIM}Injected concept library strategies${C_RESET}" >&2
+    fi
+  fi
 else
   # Familiar task — retrieve past examples as templates
   if command -v eval-examples &>/dev/null && [[ -f "$WORKSPACE/memory/eval-embeddings.bin" ]]; then

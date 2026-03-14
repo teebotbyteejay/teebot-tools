@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# concept-search — Find relevant reasoning strategies for a task
+#
+# Searches the concept library using embedding similarity.
+# Returns composable building blocks for novel task approaches.
+#
+# Usage: concept-search "design a caching layer for API responses"
+# Options:
+#   --limit N     Max concepts to return (default: 3)
+#   --threshold T Min similarity to include (default: 0.3)
+#   --embed       Force re-embedding of concept library
+#   --list        List all concepts without searching
+set -euo pipefail
+
+LIMIT=3
+THRESHOLD=0.25
+FORCE_EMBED=false
+LIST_MODE=false
+QUERY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --embed) FORCE_EMBED=true; shift ;;
+    --list) LIST_MODE=true; shift ;;
+    --limit) LIMIT="$2"; shift 2 ;;
+    --threshold) THRESHOLD="$2"; shift 2 ;;
+    -*) echo "Unknown option: $1" >&2; exit 1 ;;
+    *) QUERY="$1"; shift ;;
+  esac
+done
+
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+LIBRARY="$WORKSPACE/memory/concept-library.yaml"
+EMBEDDINGS="$WORKSPACE/memory/concept-embeddings.json"
+
+if [[ ! -f "$LIBRARY" ]]; then
+  echo "Error: concept library not found at $LIBRARY" >&2
+  exit 1
+fi
+
+if $LIST_MODE; then
+  python3 -c "
+import yaml, sys
+with open('$LIBRARY') as f:
+    data = yaml.safe_load(f)
+for c in data['concepts']:
+    print(f\"  [{c['category']}] {c['name']}: {c['description']}\")
+"
+  exit 0
+fi
+
+if [[ -z "$QUERY" ]]; then
+  echo "Usage: concept-search '<task description>'" >&2
+  echo "       concept-search --list" >&2
+  exit 1
+fi
+
+# Main search logic in Python (embedding + YAML parsing)
+python3 - "$QUERY" "$LIBRARY" "$EMBEDDINGS" "$LIMIT" "$THRESHOLD" "$FORCE_EMBED" <<'PYEOF'
+import json, yaml, sys, os, time
+import numpy as np
+
+query = sys.argv[1]
+library_path = sys.argv[2]
+embeddings_path = sys.argv[3]
+limit = int(sys.argv[4])
+threshold = float(sys.argv[5])
+force_embed = sys.argv[6] == "true"
+
+# Load concept library
+with open(library_path) as f:
+    library = yaml.safe_load(f)
+concepts = library['concepts']
+
+# Check if embeddings exist and are fresh
+need_embed = force_embed
+if not os.path.exists(embeddings_path):
+    need_embed = True
+elif os.path.getmtime(library_path) > os.path.getmtime(embeddings_path):
+    need_embed = True
+    print("  (concept library updated, re-embedding...)", file=sys.stderr)
+
+def get_embeddings(texts, model="text-embedding-3-small"):
+    """Get embeddings from OpenAI API."""
+    import urllib.request
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        print("Error: OPENAI_API_KEY not set", file=sys.stderr)
+        sys.exit(1)
+    
+    data = json.dumps({"input": texts, "model": model}).encode()
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/embeddings",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read())
+    return [item["embedding"] for item in result["data"]]
+
+def cosine_sim(a, b):
+    a, b = np.array(a), np.array(b)
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
+
+# Embed concepts if needed
+if need_embed:
+    print(f"  Embedding {len(concepts)} concepts...", file=sys.stderr)
+    # Create rich search text for each concept
+    texts = []
+    for c in concepts:
+        search_text = f"{c['name']}: {c['description']}. {c['when_useful']}"
+        texts.append(search_text)
+    
+    embeddings = get_embeddings(texts)
+    
+    # Save embeddings keyed by concept ID
+    emb_data = {}
+    for c, emb in zip(concepts, embeddings):
+        emb_data[c['id']] = emb
+    
+    with open(embeddings_path, 'w') as f:
+        json.dump(emb_data, f)
+    print(f"  ✓ Saved embeddings to {embeddings_path}", file=sys.stderr)
+else:
+    with open(embeddings_path) as f:
+        emb_data = json.load(f)
+
+# Embed the query
+query_emb = get_embeddings([query])[0]
+
+# Score each concept
+scored = []
+for c in concepts:
+    cid = c['id']
+    if cid not in emb_data:
+        continue
+    sim = cosine_sim(query_emb, emb_data[cid])
+    if sim >= threshold:
+        scored.append((sim, c))
+
+scored.sort(key=lambda x: -x[0])
+results = scored[:limit]
+
+if not results:
+    print("No concepts matched above threshold.")
+    sys.exit(0)
+
+# Format output
+print(f"## Relevant Concepts ({len(results)} matched)")
+print()
+for sim, c in results:
+    print(f"### {c['name']} (similarity: {sim:.3f})")
+    print(f"*{c['description']}*")
+    print()
+    print(f"**When useful:** {c['when_useful']}")
+    print()
+    print("**How to apply:**")
+    for step in c['how_to_apply']:
+        print(f"  {step}")
+    print()
+    print(f"**Grounding:** {c['grounding']}")
+    print()
+    if c.get('composable_with'):
+        # Look up names for composable concepts
+        id_to_name = {cc['id']: cc['name'] for cc in concepts}
+        comp_names = [id_to_name.get(cid, cid) for cid in c['composable_with']]
+        print(f"**Combines well with:** {', '.join(comp_names)}")
+        print()
+    print("---")
+    print()
+PYEOF
