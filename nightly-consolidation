@@ -129,7 +129,7 @@ echo "$new_state" > "$CURRENT_STATE"
 echo -e "${C_GREEN}✓${C_RESET} CURRENT_STATE.md updated ($(wc -c < "$CURRENT_STATE") bytes)"
 
 if [[ -f "${CURRENT_STATE}.prev" ]]; then
-  changes=$(diff "${CURRENT_STATE}.prev" "$CURRENT_STATE" 2>/dev/null | head -20 || true)
+  _diff_out=$(diff "${CURRENT_STATE}.prev" "$CURRENT_STATE" 2>/dev/null || true); changes=$(head -20 <<< "$_diff_out")
   [[ -n "$changes" ]] && echo -e "${C_DIM}${changes}${C_RESET}"
   rm -f "${CURRENT_STATE}.prev"
 fi

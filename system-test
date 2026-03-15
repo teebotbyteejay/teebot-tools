@@ -467,7 +467,7 @@ test_infra() {
       file_count=$(find "$inject_dir" -name "*.md" | wc -l)
       if [[ "$file_count" -gt 0 ]]; then
         local newest_age
-        newest_age=$(find "$inject_dir" -name "*.md" -printf '%T@\n' | sort -rn | head -1)
+        _find_ages=$(find "$inject_dir" -name "*.md" -printf '%T@\n' | sort -rn); newest_age=$(head -1 <<< "$_find_ages")
         local age_hrs=$(( ($(date +%s) - ${newest_age%.*}) / 3600 ))
         pass "context-inject: $file_count file(s) (newest: ${age_hrs}h ago)"
       else

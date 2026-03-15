@@ -134,7 +134,7 @@ fi
 
 # === Recent Activity (last 5 git commits across all repos) ===
 section "Recent Activity"
-{
+_git_activity=$({
   for dir in "$WORKSPACE"/*/; do
     [[ -d "$dir/.git" ]] || continue
     name=$(basename "$dir")
@@ -142,7 +142,9 @@ section "Recent Activity"
     git log -3 --format="${name}|%ar|%s" 2>/dev/null || true
     cd "$WORKSPACE"
   done
-} | sort -t'|' -k2 | head -8 | while IFS='|' read -r repo time msg; do
+})
+_recent_sorted=$(sort -t'|' -k2 <<< "$_git_activity")
+head -8 <<< "$_recent_sorted" | while IFS='|' read -r repo time msg; do
   echo -e "  ${C_CYAN}$repo${C_RESET} ${C_DIM}$time${C_RESET} — $msg"
 done
 
