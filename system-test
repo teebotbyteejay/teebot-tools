@@ -18,6 +18,7 @@ TODAY=$(date -u +%Y-%m-%d)
 VERBOSE=false
 QUICK=false
 BENCHMARK=false
+REPORT=false
 CATEGORY=""
 
 for arg in "$@"; do
@@ -25,6 +26,7 @@ for arg in "$@"; do
     --verbose|-v) VERBOSE=true ;;
     --quick|-q) QUICK=true ;;
     --benchmark|-b) BENCHMARK=true ;;
+    --report|-r) REPORT=true ;;
     tools|pipeline|memory|infra|benchmark) CATEGORY="$arg" ;;
   esac
 done
@@ -47,9 +49,136 @@ C_RED='\033[31m'
 C_YELLOW='\033[33m'
 C_DIM='\033[2m'
 
-pass() { ((PASS++)) || true; echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
-fail() { ((FAIL++)) || true; FAILURES+=("$1: $2"); echo -e "  ${C_RED}✗${C_RESET} $1 — ${C_DIM}$2${C_RESET}"; }
-skip() { ((SKIP++)) || true; echo -e "  ${C_YELLOW}⊘${C_RESET} $1 — ${C_DIM}$2${C_RESET}"; }
+# Verification value tracking: record every check result
+declare -A CHECK_RESULTS
+HISTORY_FILE="$MEMORY_DIR/system-test-history.jsonl"
+
+# Normalize check names for stable tracking (strip dynamic numbers/details)
+normalize_check() {
+  echo "$1" | sed -E 's/: .*//; s/ \(.*//; s/[0-9]+[BKGMsmhd]+//g; s/\s+/ /g; s/^ //; s/ $//'
+}
+
+pass() { local key; key=$(normalize_check "$1"); ((PASS++)) || true; CHECK_RESULTS["$key"]="pass"; echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+fail() { local key; key=$(normalize_check "$1"); ((FAIL++)) || true; CHECK_RESULTS["$key"]="fail"; FAILURES+=("$1: $2"); echo -e "  ${C_RED}✗${C_RESET} $1 — ${C_DIM}$2${C_RESET}"; }
+skip() { local key; key=$(normalize_check "$1"); ((SKIP++)) || true; CHECK_RESULTS["$key"]="skip"; echo -e "  ${C_YELLOW}⊘${C_RESET} $1 — ${C_DIM}$2${C_RESET}"; }
+
+# Dump check results to history
+dump_history() {
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local mode="full"
+  $QUICK && mode="quick"
+  $BENCHMARK && mode="benchmark"
+  
+  # Build JSON object of results
+  local results_json="{"
+  local first=true
+  for check in "${!CHECK_RESULTS[@]}"; do
+    $first || results_json+=","
+    first=false
+    # Escape check name for JSON
+    local escaped_check
+    escaped_check=$(printf '%s' "$check" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()), end='')" 2>/dev/null || printf '"%s"' "$check")
+    results_json+="${escaped_check}:\"${CHECK_RESULTS[$check]}\""
+  done
+  results_json+="}"
+  
+  echo "{\"timestamp\":\"$ts\",\"mode\":\"$mode\",\"pass\":$PASS,\"fail\":$FAIL,\"skip\":$SKIP,\"results\":$results_json}" >> "$HISTORY_FILE"
+}
+
+# Report mode: analyze verification value from history
+run_report() {
+  echo -e "${C_BOLD}🐣 system-test — Verification Value Report${C_RESET}"
+  echo -e "${C_DIM}History: $HISTORY_FILE${C_RESET}\n"
+  
+  if [[ ! -f "$HISTORY_FILE" ]]; then
+    echo "No history yet. Run system-test a few times first."
+    exit 0
+  fi
+  
+  local total_runs
+  total_runs=$(wc -l < "$HISTORY_FILE")
+  echo -e "${C_BOLD}Total runs:${C_RESET} $total_runs\n"
+  
+  if [[ "$total_runs" -lt 3 ]]; then
+    echo "Need at least 3 runs for meaningful analysis."
+    exit 0
+  fi
+  
+  # Analyze per-check correction rates using Python for JSON handling
+  python3 - "$HISTORY_FILE" << 'PYEOF'
+import json, sys
+from collections import defaultdict
+
+history_file = sys.argv[1]
+check_stats = defaultdict(lambda: {"pass": 0, "fail": 0, "skip": 0, "last_fail": None, "runs": 0})
+
+with open(history_file) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = entry.get("timestamp", "?")
+        results = entry.get("results", {})
+        for check, result in results.items():
+            check_stats[check]["runs"] += 1
+            check_stats[check][result] = check_stats[check].get(result, 0) + 1
+            if result == "fail":
+                check_stats[check]["last_fail"] = ts
+
+# Sort by correction rate (failures / runs), ascending
+sorted_checks = sorted(check_stats.items(), key=lambda x: x[1]["fail"] / max(x[1]["runs"], 1))
+
+# Header
+print(f"{'Check':<40} {'Runs':>5} {'Fail':>5} {'Rate':>7} {'Last Fail':<12} {'Recommendation'}")
+print("-" * 100)
+
+weekly_candidates = []
+for check, stats in sorted_checks:
+    runs = stats["runs"]
+    fails = stats["fail"]
+    rate = (fails / runs * 100) if runs > 0 else 0
+    last_fail = stats["last_fail"] or "never"
+    if last_fail != "never":
+        last_fail = last_fail[:10]  # Just the date
+    
+    # Recommendation logic
+    if runs >= 10 and rate == 0:
+        rec = "→ weekly"
+        weekly_candidates.append(check)
+    elif runs >= 5 and rate < 2:
+        rec = "→ weekly (likely)"
+    elif rate > 10:
+        rec = "⚠ keep (high correction value)"
+    else:
+        rec = "keep"
+    
+    # Color coding
+    if rate == 0:
+        rate_str = f"\033[2m{rate:6.1f}%\033[0m"
+    elif rate < 5:
+        rate_str = f"\033[33m{rate:6.1f}%\033[0m"
+    else:
+        rate_str = f"\033[31m{rate:6.1f}%\033[0m"
+    
+    print(f"  {check:<38} {runs:>5} {fails:>5} {rate_str} {last_fail:<12} {rec}")
+
+print()
+if weekly_candidates:
+    print(f"\033[1m{len(weekly_candidates)} checks with 0% correction rate over 10+ runs:\033[0m")
+    print("  These have never caught a real bug. Consider moving to weekly.")
+    for c in weekly_candidates:
+        print(f"  • {c}")
+else:
+    print("Not enough history yet for weekly recommendations (need 10+ runs per check).")
+PYEOF
+  
+  exit 0
+}
 section() { echo -e "\n${C_BOLD}$1${C_RESET}"; }
 
 # === TOOL EXISTENCE & EXECUTABILITY ===
@@ -528,6 +657,9 @@ test_benchmark() {
 }
 
 # === RUN TESTS ===
+# Report mode: analyze history and exit
+$REPORT && run_report
+
 echo -e "${C_BOLD}🐣 system-test${C_RESET} — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo -e "${C_DIM}Workspace: $WORKSPACE${C_RESET}"
 [[ "$QUICK" == true ]] && echo -e "${C_DIM}Mode: quick${C_RESET}"
@@ -567,6 +699,9 @@ if [[ ${#FAILURES[@]} -gt 0 ]]; then
     echo -e "  ${C_RED}•${C_RESET} $f"
   done
 fi
+
+# Dump verification history (unless report-only)
+dump_history 2>/dev/null || true
 
 echo ""
 if [[ "$FAIL" -gt 0 ]]; then
