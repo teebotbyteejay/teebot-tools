@@ -134,7 +134,7 @@ For each rule, was it followed (reinforced), violated (contradicted), or not rel
       echo -e "\n  ${C_DIM}Feedback: $reinforced reinforced, $contradicted contradicted, $skipped skipped${C_RESET}"
       
       # Persist feedback data into the eval file for later analysis
-      eval_file=$(ls -t "$WORKSPACE/memory/reflexion-evals/"*.json 2>/dev/null | head -1)
+      _eval_ls=$(ls -t "$WORKSPACE/memory/reflexion-evals/"*.json 2>/dev/null); eval_file=$(head -1 <<< "$_eval_ls")
       if [[ -n "$eval_file" ]]; then
         matched_rules=$(jq -c '.matched_rules' "$PRETASK_FILE" 2>/dev/null || echo "[]")
         tmp=$(mktemp)
@@ -188,13 +188,130 @@ $distilled_context"
     [[ -n "$ret_missing" && "$ret_missing" != "null" ]] && echo -e "  ${C_DIM}Missing: $ret_missing${C_RESET}"
     
     # Persist retrieval feedback into eval file
-    eval_file=$(ls -t "$WORKSPACE/memory/reflexion-evals/"*.json 2>/dev/null | head -1)
+    _eval_ls=$(ls -t "$WORKSPACE/memory/reflexion-evals/"*.json 2>/dev/null); eval_file=$(head -1 <<< "$_eval_ls")
     if [[ -n "$eval_file" ]]; then
       tmp=$(mktemp)
       jq --argjson ret_feedback "$(echo "$ret_eval" | jq -c '.' 2>/dev/null || echo '{}')" \
         '. + {retrieval_feedback: $ret_feedback}' \
         "$eval_file" > "$tmp" 2>/dev/null && mv "$tmp" "$eval_file" && \
         echo -e "  ${C_GREEN}✓${C_RESET} Retrieval feedback persisted" || rm -f "$tmp"
+    fi
+  fi
+fi
+
+# --- Behavior Extraction (automated concept candidates from traces) ---
+# Only triggers on successful tasks (score >= 80) with traces.
+# Extracts reusable strategies → concept-candidates.yaml for manual review.
+CANDIDATES_FILE="$WORKSPACE/memory/concept-candidates.yaml"
+if ! $NO_FEEDBACK && [[ -n "$TRACE" ]] && [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  # Extract score from eval output (format: "score: 85/100" or "score=85")
+  task_score=$(echo "${eval_output:-}" | grep -oP 'score[=:]\s*\K[0-9]+' || echo "0")
+  
+  if [[ "$task_score" -ge 80 ]]; then
+    echo -e "\n${C_CYAN}${C_BOLD}Behavior Extraction${C_RESET}"
+    
+    # Get existing concept names to avoid duplicates
+    existing_concepts=""
+    if [[ -f "$WORKSPACE/memory/concept-library.yaml" ]]; then
+      existing_concepts=$(grep -E '^\s+name:' "$WORKSPACE/memory/concept-library.yaml" | sed 's/.*name:\s*//' | tr '\n' ', ')
+    fi
+    
+    # Also get existing candidates to avoid re-extracting
+    existing_candidates=""
+    if [[ -f "$CANDIDATES_FILE" ]]; then
+      existing_candidates=$(grep -E '^\s+name:' "$CANDIDATES_FILE" | sed 's/.*name:\s*//' | tr '\n' ', ')
+    fi
+    
+    be_system="You extract reusable reasoning strategies from successful task traces. Given a task, its outcome, and the execution trace, identify 0-2 novel strategies that could help with FUTURE tasks in other domains. Each strategy must be:
+- Specific enough to be actionable (concrete steps, not platitudes)
+- General enough to apply beyond this exact task
+- NOT a duplicate of existing concepts
+
+Existing concepts (skip anything similar): ${existing_concepts}${existing_candidates}
+
+Output a JSON array of 0-2 objects:
+[{\"name\": \"Short Name\", \"category\": \"debugging|design|reasoning|meta\", \"description\": \"one-line summary\", \"when_useful\": \"conditions that signal this applies\", \"how_to_apply\": [\"step 1\", \"step 2\", ...], \"grounding\": \"specific example from THIS task\"}]
+
+Output [] if nothing novel was learned. Quality over quantity — 0 is fine. Only output the JSON array."
+
+    be_user="Task: $TASK
+
+Outcome: $OUTCOME
+
+Execution Trace:
+${TRACE:0:3000}"
+
+    be_response=$(curl -s --max-time 20 "https://api.openai.com/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d "$(jq -n --arg sys "$be_system" --arg usr "$be_user" '{
+        model: "gpt-4o-mini",
+        messages: [{role: "system", content: $sys}, {role: "user", content: $usr}],
+        temperature: 0.2,
+        max_tokens: 500
+      }')" 2>/dev/null)
+    
+    be_candidates=$(echo "$be_response" | jq -r '.choices[0].message.content // "[]"' 2>/dev/null | sed 's/^```json//;s/^```//;s/```$//')
+    num_candidates=$(echo "$be_candidates" | jq 'length' 2>/dev/null || echo "0")
+    
+    if [[ "$num_candidates" -gt 0 && "$num_candidates" != "null" ]]; then
+      echo -e "  Extracted ${C_BOLD}$num_candidates${C_RESET} candidate(s)"
+      
+      # Initialize candidates file if needed
+      if [[ ! -f "$CANDIDATES_FILE" ]]; then
+        cat > "$CANDIDATES_FILE" << 'HEADER'
+# concept-candidates.yaml — Auto-extracted behavior candidates from post-task
+# Review during deep work sessions. Promote good ones to concept-library.yaml.
+# Delete weak ones. This file is append-only from automation.
+
+candidates:
+HEADER
+      fi
+      
+      # Append each candidate
+      while IFS= read -r candidate; do
+        [[ -z "$candidate" || "$candidate" == "null" ]] && continue
+        c_name=$(echo "$candidate" | jq -r '.name // ""')
+        c_cat=$(echo "$candidate" | jq -r '.category // "meta"')
+        c_desc=$(echo "$candidate" | jq -r '.description // ""')
+        c_when=$(echo "$candidate" | jq -r '.when_useful // ""')
+        c_ground=$(echo "$candidate" | jq -r '.grounding // ""')
+        c_date=$(date -Idate)
+        c_task_short="${TASK:0:80}"
+        
+        [[ -z "$c_name" || "$c_name" == "null" ]] && continue
+        
+        # Build YAML entry
+        {
+          echo "  - name: \"$c_name\""
+          echo "    category: $c_cat"
+          echo "    description: \"$c_desc\""
+          echo "    when_useful: \"$c_when\""
+          echo "    how_to_apply:"
+          echo "$candidate" | jq -r '.how_to_apply[]? // empty' 2>/dev/null | while IFS= read -r step; do
+            echo "      - \"$step\""
+          done
+          echo "    grounding: \"$c_ground\""
+          echo "    extracted_from: \"$c_task_short\""
+          echo "    date: $c_date"
+          echo "    status: pending  # pending | promoted | rejected"
+          echo ""
+        } >> "$CANDIDATES_FILE"
+        
+        echo -e "  ${C_GREEN}✓${C_RESET} $c_name ($c_cat)"
+      done < <(echo "$be_candidates" | jq -c '.[]' 2>/dev/null)
+    else
+      echo -e "  ${C_DIM}No novel strategies extracted (this is fine)${C_RESET}"
+    fi
+    
+    # Persist extraction info into eval file
+    _eval_ls=$(ls -t "$WORKSPACE/memory/reflexion-evals/"*.json 2>/dev/null); eval_file=$(head -1 <<< "$_eval_ls")
+    if [[ -n "$eval_file" ]]; then
+      tmp=$(mktemp)
+      jq --argjson behaviors "$(echo "$be_candidates" | jq -c '.' 2>/dev/null || echo '[]')" \
+        '. + {behavior_extraction: {candidates: $behaviors, count: ($behaviors | length)}}' \
+        "$eval_file" > "$tmp" 2>/dev/null && mv "$tmp" "$eval_file" && \
+        echo -e "  ${C_GREEN}✓${C_RESET} Extraction data persisted" || rm -f "$tmp"
     fi
   fi
 fi
