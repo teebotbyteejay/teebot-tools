@@ -427,6 +427,35 @@ test_memory() {
   else
     fail "graphmem edges" "cannot get count"
   fi
+
+  # Test 11: epistemic classification — check that classified edges exist
+  local stats_output
+  stats_output=$(graphmem-sqlite stats 2>/dev/null || echo "")
+  local classified_count
+  classified_count=$(sqlite3 "$WORKSPACE/graphmem/data/graphmem.db" \
+    "SELECT COUNT(*) FROM edges WHERE epistemic_type != 'unknown' AND expired_at IS NULL;" 2>/dev/null || echo "0")
+  if [[ "$classified_count" -gt 100 ]]; then
+    pass "epistemic classification: $classified_count classified edges"
+  elif [[ "$classified_count" -gt 0 ]]; then
+    pass "epistemic classification: $classified_count edges (partial — run graphmem-sqlite classify --apply)"
+  else
+    fail "epistemic classification" "0 classified edges — run graphmem-sqlite classify --apply"
+  fi
+
+  # Test 12: confidence_base — beliefs have base confidence for decay tracking
+  local base_count
+  base_count=$(sqlite3 "$WORKSPACE/graphmem/data/graphmem.db" \
+    "SELECT COUNT(*) FROM edges WHERE epistemic_type='belief' AND confidence_base IS NOT NULL AND expired_at IS NULL;" 2>/dev/null || echo "0")
+  local belief_count
+  belief_count=$(sqlite3 "$WORKSPACE/graphmem/data/graphmem.db" \
+    "SELECT COUNT(*) FROM edges WHERE epistemic_type='belief' AND expired_at IS NULL;" 2>/dev/null || echo "0")
+  if [[ "$belief_count" -gt 0 && "$base_count" -eq "$belief_count" ]]; then
+    pass "belief decay: $base_count/$belief_count beliefs have confidence_base"
+  elif [[ "$base_count" -gt 0 ]]; then
+    pass "belief decay: $base_count/$belief_count beliefs have confidence_base (partial)"
+  else
+    fail "belief decay" "no beliefs have confidence_base — run backfill"
+  fi
 }
 
 # === INFRASTRUCTURE TESTS ===

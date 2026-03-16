@@ -316,11 +316,28 @@ HEADER
   fi
 fi
 
-# --- Ingest into graphmem ---
+# --- Ingest into graphmem (with selective addition gate) ---
+# Xiong et al. (2025): Selective addition > add-all. Only store quality experiences.
 if ! $NO_GRAPH && command -v graphmem-sqlite &>/dev/null; then
-  if [[ ${#OUTCOME} -gt 20 ]]; then
+  task_score=$(echo "${eval_output:-}" | grep -oP 'score[=:]\s*\K[0-9]+' || echo "0")
+  
+  # Log retrieval outcomes (always — links past retrievals to this task's success/failure)
+  session_key="${OPENCLAW_SESSION_KEY:-unknown}"
+  if [[ "$task_score" -gt 0 ]]; then
+    graphmem-sqlite log-outcome "$session_key" "$task_score" "$TASK" 2>/dev/null && \
+      echo -e "\n  ${C_GREEN}✓${C_RESET} Logged retrieval outcomes (score=$task_score)" || true
+  fi
+  
+  # Selective addition: only add to graph if score >= 70 (quality gate)
+  if [[ ${#OUTCOME} -gt 20 && "$task_score" -ge 70 ]]; then
     graphmem-sqlite add "Task: $TASK. Outcome: $OUTCOME" 2>/dev/null && \
-      echo -e "\n  ${C_GREEN}✓${C_RESET} Added to graph memory" || true
+      echo -e "  ${C_GREEN}✓${C_RESET} Added to graph memory (quality gate: score=$task_score >= 70)" || true
+  elif [[ ${#OUTCOME} -gt 20 && "$task_score" -gt 0 ]]; then
+    echo -e "  ${C_DIM}Skipped graph memory (quality gate: score=$task_score < 70)${C_RESET}"
+  elif [[ ${#OUTCOME} -gt 20 ]]; then
+    # No score available — add with warning (backward compat)
+    graphmem-sqlite add "Task: $TASK. Outcome: $OUTCOME" 2>/dev/null && \
+      echo -e "\n  ${C_YELLOW}⚠${C_RESET} Added to graph memory (no score available — no quality gate)" || true
   fi
 fi
 

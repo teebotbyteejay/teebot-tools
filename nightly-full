@@ -58,14 +58,37 @@ else
   ((errors++)) || true
 fi
 
-# --- 5. Graph stats snapshot ---
-echo -e "\n${C_DIM}[5/6] Graph memory stats...${C_RESET}"
+# --- 5. Memory utility computation (ACT-R activation + utility scoring) ---
+echo -e "\n${C_DIM}[5/7] Memory utility computation...${C_RESET}"
 if command -v graphmem-sqlite &>/dev/null; then
-  graphmem-sqlite stats 2>/dev/null || true
+  if graphmem-sqlite compute-utility 2>&1; then
+    echo -e "${C_GREEN}✓${C_RESET} Memory utility computed"
+    # Print brief report
+    graphmem-sqlite utility-report 2>/dev/null | head -8 || true
+  else
+    echo -e "${C_YELLOW}⚠ Memory utility computation failed (non-fatal)${C_RESET}"
+    ((errors++)) || true
+  fi
 fi
 
-# --- 6. System health check ---
-echo -e "\n${C_DIM}[6/6] System health check...${C_RESET}"
+# --- 6. Graph stats snapshot + epistemic classify ---
+echo -e "\n${C_DIM}[6/7] Graph memory stats + epistemic classify...${C_RESET}"
+if command -v graphmem-sqlite &>/dev/null; then
+  graphmem-sqlite stats 2>/dev/null || true
+  # Classify any unclassified edges (catches stragglers from manual adds)
+  unclassified=$(sqlite3 "$HOME/.openclaw/workspace/graphmem/data/graphmem.db" \
+    "SELECT COUNT(*) FROM edges WHERE epistemic_type='unknown' AND expired_at IS NULL;" 2>/dev/null || echo "0")
+  if [[ "$unclassified" -gt 0 ]]; then
+    echo -e "  Classifying $unclassified unclassified edges..."
+    PYTHONUNBUFFERED=1 graphmem-sqlite classify --apply --batch-size 40 2>&1 || true
+  fi
+  # Decay confidence on stale beliefs
+  echo -e "  Running belief confidence decay..."
+  graphmem-sqlite decay --apply 2>&1 || true
+fi
+
+# --- 7. System health check ---
+echo -e "\n${C_DIM}[7/7] System health check...${C_RESET}"
 if command -v system-test &>/dev/null; then
   if system-test --quick 2>&1; then
     echo -e "${C_GREEN}✓${C_RESET} System test: all passed"
