@@ -27,7 +27,7 @@ for arg in "$@"; do
     --quick|-q) QUICK=true ;;
     --benchmark|-b) BENCHMARK=true ;;
     --report|-r) REPORT=true ;;
-    tools|pipeline|memory|infra|benchmark) CATEGORY="$arg" ;;
+    tools|pipeline|memory|infra|benchmark|behavioral) CATEGORY="$arg" ;;
   esac
 done
 
@@ -565,6 +565,12 @@ test_infra() {
   fi
 }
 
+# === BEHAVIORAL TESTS (stub — three-tier verification layer 3) ===
+test_behavioral() {
+  section "🧪 Behavioral Tests"
+  skip "behavioral tests" "not yet implemented — stub only"
+}
+
 # === BENCHMARK TESTS (quality, not just presence) ===
 test_benchmark() {
   section "📏 Quality Benchmarks"
@@ -685,6 +691,230 @@ test_benchmark() {
   fi
 }
 
+# === BEHAVIORAL TESTS (verify correct system behavior, not just existence) ===
+test_behavioral() {
+  section "🧠 Behavioral Tests"
+  
+  local SESSIONS_DIR="$HOME/.openclaw/agents/main/sessions"
+  local TEEJAY_NUM="+18029896729"
+  
+  # --- Test 1: Message target audit ---
+  # Scan recent sessions for message sends to non-Teejay targets
+  # This catches the March 10 credential leak and March 14 routing incident class of bugs
+  local violations=0
+  local total_sends=0
+  local violation_details=""
+  
+  if [[ -d "$SESSIONS_DIR" ]]; then
+    # Check session files modified in last 48 hours for message sends
+    local recent_files
+    recent_files=$(find "$SESSIONS_DIR" -name "*.jsonl" -mtime -2 2>/dev/null | head -50)
+    
+    while IFS= read -r session_file; do
+      [[ -z "$session_file" ]] && continue
+      
+      # Extract message send tool calls — look for "action":"send" with target field
+      # Format: {"toolName":"message", ...arguments containing action and target...}
+      local sends
+      sends=$(grep -o '"toolName":"message"[^}]*' "$session_file" 2>/dev/null | head -50 || true)
+      
+      # Also check the actual tool call arguments for targets
+      # Look for lines containing message tool calls with send action
+      local send_lines
+      send_lines=$(grep '"message"' "$session_file" 2>/dev/null | grep -i '"send"' | head -50 || true)
+      
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        total_sends=$((total_sends + 1))
+        
+        # Extract target from the line
+        local target
+        target=$(echo "$line" | grep -oP '"target"\s*:\s*"[^"]*"' | head -1 || true)
+        
+        if [[ -n "$target" ]]; then
+          # Check if target is Teejay's number
+          if ! echo "$target" | grep -q "$TEEJAY_NUM"; then
+            # Check if it's an internal/system target (no phone number pattern)
+            if echo "$target" | grep -qP '\+\d{10,}'; then
+              violations=$((violations + 1))
+              local session_name
+              session_name=$(basename "$session_file" .jsonl)
+              violation_details+="  target=$target in session=${session_name:0:16}\n"
+            fi
+          fi
+        fi
+      done <<< "$send_lines"
+    done <<< "$recent_files"
+    
+    if [[ "$violations" -gt 0 ]]; then
+      fail "message target audit" "$violations messages to non-Teejay targets in last 48h"
+      echo -e "  ${C_RED}Violations:${C_RESET}"
+      echo -e "$violation_details" | head -10
+    elif [[ "$total_sends" -gt 0 ]]; then
+      pass "message target audit: $total_sends sends, all to Teejay ($TEEJAY_NUM)"
+    else
+      pass "message target audit: no message sends found in last 48h"
+    fi
+  else
+    skip "message target audit" "sessions directory not found"
+  fi
+  
+  # --- Test 2: Prediction log staleness ---
+  # Check if any predictions are past their resolution date and unresolved
+  local pred_log="$MEMORY_DIR/prediction-log.jsonl"
+  
+  if [[ -f "$pred_log" ]]; then
+    local today_iso
+    today_iso=$(date +%Y-%m-%d)
+    local total_predictions=0
+    local overdue=0
+    local resolved=0
+    local overdue_details=""
+    
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      total_predictions=$((total_predictions + 1))
+      
+      local res_date
+      res_date=$(echo "$line" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolution_date',''))" 2>/dev/null || echo "")
+      local is_resolved
+      is_resolved=$(echo "$line" | python3 -c "import json,sys; d=json.load(sys.stdin); print('yes' if d.get('resolved') or d.get('outcome') else 'no')" 2>/dev/null || echo "no")
+      
+      if [[ "$is_resolved" == "yes" ]]; then
+        resolved=$((resolved + 1))
+      elif [[ -n "$res_date" && "$res_date" < "$today_iso" ]]; then
+        overdue=$((overdue + 1))
+        local pred_summary
+        pred_summary=$(echo "$line" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('prediction','')[:60])" 2>/dev/null || echo "")
+        overdue_details+="    due=$res_date: $pred_summary\n"
+      fi
+    done < "$pred_log"
+    
+    if [[ "$overdue" -gt 0 ]]; then
+      fail "prediction log" "$overdue/$total_predictions predictions overdue for resolution"
+      echo -e "$overdue_details"
+    elif [[ "$total_predictions" -gt 0 ]]; then
+      pass "prediction log: $total_predictions predictions ($resolved resolved, 0 overdue)"
+    else
+      pass "prediction log: exists (empty — make predictions!)"
+    fi
+  else
+    pass "prediction log: no log yet"
+  fi
+  
+  # --- Test 3: Graph quality baseline ---
+  # After pruning, monitor that graph quality doesn't degrade
+  local DB="$WORKSPACE/graphmem/data/graphmem.db"
+  
+  if [[ -f "$DB" ]]; then
+    local active_edges
+    active_edges=$(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL;" 2>/dev/null || echo "0")
+    local never_retrieved
+    never_retrieved=$(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND retrieval_count = 0;" 2>/dev/null || echo "0")
+    local dead_edges
+    dead_edges=$(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND activation < -1.35 AND retrieval_count = 0;" 2>/dev/null || echo "0")
+    local short_facts
+    short_facts=$(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND length(fact) < 30;" 2>/dev/null || echo "0")
+    
+    # Calculate never-retrieved ratio
+    local never_ratio=0
+    if [[ "$active_edges" -gt 0 ]]; then
+      never_ratio=$((never_retrieved * 100 / active_edges))
+    fi
+    
+    # Graph quality checks
+    if [[ "$dead_edges" -gt 50 ]]; then
+      fail "graph quality: dead edges" "$dead_edges dead edges (activation<-1.35, unretrieved) — run graph-prune --apply"
+    elif [[ "$short_facts" -gt 20 ]]; then
+      fail "graph quality: short facts" "$short_facts edges with fact < 30 chars — quality gate may be disabled"
+    else
+      pass "graph quality: ${active_edges} active edges, ${dead_edges} dead, ${short_facts} short facts"
+    fi
+  else
+    skip "graph quality" "graphmem database not found"
+  fi
+  
+  # --- Test 4: Feedback signal freshness ---
+  # Check that human feedback is being captured
+  local fb_log="$MEMORY_DIR/feedback-log.jsonl"
+  
+  if [[ -f "$fb_log" ]]; then
+    local fb_count
+    fb_count=$(wc -l < "$fb_log" 2>/dev/null || echo "0")
+    local recent_fb
+    recent_fb=$(tail -5 "$fb_log" 2>/dev/null | python3 -c "
+import sys, json
+from datetime import datetime, timedelta
+cutoff = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d')
+recent = 0
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+        if d.get('date','') >= cutoff: recent += 1
+    except: pass
+print(recent)
+" 2>/dev/null || echo "0")
+    
+    if [[ "$fb_count" -gt 0 ]]; then
+      pass "feedback capture: $fb_count entries ($recent_fb in last 7d)"
+    else
+      pass "feedback capture: log exists (empty — capture Teejay's reactions!)"
+    fi
+  else
+    pass "feedback capture: no log yet (build with log-feedback)"
+  fi
+  
+  # --- Test 5: Post-task evaluation distribution ---
+  # Check that we're not just getting confirmatory high scores
+  local eval_dir="$MEMORY_DIR/reflexion-evals"
+  
+  if [[ -d "$eval_dir" ]]; then
+    local eval_count
+    eval_count=$(ls "$eval_dir"/*.json 2>/dev/null | wc -l || echo "0")
+    
+    if [[ "$eval_count" -ge 10 ]]; then
+      # Analyze score distribution (scores live in evaluation.score or top-level score)
+      local score_stats
+      score_stats=$(ls -t "$eval_dir"/*.json 2>/dev/null | head -30 | while read -r f; do
+        python3 -c "
+import json
+d=json.load(open('$f'))
+s = d.get('score') or (d.get('evaluation',{}) or {}).get('score')
+if s is not None: print(int(s))
+" 2>/dev/null || true
+      done | python3 -c "
+import sys
+scores = [int(s.strip()) for s in sys.stdin if s.strip().isdigit()]
+if scores:
+    avg = sum(scores)/len(scores)
+    high = sum(1 for s in scores if s >= 80)
+    low = sum(1 for s in scores if s < 60)
+    total = len(scores)
+    high_pct = high * 100 // total
+    print(f'{avg:.0f} avg | {high}/{total} ≥80 ({high_pct}%) | {low}/{total} <60')
+else:
+    print('no scored evals')
+" 2>/dev/null || echo "parse error")
+      
+      # If >90% of scores are ≥80, self-eval is probably overconfident
+      local high_pct
+      high_pct=$(echo "$score_stats" | grep -oP '\((\d+)%\)' | grep -oP '\d+' || echo "0")
+      
+      if [[ "$high_pct" -gt 90 ]]; then
+        fail "eval distribution" "self-eval likely overconfident: $score_stats (>90% high scores)"
+      else
+        pass "eval distribution: $score_stats (recent $eval_count evals)"
+      fi
+    elif [[ "$eval_count" -gt 0 ]]; then
+      pass "eval distribution: $eval_count evals (need 10+ for distribution check)"
+    else
+      pass "eval distribution: no evals yet"
+    fi
+  else
+    skip "eval distribution" "eval directory not found"
+  fi
+}
+
 # === RUN TESTS ===
 # Report mode: analyze history and exit
 $REPORT && run_report
@@ -698,16 +928,18 @@ echo -e "${C_DIM}Workspace: $WORKSPACE${C_RESET}"
 START_TIME=$(date +%s)
 
 case "$CATEGORY" in
-  tools)     test_tools ;;
-  pipeline)  test_pipeline ;;
-  memory)    test_memory ;;
-  infra)     test_infra ;;
-  benchmark) test_benchmark ;;
+  tools)      test_tools ;;
+  pipeline)   test_pipeline ;;
+  memory)     test_memory ;;
+  infra)      test_infra ;;
+  benchmark)  test_benchmark ;;
+  behavioral) test_behavioral ;;
   *)
     test_tools
     test_pipeline
     test_memory
     test_infra
+    test_behavioral
     if $BENCHMARK; then
       test_benchmark
     fi
