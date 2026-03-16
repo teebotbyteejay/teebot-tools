@@ -565,12 +565,6 @@ test_infra() {
   fi
 }
 
-# === BEHAVIORAL TESTS (stub — three-tier verification layer 3) ===
-test_behavioral() {
-  section "🧪 Behavioral Tests"
-  skip "behavioral tests" "not yet implemented — stub only"
-}
-
 # === BENCHMARK TESTS (quality, not just presence) ===
 test_benchmark() {
   section "📏 Quality Benchmarks"
