@@ -225,7 +225,7 @@ test_pipeline() {
 
   # Test 2: graphmem-sqlite search returns results
   local search_result
-  search_result=$(graphmem-sqlite search "teebot memory" --limit 3 2>/dev/null || echo "")
+  search_result=$(graphmem-sqlite search "teebot memory" --limit 3 --no-log 2>/dev/null || echo "")
   if grep -q "score=" <<< "$search_result"; then
     pass "graphmem search: returns scored results"
   else
@@ -660,7 +660,7 @@ test_benchmark() {
     relevance_total=$((relevance_total + 1))
     local expected_terms="${relevance_checks[$query]}"
     local search_result
-    search_result=$(graphmem-sqlite search "$query" --limit 5 2>/dev/null || echo "")
+    search_result=$(graphmem-sqlite search "$query" --limit 5 --no-log 2>/dev/null || echo "")
 
     local found_any=false
     IFS='|' read -ra terms <<< "$expected_terms"

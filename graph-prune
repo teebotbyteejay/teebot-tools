@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# graph-prune — Expire low-quality edges from graphmem
+#
+# Categories pruned:
+#   1. SHORT: fact < 30 chars, never retrieved
+#   2. CONTEXT-FREE: fact < 50 chars, never retrieved, low activation (<-1.0)
+#   3. STALE COUNTS: facts about entity/edge counts that are now wrong
+#   4. DUPLICATES: identical facts on same source→target
+#   5. DEAD: activation < -1.35, never retrieved (bottom of cold storage)
+#
+# Usage:
+#   graph-prune --dry-run    Show what would be pruned (default)
+#   graph-prune --apply      Actually expire the edges
+#   graph-prune --stats      Show quality stats only
+
+set -euo pipefail
+
+DB="${GRAPHMEM_DB:-$HOME/.openclaw/workspace/graphmem/data/graphmem.db}"
+MODE="${1:---dry-run}"
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_CYAN='\033[36m'
+
+if [[ ! -f "$DB" ]]; then
+  echo "Database not found: $DB" >&2
+  exit 1
+fi
+
+echo -e "${C_BOLD}Graph Quality Audit${C_RESET}"
+echo "Database: $DB"
+echo ""
+
+# Current stats
+total_active=$(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL;")
+total_entities=$(sqlite3 "$DB" "SELECT COUNT(*) FROM entities;")
+echo -e "${C_CYAN}Active edges: $total_active | Entities: $total_entities${C_RESET}"
+echo ""
+
+if [[ "$MODE" == "--stats" ]]; then
+  echo -e "${C_BOLD}Quality Distribution:${C_RESET}"
+  echo "  Short facts (<30 chars):  $(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND length(fact) < 30;")"
+  echo "  Short facts (<50 chars):  $(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND length(fact) < 50;")"
+  echo "  Never retrieved:          $(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND retrieval_count = 0;")"
+  echo "  Low activation (<-1.0):   $(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND activation < -1.0;")"
+  echo "  Low activation (<-1.35):  $(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND activation < -1.35;")"
+  echo ""
+  echo -e "${C_BOLD}Activation distribution:${C_RESET}"
+  sqlite3 "$DB" "
+    SELECT 
+      CASE 
+        WHEN activation IS NULL THEN 'NULL'
+        WHEN activation < -1.35 THEN '< -1.35 (dead)'
+        WHEN activation < -1.0 THEN '-1.35 to -1.0 (cold)'
+        WHEN activation < -0.5 THEN '-1.0 to -0.5 (tepid)'
+        WHEN activation < 0 THEN '-0.5 to 0 (warm)'
+        ELSE '>= 0 (hot)'
+      END as bucket,
+      COUNT(*) as cnt
+    FROM edges WHERE expired_at IS NULL
+    GROUP BY bucket ORDER BY bucket;"
+  echo ""
+  echo -e "${C_BOLD}Epistemic distribution:${C_RESET}"
+  sqlite3 "$DB" "SELECT epistemic_type, COUNT(*), ROUND(AVG(confidence),2) FROM edges WHERE expired_at IS NULL GROUP BY epistemic_type ORDER BY COUNT(*) DESC;"
+  echo ""
+  echo -e "${C_BOLD}Retrieval distribution:${C_RESET}"
+  echo "  Never retrieved: $(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND retrieval_count = 0;") / $total_active"
+  echo "  Retrieved 1-5x:  $(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND retrieval_count BETWEEN 1 AND 5;")"
+  echo "  Retrieved 5+:    $(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND retrieval_count > 5;")"
+  exit 0
+fi
+
+# === CATEGORY 1: Very short facts, never retrieved ===
+cat1_count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND length(fact) < 30 AND retrieval_count = 0;")
+echo -e "${C_YELLOW}Category 1 — Very short (<30 chars), never retrieved: $cat1_count${C_RESET}"
+if [[ "$cat1_count" -gt 0 ]]; then
+  sqlite3 "$DB" "SELECT substr(fact,1,60) FROM edges WHERE expired_at IS NULL AND length(fact) < 30 AND retrieval_count = 0 ORDER BY RANDOM() LIMIT 5;" | while read -r line; do
+    echo -e "  ${C_DIM}$line${C_RESET}"
+  done
+fi
+
+# === CATEGORY 2: Short + never retrieved + cold ===
+cat2_count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND length(fact) < 50 AND retrieval_count = 0 AND activation < -1.0;")
+echo -e "${C_YELLOW}Category 2 — Short (<50 chars) + cold + unretrieved: $cat2_count${C_RESET}"
+if [[ "$cat2_count" -gt 0 ]]; then
+  sqlite3 "$DB" "SELECT substr(fact,1,60) FROM edges WHERE expired_at IS NULL AND length(fact) < 50 AND retrieval_count = 0 AND activation < -1.0 ORDER BY RANDOM() LIMIT 5;" | while read -r line; do
+    echo -e "  ${C_DIM}$line${C_RESET}"
+  done
+fi
+
+# === CATEGORY 3: Stale numeric facts ===
+cat3_count=$(sqlite3 "$DB" "
+  SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND (
+    fact LIKE '%260 entities%' OR fact LIKE '%270 entities%' OR fact LIKE '%400 entities%'
+    OR fact LIKE '%864 entities%' OR fact LIKE '%1275 active%' OR fact LIKE '%971 entities%'
+    OR fact LIKE '%37/37 pass%' OR fact LIKE '%38/38 pass%' OR fact LIKE '%37 rules%'
+    OR fact LIKE '%1107 entities%' OR fact LIKE '%2526 edges%'
+    OR (fact LIKE '%Graph tracks%' AND fact LIKE '%entities%')
+    OR (fact LIKE '%Graph contains%' AND fact LIKE '%entities%')
+    OR (fact LIKE '%Graph has%' AND fact LIKE '%entities%')
+  );")
+echo -e "${C_YELLOW}Category 3 — Stale numeric facts: $cat3_count${C_RESET}"
+if [[ "$cat3_count" -gt 0 ]]; then
+  sqlite3 "$DB" "
+    SELECT substr(fact,1,80) FROM edges WHERE expired_at IS NULL AND (
+      fact LIKE '%260 entities%' OR fact LIKE '%270 entities%' OR fact LIKE '%400 entities%'
+      OR fact LIKE '%864 entities%' OR fact LIKE '%1275 active%' OR fact LIKE '%971 entities%'
+      OR fact LIKE '%37/37 pass%' OR fact LIKE '%38/38 pass%' OR fact LIKE '%37 rules%'
+      OR fact LIKE '%1107 entities%' OR fact LIKE '%2526 edges%'
+      OR (fact LIKE '%Graph tracks%' AND fact LIKE '%entities%')
+      OR (fact LIKE '%Graph contains%' AND fact LIKE '%entities%')
+      OR (fact LIKE '%Graph has%' AND fact LIKE '%entities%')
+    ) LIMIT 10;" | while read -r line; do
+    echo -e "  ${C_DIM}$line${C_RESET}"
+  done
+fi
+
+# === CATEGORY 4: Exact duplicates (same fact on same source→target) ===
+cat4_count=$(sqlite3 "$DB" "
+  SELECT SUM(cnt - 1) FROM (
+    SELECT source_id, target_id, fact, COUNT(*) as cnt 
+    FROM edges WHERE expired_at IS NULL 
+    GROUP BY source_id, target_id, fact 
+    HAVING cnt > 1
+  );")
+cat4_count=${cat4_count:-0}
+echo -e "${C_YELLOW}Category 4 — Exact duplicate edges: $cat4_count${C_RESET}"
+
+# === CATEGORY 5: Dead edges (very low activation, never retrieved) ===
+cat5_count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND activation < -1.35 AND retrieval_count = 0;")
+echo -e "${C_YELLOW}Category 5 — Dead (activation < -1.35, never retrieved): $cat5_count${C_RESET}"
+if [[ "$cat5_count" -gt 0 ]]; then
+  sqlite3 "$DB" "SELECT substr(fact,1,60), ROUND(activation,2) FROM edges WHERE expired_at IS NULL AND activation < -1.35 AND retrieval_count = 0 ORDER BY RANDOM() LIMIT 5;" | while read -r line; do
+    echo -e "  ${C_DIM}$line${C_RESET}"
+  done
+fi
+
+echo ""
+
+# Compute total (avoiding double-counting via UNION)
+total_prune=$(sqlite3 "$DB" "
+  SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND id IN (
+    SELECT id FROM edges WHERE expired_at IS NULL AND length(fact) < 30 AND retrieval_count = 0
+    UNION
+    SELECT id FROM edges WHERE expired_at IS NULL AND length(fact) < 50 AND retrieval_count = 0 AND activation < -1.0
+    UNION
+    SELECT id FROM edges WHERE expired_at IS NULL AND (
+      fact LIKE '%260 entities%' OR fact LIKE '%270 entities%' OR fact LIKE '%400 entities%'
+      OR fact LIKE '%864 entities%' OR fact LIKE '%1275 active%' OR fact LIKE '%971 entities%'
+      OR fact LIKE '%37/37 pass%' OR fact LIKE '%38/38 pass%' OR fact LIKE '%37 rules%'
+      OR fact LIKE '%1107 entities%' OR fact LIKE '%2526 edges%'
+      OR (fact LIKE '%Graph tracks%' AND fact LIKE '%entities%')
+      OR (fact LIKE '%Graph contains%' AND fact LIKE '%entities%')
+      OR (fact LIKE '%Graph has%' AND fact LIKE '%entities%')
+    )
+    UNION
+    SELECT id FROM edges WHERE expired_at IS NULL AND activation < -1.35 AND retrieval_count = 0
+  );")
+
+remaining=$((total_active - total_prune))
+echo -e "${C_BOLD}Total to prune: ${C_RED}$total_prune${C_RESET} / $total_active edges (${C_GREEN}$remaining would remain${C_RESET})"
+
+if [[ "$MODE" == "--apply" ]]; then
+  echo ""
+  echo -e "${C_BOLD}Applying...${C_RESET}"
+  
+  # Expire all matching edges (don't delete — expire so they can be recovered)
+  sqlite3 "$DB" "
+    UPDATE edges SET expired_at = '$NOW' WHERE expired_at IS NULL AND id IN (
+      SELECT id FROM edges WHERE expired_at IS NULL AND length(fact) < 30 AND retrieval_count = 0
+      UNION
+      SELECT id FROM edges WHERE expired_at IS NULL AND length(fact) < 50 AND retrieval_count = 0 AND activation < -1.0
+      UNION
+      SELECT id FROM edges WHERE expired_at IS NULL AND (
+        fact LIKE '%260 entities%' OR fact LIKE '%270 entities%' OR fact LIKE '%400 entities%'
+        OR fact LIKE '%864 entities%' OR fact LIKE '%1275 active%' OR fact LIKE '%971 entities%'
+        OR fact LIKE '%37/37 pass%' OR fact LIKE '%38/38 pass%' OR fact LIKE '%37 rules%'
+        OR fact LIKE '%1107 entities%' OR fact LIKE '%2526 edges%'
+        OR (fact LIKE '%Graph tracks%' AND fact LIKE '%entities%')
+        OR (fact LIKE '%Graph contains%' AND fact LIKE '%entities%')
+        OR (fact LIKE '%Graph has%' AND fact LIKE '%entities%')
+      )
+      UNION
+      SELECT id FROM edges WHERE expired_at IS NULL AND activation < -1.35 AND retrieval_count = 0
+    );"
+  
+  # Handle exact duplicates separately: keep the one with highest retrieval count
+  sqlite3 "$DB" "
+    UPDATE edges SET expired_at = '$NOW' 
+    WHERE expired_at IS NULL 
+    AND id NOT IN (
+      SELECT id FROM (
+        SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY source_id, target_id, fact 
+          ORDER BY retrieval_count DESC, created_at DESC
+        ) as rn
+        FROM edges WHERE expired_at IS NULL
+      ) WHERE rn = 1
+    )
+    AND id IN (
+      SELECT e.id FROM edges e
+      WHERE e.expired_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM edges e2 
+        WHERE e2.source_id = e.source_id 
+        AND e2.target_id = e.target_id 
+        AND e2.fact = e.fact 
+        AND e2.expired_at IS NULL
+        AND e2.id != e.id
+      )
+    );"
+  
+  new_active=$(sqlite3 "$DB" "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL;")
+  pruned=$((total_active - new_active))
+  echo -e "${C_GREEN}Done. Pruned $pruned edges. Active: $new_active${C_RESET}"
+  
+  # Also reset inflated retrieval counts from automated queries
+  echo ""
+  echo -e "${C_BOLD}Resetting inflated retrieval counts...${C_RESET}"
+  # These 4 edges got 700+ retrievals from automated context-inject queries, not real tasks
+  sqlite3 "$DB" "
+    UPDATE edges SET retrieval_count = 0, last_retrieved_at = NULL
+    WHERE retrieval_count > 100;"
+  echo "  Reset edges with retrieval_count > 100 (inflated by automated queries)"
+  
+  # Clean up memory_retrievals from automated queries
+  auto_deleted=$(sqlite3 "$DB" "
+    SELECT COUNT(*) FROM memory_retrievals 
+    WHERE query IN ('teebot memory') 
+    OR query LIKE 'What database did teebot use before%';")
+  sqlite3 "$DB" "
+    DELETE FROM memory_retrievals 
+    WHERE query IN ('teebot memory') 
+    OR query LIKE 'What database did teebot use before%';"
+  echo "  Removed $auto_deleted automated retrieval log entries"
+  
+else
+  echo ""
+  echo -e "${C_DIM}Dry run — use --apply to expire these edges${C_RESET}"
+fi

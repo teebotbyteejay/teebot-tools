@@ -77,7 +77,7 @@ skip_retrieval=false
 probe_emb_score="0"
 
 if command -v graphmem-sqlite &>/dev/null; then
-  probe=$(graphmem-sqlite search "$TASK" --limit 2 2>/dev/null | head -5 || true)
+  probe=$(graphmem-sqlite search "$TASK" --limit 2 --no-log 2>/dev/null | head -5 || true)
   probe_emb_score=$(echo "$probe" | grep -oP 'emb=\K[0-9.]+' | head -1 || echo "0")
   top_score=$(echo "$probe" | grep -oP 'score=\K[0-9.]+' | head -1 || echo "0")
   

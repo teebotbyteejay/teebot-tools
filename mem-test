@@ -172,7 +172,7 @@ for test_case in "${TEST_CASES[@]}"; do
   else
     case "$TOOL" in
       graphmem)
-        output=$(graphmem-sqlite search "$question" --limit 10 2>/dev/null || echo "ERROR")
+        output=$(graphmem-sqlite search "$question" --limit 10 --no-log 2>/dev/null || echo "ERROR")
         ;;
       mem-research)
         output=$(mem-research "$question" 2>/dev/null || echo "ERROR")
