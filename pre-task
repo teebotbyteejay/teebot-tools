@@ -50,6 +50,18 @@ $rules
   matched_rules_json=$(reflexion-eval match-json "$TASK" 2>/dev/null || echo "[]")
 fi
 
+# --- 1.1. Human Feedback (always runs — highest-signal context) ---
+if command -v feedback-search &>/dev/null; then
+  feedback=$(feedback-search "$TASK" --limit 3 2>/dev/null | grep -v "^🔍\|^$\|^📋 Feedback log:" || true)
+  if [[ -n "$feedback" && ! "$feedback" =~ "No keyword matches" && ! "$feedback" =~ "No feedback log yet" ]]; then
+    output+="## Past Human Feedback (5x weight)
+$feedback
+
+"
+    $VERBOSE && echo -e "${C_DIM}Injected human feedback context${C_RESET}" >&2
+  fi
+fi
+
 # --- 1.5. Retrieval Trigger (MemGen-inspired) ---
 # Quick probe: is retrieval likely to be useful for this task?
 # Uses EMBEDDING score (semantic similarity) not composite score.

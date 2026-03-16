@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# log-feedback — Capture Teejay's explicit feedback signals
+# Usage: log-feedback <type> "<what_i_did>" "<teejay_said>"
+# Types: good | bad | fix | redirect | preference
+#
+# Stores in memory/feedback-log.jsonl + adds high-weight graphmem edge.
+# Human feedback is weighted 5x vs self-eval per research findings.
+
+set -euo pipefail
+
+WORKSPACE="${HOME}/.openclaw/workspace"
+FEEDBACK_LOG="${WORKSPACE}/memory/feedback-log.jsonl"
+GRAPHMEM="${WORKSPACE}/graphmem/graphmem-sqlite"
+
+usage() {
+    cat <<'EOF'
+Usage: log-feedback <type> "<what_i_did>" "<teejay_said>"
+
+Types:
+  good       — Teejay approved or praised something
+  bad        — Teejay said something was wrong or unhelpful
+  fix        — Teejay corrected a specific error
+  redirect   — Teejay changed direction (implicit dissatisfaction)
+  preference — Teejay expressed a preference for how things should be done
+
+Examples:
+  log-feedback good "summarized DC rental options" "this is exactly what I needed"
+  log-feedback fix "sent alert to wrong person" "that should go to me not the group"
+  log-feedback preference "used formal tone" "keep it casual"
+EOF
+    exit 1
+}
+
+[[ $# -lt 3 ]] && usage
+
+TYPE="$1"
+WHAT_I_DID="$2"
+TEEJAY_SAID="$3"
+
+# Validate type
+case "$TYPE" in
+    good|bad|fix|redirect|preference) ;;
+    *) echo "❌ Invalid type: $TYPE (use good|bad|fix|redirect|preference)" >&2; exit 1 ;;
+esac
+
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+DATE=$(date +%Y-%m-%d)
+
+# Determine valence for weighting
+case "$TYPE" in
+    good) VALENCE="positive"; WEIGHT=5 ;;
+    bad|fix) VALENCE="negative"; WEIGHT=10 ;;  # Negative feedback is rarer and more informative
+    redirect) VALENCE="negative"; WEIGHT=7 ;;
+    preference) VALENCE="neutral"; WEIGHT=8 ;;  # Preferences are high-signal
+esac
+
+# Build JSONL entry
+ENTRY=$(jq -nc \
+    --arg ts "$TIMESTAMP" \
+    --arg type "$TYPE" \
+    --arg valence "$VALENCE" \
+    --argjson weight "$WEIGHT" \
+    --arg did "$WHAT_I_DID" \
+    --arg said "$TEEJAY_SAID" \
+    --arg date "$DATE" \
+    '{timestamp: $ts, date: $date, type: $type, valence: $valence, weight: $weight, what_i_did: $did, teejay_said: $said}')
+
+echo "$ENTRY" >> "$FEEDBACK_LOG"
+echo "📝 Logged ${TYPE} feedback (weight: ${WEIGHT}x)"
+
+# Add to graphmem as high-weight experience edge
+EDGE_DESC="[HUMAN FEEDBACK ${TYPE^^}] Teejay's response to '${WHAT_I_DID}': '${TEEJAY_SAID}'. Weight: ${WEIGHT}x. Type: ${TYPE}."
+
+if [[ -x "$GRAPHMEM" ]]; then
+    "$GRAPHMEM" add "$EDGE_DESC" \
+        2>/dev/null && echo "🧠 Added to graphmem as episode" \
+        || echo "⚠️  graphmem add failed (logged to JSONL only)"
+else
+    echo "⚠️  graphmem not found — logged to JSONL only"
+fi
+
+# Append to daily log
+DAILY_LOG="${WORKSPACE}/memory/${DATE}.md"
+echo "- **Feedback (${TYPE})**: Did: ${WHAT_I_DID} → Teejay: \"${TEEJAY_SAID}\" [w:${WEIGHT}]" >> "$DAILY_LOG"
+echo "📅 Added to daily log"

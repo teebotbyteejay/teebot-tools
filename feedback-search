@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# feedback-search — Search past human feedback for similar contexts
+# Usage: feedback-search "<context_query>" [--limit N]
+# Searches graphmem for feedback edges, weighted by signal type.
+
+set -euo pipefail
+
+WORKSPACE="${HOME}/.openclaw/workspace"
+FEEDBACK_LOG="${WORKSPACE}/memory/feedback-log.jsonl"
+GRAPHMEM="${WORKSPACE}/graphmem/graphmem-sqlite"
+
+QUERY="${1:?Usage: feedback-search \"<context_query>\" [--limit N]}"
+LIMIT=5
+[[ "${2:-}" == "--limit" ]] && LIMIT="${3:-5}"
+
+echo "🔍 Searching feedback for: ${QUERY}"
+echo ""
+
+# Method 1: graphmem semantic search (preferred)
+if [[ -x "$GRAPHMEM" ]]; then
+    RESULTS=$("$GRAPHMEM" search "HUMAN FEEDBACK ${QUERY}" --limit "$LIMIT" 2>/dev/null || true)
+    if [[ -n "$RESULTS" ]]; then
+        echo "📊 Graphmem matches:"
+        echo "$RESULTS" | grep -i "HUMAN FEEDBACK" || echo "  (no feedback-specific matches)"
+        echo ""
+    fi
+fi
+
+# Method 2: JSONL grep (fallback + supplement)
+if [[ -f "$FEEDBACK_LOG" ]]; then
+    COUNT=$(wc -l < "$FEEDBACK_LOG")
+    echo "📋 Feedback log: ${COUNT} entries"
+
+    # Search by context similarity (keyword fallback)
+    MATCHES=$(grep -i "$(echo "$QUERY" | tr ' ' '\|')" "$FEEDBACK_LOG" 2>/dev/null | tail -"$LIMIT" || true)
+    if [[ -n "$MATCHES" ]]; then
+        echo ""
+        echo "$MATCHES" | while IFS= read -r line; do
+            TYPE=$(echo "$line" | jq -r '.type')
+            WEIGHT=$(echo "$line" | jq -r '.weight')
+            DID=$(echo "$line" | jq -r '.what_i_did')
+            SAID=$(echo "$line" | jq -r '.teejay_said')
+            DATE=$(echo "$line" | jq -r '.date')
+            echo "  [${TYPE^^} w:${WEIGHT}] ${DATE}"
+            echo "    Did: ${DID}"
+            echo "    Teejay: \"${SAID}\""
+            echo ""
+        done
+    else
+        echo "  No keyword matches in JSONL"
+    fi
+else
+    echo "📋 No feedback log yet (will be created on first log-feedback call)"
+fi
