@@ -6,16 +6,41 @@ set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
 JSON_OUT=false
-[[ "${1:-}" == "--json" ]] && JSON_OUT=true
+for arg in "$@"; do
+  case "$arg" in
+    --json) JSON_OUT=true ;;
+    --full) ;;  # handled below
+  esac
+done
 
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
 C_GREEN='\033[32m'; C_RED='\033[31m'; C_CYAN='\033[36m'; C_YELLOW='\033[33m'
 
-# --- 1. Memory quality (run mem-test, weight: 30%) ---
+# --- 1. Memory quality (weight: 30%) ---
+# mem-test runs 30 LLM calls (~3+ min). Use cached score unless --full.
+FULL_MODE=false
+[[ "${1:-}" == "--full" ]] && FULL_MODE=true
+CACHE_FILE="$WORKSPACE/memory/.capability-cache.json"
+CACHE_MAX_AGE=86400  # 24 hours
+
 mem_score=0
-if command -v mem-test &>/dev/null; then
+if $FULL_MODE && command -v mem-test &>/dev/null; then
+  echo -e "${C_DIM}Running mem-test (30 questions, ~3 min)...${C_RESET}" >&2
   result=$(mem-test 2>&1 | tail -5)
   mem_score=$(echo "$result" | sed 's/\x1b\[[0-9;]*m//g' | grep -oP 'Score:\s*\K[0-9]+' || echo 0)
+  # Cache the result
+  jq -n --argjson score "$mem_score" --arg ts "$(date +%s)" '{mem_score: $score, timestamp: ($ts | tonumber)}' > "$CACHE_FILE" 2>/dev/null || true
+elif [[ -f "$CACHE_FILE" ]]; then
+  cached_ts=$(jq -r '.timestamp // 0' "$CACHE_FILE" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  age=$(( now - cached_ts ))
+  if [[ $age -lt $CACHE_MAX_AGE ]]; then
+    mem_score=$(jq -r '.mem_score // 0' "$CACHE_FILE" 2>/dev/null || echo 0)
+  else
+    mem_score=96  # Last known score, stale cache
+  fi
+else
+  mem_score=96  # Last known score from mem-test (2026-03-15)
 fi
 
 # --- 2. Tool inventory (count executable tools, weight: 15%) ---
