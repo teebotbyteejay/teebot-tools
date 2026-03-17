@@ -890,6 +890,24 @@ print(recent)
     pass "feedback capture: no log yet (build with log-feedback)"
   fi
   
+  # --- Test 4b: Coactive preference store ---
+  local coactive_db="$MEMORY_DIR/coactive.db"
+  
+  if [[ -f "$coactive_db" ]]; then
+    local coactive_total
+    coactive_total=$(sqlite3 "$coactive_db" "SELECT COUNT(*) FROM preferences;" 2>/dev/null || echo "0")
+    local coactive_types
+    coactive_types=$(sqlite3 "$coactive_db" "SELECT signal_type || ':' || COUNT(*) FROM preferences GROUP BY signal_type ORDER BY COUNT(*) DESC;" 2>/dev/null | tr '\n' ', ' | sed 's/,$//' || echo "?")
+    
+    if [[ "$coactive_total" -eq 0 ]]; then
+      fail "coactive preferences" "database exists but empty — run: coactive extract"
+    else
+      pass "coactive preferences: $coactive_total pairs ($coactive_types)"
+    fi
+  else
+    skip "coactive preferences" "not yet extracted — run: coactive extract"
+  fi
+  
   # --- Test 5: Post-task evaluation distribution ---
   # Check that we're not just getting confirmatory high scores
   local eval_dir="$MEMORY_DIR/reflexion-evals"

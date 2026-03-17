@@ -62,6 +62,23 @@ $feedback
   fi
 fi
 
+# --- 1.2. Coactive Preferences (implicit feedback from conversations) ---
+if command -v coactive &>/dev/null; then
+  # Search for correction/redirect/preference only (skip positive/neutral noise)
+  coactive_results=""
+  for sig_type in correction redirect preference; do
+    chunk=$(coactive search "$TASK" --limit 2 --type "$sig_type" 2>/dev/null | grep -v "^$\|^No preferences" || true)
+    [[ -n "$chunk" ]] && coactive_results+="$chunk
+"
+  done
+  if [[ -n "$coactive_results" ]]; then
+    output+="## Past Corrections & Preferences (from conversations)
+$coactive_results
+"
+    $VERBOSE && echo -e "${C_DIM}Injected coactive preference context${C_RESET}" >&2
+  fi
+fi
+
 # --- 1.5. Retrieval Trigger (MemGen-inspired) ---
 # Quick probe: is retrieval likely to be useful for this task?
 # Uses EMBEDDING score (semantic similarity) not composite score.

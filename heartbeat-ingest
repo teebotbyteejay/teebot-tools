@@ -143,3 +143,9 @@ if command -v ragmem &>/dev/null; then
   echo -e "  ${C_DIM}Updating ragmem index...${C_RESET}"
   ragmem ingest 2>&1 | tail -1 || true
 fi
+
+# Update coactive preference pairs (idempotent — only processes changed sessions)
+if command -v coactive &>/dev/null; then
+  echo -e "  ${C_DIM}Updating coactive preferences...${C_RESET}"
+  coactive extract 2>&1 | tail -1 || true
+fi

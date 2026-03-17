@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+"""coactive — Extract and search implicit feedback from conversations.
+
+Processes session files to find (bot_output, teejay_response) pairs.
+Classifies response type and stores as searchable preference pairs.
+
+Usage:
+    coactive extract [--force]           Extract preferences from recent sessions
+    coactive search "query" [--limit N]  Search preferences by similarity
+    coactive stats                       Show preference store stats
+    coactive show [--type TYPE] [--limit N]  Show recent preferences
+"""
+
+import json
+import os
+import re
+import sqlite3
+import struct
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from uuid import uuid4
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+WORKSPACE = Path(os.environ.get("WORKSPACE", Path.home() / ".openclaw" / "workspace"))
+SESSIONS_DIR = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+DB_PATH = WORKSPACE / "memory" / "coactive.db"
+EMBEDDING_MODEL = "text-embedding-3-small"
+TEEJAY_PHONE = "+18029896729"
+
+# Reuse ragmem's numpy from graphmem venv
+GRAPHMEM_VENV = WORKSPACE / "graphmem" / ".venv" / "lib"
+_site_dirs = list(GRAPHMEM_VENV.glob("python*/site-packages"))
+if _site_dirs:
+    sys.path.insert(0, str(_site_dirs[0]))
+
+import numpy as np
+
+# Signal type classification templates
+SIGNAL_TEMPLATES = {
+    "correction": [
+        "No, I meant something different",
+        "That's wrong, it should be",
+        "Actually, the correct answer is",
+        "I don't mean that, I mean this instead",
+        "That's not what I asked for",
+    ],
+    "redirect": [
+        "Stop doing that and focus on this",
+        "That's not enough progress, work harder",
+        "Why are you doing that instead of this",
+        "I want you to prioritize something else",
+        "We need to change direction",
+    ],
+    "preference": [
+        "Can you also include this when you do that",
+        "I want updates in a different format",
+        "Send me the information like this instead",
+        "I prefer this approach over that one",
+        "Next time, do it this way",
+    ],
+    "frustration": [
+        "Hello? Are you there?",
+        "Why have you been so quiet, no updates",
+        "What happened, this is broken",
+        "That doesn't make sense at all",
+        "This is not acceptable",
+    ],
+    "positive": [
+        "Good job, that's exactly what I wanted",
+        "Sounds good, keep going",
+        "Yes, that's right, perfect",
+        "I'm feeling better after our conversation",
+        "Nice work on that",
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Embedding helpers (same as ragmem)
+# ---------------------------------------------------------------------------
+def get_embedding(text: str) -> list[float]:
+    import urllib.request
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    
+    payload = json.dumps({
+        "model": EMBEDDING_MODEL,
+        "input": text[:8000],
+    }).encode()
+    
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/embeddings",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read())
+    
+    return data["data"][0]["embedding"]
+
+
+def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """Batch embed multiple texts in one API call."""
+    import urllib.request
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    
+    payload = json.dumps({
+        "model": EMBEDDING_MODEL,
+        "input": [t[:8000] for t in texts],
+    }).encode()
+    
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/embeddings",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    
+    # Sort by index to maintain order
+    sorted_data = sorted(data["data"], key=lambda x: x["index"])
+    return [d["embedding"] for d in sorted_data]
+
+
+def pack_embedding(emb: list[float]) -> bytes:
+    return struct.pack(f"{len(emb)}f", *emb)
+
+
+def unpack_embedding(blob: bytes) -> np.ndarray:
+    n = len(blob) // 4
+    return np.array(struct.unpack(f"{n}f", blob), dtype=np.float32)
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+def get_db() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS preferences (
+            id TEXT PRIMARY KEY,
+            session_file TEXT NOT NULL,
+            timestamp TEXT,
+            signal_type TEXT,
+            my_output TEXT NOT NULL,
+            teejay_response TEXT NOT NULL,
+            context TEXT,
+            lesson TEXT,
+            embedding BLOB,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_pref_session ON preferences(session_file);
+        CREATE INDEX IF NOT EXISTS idx_pref_type ON preferences(signal_type);
+        CREATE INDEX IF NOT EXISTS idx_pref_ts ON preferences(timestamp);
+        
+        CREATE TABLE IF NOT EXISTS extract_state (
+            session_file TEXT PRIMARY KEY,
+            file_hash TEXT,
+            extracted_at TEXT DEFAULT (datetime('now'))
+        );
+        
+        -- Signal type template embeddings (cached)
+        CREATE TABLE IF NOT EXISTS signal_templates (
+            signal_type TEXT NOT NULL,
+            centroid BLOB,
+            PRIMARY KEY (signal_type)
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Signal classification
+# ---------------------------------------------------------------------------
+def _ensure_centroids(conn: sqlite3.Connection):
+    """Compute and cache signal type centroids if not present."""
+    existing = conn.execute("SELECT COUNT(*) FROM signal_templates").fetchone()[0]
+    if existing >= len(SIGNAL_TEMPLATES):
+        return
+    
+    print("  Computing signal type centroids...")
+    
+    for sig_type, templates in SIGNAL_TEMPLATES.items():
+        embeddings = get_embeddings_batch(templates)
+        centroid = np.mean([np.array(e, dtype=np.float32) for e in embeddings], axis=0)
+        conn.execute(
+            "INSERT OR REPLACE INTO signal_templates (signal_type, centroid) VALUES (?, ?)",
+            (sig_type, pack_embedding(centroid.tolist()))
+        )
+    
+    conn.commit()
+    print("  ✓ Centroids cached")
+
+
+def classify_signal(text: str, text_emb: np.ndarray, conn: sqlite3.Connection) -> str:
+    """Classify a Teejay response by signal type using centroid similarity."""
+    _ensure_centroids(conn)
+    
+    rows = conn.execute("SELECT signal_type, centroid FROM signal_templates").fetchall()
+    
+    best_type = "neutral"
+    best_sim = 0.0
+    
+    for sig_type, centroid_blob in rows:
+        centroid = unpack_embedding(centroid_blob)
+        sim = cosine_similarity(text_emb, centroid)
+        if sim > best_sim:
+            best_sim = sim
+            best_type = sig_type
+    
+    # Minimum threshold — below this, classify as neutral
+    if best_sim < 0.25:
+        return "neutral"
+    
+    return best_type
+
+
+# ---------------------------------------------------------------------------
+# Session parsing
+# ---------------------------------------------------------------------------
+def extract_pairs(session_path: Path) -> list[dict]:
+    """Extract (my_output, teejay_response) pairs from a session file."""
+    pairs = []
+    messages = []
+    
+    with open(session_path) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            
+            if d.get("type") != "message":
+                continue
+            
+            msg = d.get("message", {})
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            timestamp = d.get("timestamp", "")
+            
+            # Extract text from content (handles both string and list formats)
+            if isinstance(content, list):
+                text = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            else:
+                text = str(content)
+            
+            if not text.strip():
+                continue
+            
+            messages.append({
+                "role": role,
+                "text": text.strip(),
+                "timestamp": timestamp,
+            })
+    
+    # Find pairs: my output followed by Teejay's response
+    for i in range(len(messages) - 1):
+        curr = messages[i]
+        next_msg = messages[i + 1]
+        
+        # Skip if current isn't assistant output
+        if curr["role"] != "assistant":
+            continue
+        
+        # Skip if next isn't a user message from Teejay
+        if next_msg["role"] != "user":
+            continue
+        
+        teejay_text = next_msg["text"]
+        
+        # Check if it's from Teejay (phone number in metadata) or a real message
+        is_teejay = TEEJAY_PHONE in teejay_text
+        
+        # Also accept messages without metadata (direct user messages)
+        # but skip cron/heartbeat system messages
+        is_system = (
+            teejay_text.startswith("[cron:") or
+            teejay_text.startswith("[heartbeat]") or
+            "Read HEARTBEAT.md" in teejay_text or
+            "Execute your Session Startup" in teejay_text or
+            teejay_text.startswith("System:") or
+            "System message" in teejay_text[:50]
+        )
+        
+        if is_system and not is_teejay:
+            continue
+        
+        # Extract the actual message (strip metadata)
+        actual_teejay = _strip_metadata(teejay_text)
+        
+        if not actual_teejay or len(actual_teejay) < 5:
+            continue
+        
+        # Skip very long bot outputs (just tool noise)
+        my_output = curr["text"]
+        if len(my_output) > 2000:
+            my_output = my_output[:500] + "\n...\n" + my_output[-500:]
+        
+        # Get context: the user message before my output
+        context = ""
+        if i > 0 and messages[i-1]["role"] == "user":
+            context = _strip_metadata(messages[i-1]["text"])[:500]
+        
+        pairs.append({
+            "my_output": my_output,
+            "teejay_response": actual_teejay,
+            "context": context,
+            "timestamp": next_msg.get("timestamp", curr.get("timestamp", "")),
+        })
+    
+    return pairs
+
+
+def _strip_metadata(text: str) -> str:
+    """Strip WhatsApp metadata wrapper from a message."""
+    # Pattern: starts with "Conversation info (untrusted metadata):" followed by JSON block
+    if "untrusted metadata" in text[:100]:
+        # Find the end of the JSON block
+        try:
+            # Skip past the ```json ... ``` block
+            parts = text.split("```")
+            if len(parts) >= 3:
+                return parts[-1].strip()
+            # Fallback: everything after the JSON
+            json_end = text.find("}\n")
+            if json_end > 0:
+                return text[json_end+2:].strip()
+        except:
+            pass
+    
+    # Strip system exec notifications
+    if text.startswith("System: ["):
+        return ""
+    
+    return text.strip()
+
+
+def file_hash(path: Path) -> str:
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+# ---------------------------------------------------------------------------
+# Extract
+# ---------------------------------------------------------------------------
+def extract(force: bool = False):
+    """Extract preference pairs from session files."""
+    conn = get_db()
+    
+    # Find session files with recent human conversations
+    session_files = sorted(SESSIONS_DIR.glob("*.jsonl"), key=os.path.getmtime, reverse=True)
+    
+    if not session_files:
+        print("No session files found")
+        return
+    
+    # Check which need processing
+    existing = dict(conn.execute("SELECT session_file, file_hash FROM extract_state").fetchall())
+    
+    to_process = []
+    for f in session_files[:100]:  # Only check last 100 sessions
+        fh = file_hash(f)
+        if force or f.name not in existing or existing[f.name] != fh:
+            to_process.append(f)
+    
+    if not to_process:
+        print(f"All {len(session_files)} sessions up to date")
+        return
+    
+    print(f"Processing {len(to_process)} sessions...")
+    
+    total_pairs = 0
+    total_embedded = 0
+    
+    for f in to_process:
+        pairs = extract_pairs(f)
+        
+        if not pairs:
+            # Mark as processed even if no pairs (avoid re-processing)
+            conn.execute(
+                "INSERT OR REPLACE INTO extract_state (session_file, file_hash) VALUES (?, ?)",
+                (f.name, file_hash(f))
+            )
+            conn.commit()
+            continue
+        
+        # Delete old pairs for this session (re-extract on change)
+        conn.execute("DELETE FROM preferences WHERE session_file = ?", (f.name,))
+        
+        # Batch embed all teejay responses
+        texts_to_embed = [p["teejay_response"] for p in pairs]
+        try:
+            # Batch in groups of 20
+            all_embeddings = []
+            for batch_start in range(0, len(texts_to_embed), 20):
+                batch = texts_to_embed[batch_start:batch_start+20]
+                embs = get_embeddings_batch(batch)
+                all_embeddings.extend(embs)
+                time.sleep(0.5)  # Rate limit courtesy
+        except Exception as e:
+            print(f"  ⚠️ Embedding failed for {f.name}: {e}")
+            continue
+        
+        for pair, emb in zip(pairs, all_embeddings):
+            emb_array = np.array(emb, dtype=np.float32)
+            signal_type = classify_signal(pair["teejay_response"], emb_array, conn)
+            
+            conn.execute(
+                """INSERT INTO preferences 
+                   (id, session_file, timestamp, signal_type, my_output, teejay_response, context, embedding)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid4()),
+                    f.name,
+                    pair["timestamp"],
+                    signal_type,
+                    pair["my_output"],
+                    pair["teejay_response"],
+                    pair["context"],
+                    pack_embedding(emb),
+                )
+            )
+            total_pairs += 1
+            total_embedded += 1
+        
+        conn.execute(
+            "INSERT OR REPLACE INTO extract_state (session_file, file_hash) VALUES (?, ?)",
+            (f.name, file_hash(f))
+        )
+        conn.commit()
+        
+        type_counts = {}
+        for pair, emb in zip(pairs, all_embeddings):
+            emb_array = np.array(emb, dtype=np.float32)
+            st = classify_signal(pair["teejay_response"], emb_array, conn)
+            type_counts[st] = type_counts.get(st, 0) + 1
+        type_summary = ", ".join(f"{k}:{v}" for k, v in sorted(type_counts.items()))
+        
+        print(f"  ✓ {f.name[:12]}...: {len(pairs)} pairs ({type_summary})")
+    
+    conn.close()
+    print(f"\n✓ Extracted {total_pairs} preference pairs ({total_embedded} embedded)")
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+def search(query: str, limit: int = 5, signal_filter: str | None = None):
+    """Search preferences by embedding similarity."""
+    conn = get_db()
+    
+    query_emb = np.array(get_embedding(query), dtype=np.float32)
+    
+    sql = "SELECT id, session_file, timestamp, signal_type, my_output, teejay_response, context, embedding FROM preferences WHERE embedding IS NOT NULL"
+    params = []
+    
+    if signal_filter:
+        sql += " AND signal_type = ?"
+        params.append(signal_filter)
+    
+    rows = conn.execute(sql, params).fetchall()
+    
+    if not rows:
+        print("No preferences found. Run: coactive extract")
+        return
+    
+    results = []
+    for row in rows:
+        pid, session, ts, sig_type, my_out, tj_resp, context, emb_blob = row
+        chunk_emb = unpack_embedding(emb_blob)
+        sim = cosine_similarity(query_emb, chunk_emb)
+        
+        # Weight corrections/redirections higher
+        weight = {"correction": 1.2, "redirect": 1.15, "preference": 1.1, "frustration": 1.05}.get(sig_type, 1.0)
+        
+        results.append({
+            "sim": sim,
+            "score": sim * weight,
+            "type": sig_type,
+            "my_output": my_out,
+            "teejay": tj_resp,
+            "context": context,
+            "timestamp": ts,
+        })
+    
+    results.sort(key=lambda r: r["score"], reverse=True)
+    
+    for r in results[:limit]:
+        emoji = {"correction": "🔧", "redirect": "🔀", "preference": "💡", "frustration": "😤", "positive": "👍"}.get(r["type"], "•")
+        print(f"  [{r['score']:.3f} {emoji} {r['type']}]")
+        if r["context"]:
+            print(f"    Context: {r['context'][:100]}")
+        print(f"    Me: {r['my_output'][:120]}")
+        print(f"    Teejay: {r['teejay'][:120]}")
+        print()
+    
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Stats / Show
+# ---------------------------------------------------------------------------
+def stats():
+    conn = get_db()
+    
+    total = conn.execute("SELECT COUNT(*) FROM preferences").fetchone()[0]
+    embedded = conn.execute("SELECT COUNT(*) FROM preferences WHERE embedding IS NOT NULL").fetchone()[0]
+    sessions = conn.execute("SELECT COUNT(DISTINCT session_file) FROM preferences").fetchone()[0]
+    
+    print(f"📊 coactive stats")
+    print(f"  Preferences: {total} ({embedded} with embeddings)")
+    print(f"  Sessions: {sessions}")
+    
+    # Type breakdown
+    types = conn.execute("SELECT signal_type, COUNT(*) FROM preferences GROUP BY signal_type ORDER BY COUNT(*) DESC").fetchall()
+    if types:
+        print(f"  Types:")
+        for t, c in types:
+            emoji = {"correction": "🔧", "redirect": "🔀", "preference": "💡", "frustration": "😤", "positive": "👍"}.get(t, "•")
+            print(f"    {emoji} {t}: {c}")
+    
+    # Date range
+    oldest = conn.execute("SELECT MIN(timestamp) FROM preferences").fetchone()[0]
+    newest = conn.execute("SELECT MAX(timestamp) FROM preferences").fetchone()[0]
+    if oldest:
+        print(f"  Date range: {oldest[:10]} → {newest[:10]}")
+    
+    print(f"  DB size: {DB_PATH.stat().st_size / 1024:.0f} KB")
+    conn.close()
+
+
+def show(signal_filter: str | None = None, limit: int = 10):
+    conn = get_db()
+    
+    sql = "SELECT timestamp, signal_type, my_output, teejay_response, context FROM preferences"
+    params = []
+    
+    if signal_filter:
+        sql += " WHERE signal_type = ?"
+        params.append(signal_filter)
+    
+    sql += " ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
+    
+    rows = conn.execute(sql, params).fetchall()
+    
+    for ts, sig_type, my_out, tj_resp, context in rows:
+        emoji = {"correction": "🔧", "redirect": "🔀", "preference": "💡", "frustration": "😤", "positive": "👍"}.get(sig_type, "•")
+        print(f"  {emoji} [{sig_type}] {ts[:16] if ts else '?'}")
+        if context:
+            print(f"    Context: {context[:100]}")
+        print(f"    Me: {my_out[:120]}")
+        print(f"    Teejay: {tj_resp[:120]}")
+        print()
+    
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    cmd = sys.argv[1]
+    
+    if cmd == "extract":
+        init_db()
+        force = "--force" in sys.argv
+        extract(force)
+    
+    elif cmd == "search":
+        if len(sys.argv) < 3:
+            print("Usage: coactive search \"query\" [--limit N] [--type TYPE]")
+            sys.exit(1)
+        query = sys.argv[2]
+        limit = 5
+        signal_filter = None
+        if "--limit" in sys.argv:
+            idx = sys.argv.index("--limit")
+            if idx + 1 < len(sys.argv):
+                limit = int(sys.argv[idx + 1])
+        if "--type" in sys.argv:
+            idx = sys.argv.index("--type")
+            if idx + 1 < len(sys.argv):
+                signal_filter = sys.argv[idx + 1]
+        search(query, limit, signal_filter)
+    
+    elif cmd == "stats":
+        init_db()
+        stats()
+    
+    elif cmd == "show":
+        init_db()
+        signal_filter = None
+        limit = 10
+        if "--type" in sys.argv:
+            idx = sys.argv.index("--type")
+            if idx + 1 < len(sys.argv):
+                signal_filter = sys.argv[idx + 1]
+        if "--limit" in sys.argv:
+            idx = sys.argv.index("--limit")
+            if idx + 1 < len(sys.argv):
+                limit = int(sys.argv[idx + 1])
+        show(signal_filter, limit)
+    
+    else:
+        print(f"Unknown command: {cmd}")
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
