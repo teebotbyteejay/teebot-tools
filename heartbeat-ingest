@@ -137,3 +137,9 @@ else
   echo -e "  ${C_YELLOW}⚠${C_RESET} All chunks failed — offsets were pre-saved, content won't be retried"
   exit 1
 fi
+
+# Also update ragmem index (idempotent — only re-embeds changed files)
+if command -v ragmem &>/dev/null; then
+  echo -e "  ${C_DIM}Updating ragmem index...${C_RESET}"
+  ragmem ingest 2>&1 | tail -1 || true
+fi

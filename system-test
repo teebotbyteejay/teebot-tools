@@ -509,6 +509,38 @@ test_infra() {
     fail "context-inject hook" "not installed"
   fi
 
+  # Test 3b: ragmem health
+  local RAGMEM_DB="$WORKSPACE/ragmem/data/ragmem.db"
+  if [[ -f "$RAGMEM_DB" ]]; then
+    local rag_chunks rag_embedded rag_files rag_short
+    rag_chunks=$(sqlite3 "$RAGMEM_DB" "SELECT COUNT(*) FROM chunks;" 2>/dev/null || echo "0")
+    rag_embedded=$(sqlite3 "$RAGMEM_DB" "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL;" 2>/dev/null || echo "0")
+    rag_files=$(sqlite3 "$RAGMEM_DB" "SELECT COUNT(DISTINCT source_file) FROM chunks;" 2>/dev/null || echo "0")
+    rag_short=$(sqlite3 "$RAGMEM_DB" "SELECT COUNT(*) FROM chunks WHERE char_count < 80;" 2>/dev/null || echo "0")
+    
+    if [[ "$rag_chunks" -eq 0 ]]; then
+      fail "ragmem" "database exists but empty — run: ragmem ingest"
+    elif [[ "$rag_embedded" -lt "$rag_chunks" ]]; then
+      local missing=$((rag_chunks - rag_embedded))
+      fail "ragmem embeddings" "$missing/$rag_chunks chunks missing embeddings"
+    elif [[ "$rag_short" -gt 5 ]]; then
+      fail "ragmem quality" "$rag_short short chunks (<80 chars) — re-ingest"
+    else
+      # Check freshness: newest file should be today or yesterday
+      local newest_date
+      newest_date=$(sqlite3 "$RAGMEM_DB" "SELECT MAX(source_date) FROM chunks;" 2>/dev/null || echo "")
+      local yesterday
+      yesterday=$(date -d "yesterday" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+      if [[ -n "$newest_date" && "$newest_date" < "$yesterday" ]]; then
+        fail "ragmem freshness" "newest data is $newest_date — run: ragmem ingest"
+      else
+        pass "ragmem: $rag_chunks chunks, $rag_files files, newest=$newest_date"
+      fi
+    fi
+  else
+    fail "ragmem" "database not found at $RAGMEM_DB"
+  fi
+
   # Test 4: Cron jobs exist
   local cron_count
   cron_count=$(crontab -l 2>/dev/null | grep -c "openclaw\|teebot" || echo "0")
