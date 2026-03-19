@@ -417,7 +417,29 @@ test_memory() {
     fail "Workspace root" "$stray_count stray .md files — move to projects/ or memory/"
   fi
 
-  # Test 10: graphmem edge count sanity (renumbered)
+  # Test 10: Open request staleness — flag requests >48hrs without communication
+  if [[ -f "$WORKSPACE/CURRENT_STATE.md" ]]; then
+    local stale_requests=0
+    local request_section
+    request_section=$(sed -n '/^## Teejay.*Open Requests/,/^## /p' "$WORKSPACE/CURRENT_STATE.md" | head -20)
+    # Check for active (non-struck-through) requests that mention STATUS but not PAUSED/DONE
+    local active_requests
+    active_requests=$(echo "$request_section" | grep -c '^\s*[0-9]\+\.\s\+\*\*[^~]' 2>/dev/null || echo "0")
+    if [[ "$active_requests" -gt 0 ]]; then
+      # Check if CURRENT_STATE was updated in the last 48 hours
+      local cs_age
+      cs_age=$(( $(date +%s) - $(stat -c %Y "$WORKSPACE/CURRENT_STATE.md") ))
+      if [[ "$cs_age" -gt 172800 ]]; then
+        fail "Request staleness" "$active_requests open request(s), CURRENT_STATE.md not updated in $(( cs_age / 3600 ))h — message Teejay!"
+      else
+        pass "Request staleness: $active_requests active, CURRENT_STATE.md fresh"
+      fi
+    else
+      pass "Request staleness: no active open requests"
+    fi
+  fi
+
+  # Test 11: graphmem edge count sanity
   local edge_count
   edge_count=$(graphmem-sqlite stats 2>/dev/null | grep -oP 'Edges:\s*\K\d+' || echo "0")
   if [[ "$edge_count" -gt 500 ]]; then
