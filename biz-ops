@@ -1,0 +1,685 @@
+#!/usr/bin/env bash
+# biz-ops — Business operations toolkit for agent-operated business
+# SQLite-backed: customer management, audit trail, delivery tracking, human-in-loop gating
+# v1.0.0 — 2026-03-19
+#
+# Design principles (from business-readiness research):
+#   1. Audit everything — decisions AND non-decisions with reasons
+#   2. Human-in-loop for irreversible actions (gates)
+#   3. Simple workflows with validation checkpoints
+#   4. Recalculate assumptions on schedule (stale mark prevention)
+#   5. Error cascade prevention — validate at every step
+set -euo pipefail
+
+VERSION="1.0.0"
+DB_DIR="$HOME/.openclaw/workspace/projects/business"
+DB_PATH="$DB_DIR/biz-ops.db"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "→ $*"; }
+warn() { echo "⚠ $*" >&2; }
+
+ensure_db() {
+  [[ -f "$DB_PATH" ]] || die "Database not initialized. Run: biz-ops init"
+}
+
+# ── INIT ──────────────────────────────────────────────────────────────────────
+cmd_init() {
+  mkdir -p "$DB_DIR"
+  if [[ -f "$DB_PATH" ]]; then
+    info "Database already exists at $DB_PATH"
+    return 0
+  fi
+
+  sqlite3 "$DB_PATH" <<'SQL'
+CREATE TABLE IF NOT EXISTS customers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE,
+  plan TEXT DEFAULT 'free',
+  status TEXT DEFAULT 'active' CHECK(status IN ('active','paused','churned','trial')),
+  monthly_rate REAL DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  notes TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (datetime('now')),
+  category TEXT NOT NULL CHECK(category IN ('decision','delivery','payment','gate','system','non-action')),
+  action TEXT NOT NULL,
+  reasoning TEXT NOT NULL,
+  alternatives TEXT DEFAULT '',
+  reversible INTEGER DEFAULT 1,
+  approved_by TEXT DEFAULT '',
+  outcome TEXT DEFAULT 'pending',
+  context TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER NOT NULL REFERENCES customers(id),
+  type TEXT NOT NULL CHECK(type IN ('email','report','product','api','other')),
+  content_ref TEXT DEFAULT '',
+  scheduled_at TEXT DEFAULT '',
+  delivered_at TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending' CHECK(status IN ('pending','sent','confirmed','failed','cancelled')),
+  notes TEXT DEFAULT '',
+  audit_log_id INTEGER REFERENCES audit_log(id)
+);
+
+CREATE TABLE IF NOT EXISTS gates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  description TEXT NOT NULL,
+  category TEXT DEFAULT 'irreversible',
+  severity TEXT DEFAULT 'high' CHECK(severity IN ('low','medium','high','critical')),
+  status TEXT DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','expired')),
+  context TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now')),
+  resolved_at TEXT DEFAULT '',
+  resolved_by TEXT DEFAULT '',
+  notes TEXT DEFAULT '',
+  audit_log_id INTEGER REFERENCES audit_log(id)
+);
+
+CREATE TABLE IF NOT EXISTS metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  value REAL NOT NULL,
+  recorded_at TEXT DEFAULT (datetime('now')),
+  notes TEXT DEFAULT ''
+);
+
+-- Indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_category ON audit_log(category);
+CREATE INDEX IF NOT EXISTS idx_deliveries_customer ON deliveries(customer_id);
+CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
+CREATE INDEX IF NOT EXISTS idx_gates_status ON gates(status);
+CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(name);
+SQL
+
+  info "✓ Initialized biz-ops database at $DB_PATH"
+  # Self-audit the init
+  sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning) VALUES ('system', 'database_initialized', 'Business operations database created for agent-operated business infrastructure');"
+  info "  Tables: customers, audit_log, deliveries, gates, metrics"
+}
+
+# ── CUSTOMER ──────────────────────────────────────────────────────────────────
+cmd_customer() {
+  ensure_db
+  local subcmd="${1:-help}"
+  shift || true
+
+  case "$subcmd" in
+    add)
+      local name="" email="" plan="free" rate="0" notes="" status="active"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --name) name="$2"; shift 2 ;;
+          --email) email="$2"; shift 2 ;;
+          --plan) plan="$2"; shift 2 ;;
+          --rate) rate="$2"; shift 2 ;;
+          --notes) notes="$2"; shift 2 ;;
+          --status) status="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+      [[ -n "$name" ]] || die "Missing --name"
+      [[ -n "$email" ]] || die "Missing --email"
+
+      local cid
+      cid=$(sqlite3 "$DB_PATH" "INSERT INTO customers (name, email, plan, status, monthly_rate, notes) VALUES ('$(echo "$name" | sed "s/'/''/g")', '$(echo "$email" | sed "s/'/''/g")', '$plan', '$status', $rate, '$(echo "$notes" | sed "s/'/''/g")'); SELECT last_insert_rowid();")
+      
+      # Audit the addition
+      sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning) VALUES ('decision', 'customer_added', 'Added customer #$cid: $name ($email), plan=$plan, rate=$rate');"
+      info "✓ Added customer #$cid: $name ($email)"
+      ;;
+
+    list)
+      local filter="${1:-all}"
+      local query="SELECT id, name, email, plan, status, monthly_rate FROM customers"
+      if [[ "$filter" != "all" ]]; then
+        query="$query WHERE status='$filter'"
+      fi
+      query="$query ORDER BY created_at DESC;"
+      
+      echo "ID | Name | Email | Plan | Status | Rate"
+      echo "---|------|-------|------|--------|-----"
+      sqlite3 -separator " | " "$DB_PATH" "$query"
+      
+      local count
+      count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM customers WHERE status='active';")
+      local mrr
+      mrr=$(sqlite3 "$DB_PATH" "SELECT COALESCE(SUM(monthly_rate), 0) FROM customers WHERE status='active';")
+      echo ""
+      echo "Active: $count | MRR: \$$mrr"
+      ;;
+
+    get)
+      local cid="${1:-}"
+      [[ -n "$cid" ]] || die "Usage: biz-ops customer get <id>"
+      sqlite3 -header -column "$DB_PATH" "SELECT * FROM customers WHERE id=$cid;"
+      echo ""
+      echo "── Recent Deliveries ──"
+      sqlite3 -header -column "$DB_PATH" "SELECT id, type, status, delivered_at FROM deliveries WHERE customer_id=$cid ORDER BY id DESC LIMIT 5;"
+      ;;
+
+    update)
+      local cid=""
+      declare -A updates=()
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --id) cid="$2"; shift 2 ;;
+          --status) updates[status]="$2"; shift 2 ;;
+          --plan) updates[plan]="$2"; shift 2 ;;
+          --rate) updates[monthly_rate]="$2"; shift 2 ;;
+          --notes) updates[notes]="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+      [[ -n "$cid" ]] || die "Missing --id"
+      [[ ${#updates[@]} -gt 0 ]] || die "Specify --status, --plan, --rate, or --notes"
+
+      local changes=""
+      local audit_parts=""
+      for field in "${!updates[@]}"; do
+        local value="${updates[$field]}"
+        local old_value
+        old_value=$(sqlite3 "$DB_PATH" "SELECT $field FROM customers WHERE id=$cid;")
+        if [[ -n "$changes" ]]; then changes="$changes, "; fi
+        changes="$changes$field='$(echo "$value" | sed "s/'/''/g")'"
+        audit_parts="$audit_parts $field: $old_value→$value;"
+      done
+
+      sqlite3 "$DB_PATH" "UPDATE customers SET $changes, updated_at=datetime('now') WHERE id=$cid;"
+      
+      # Audit the change
+      sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning) VALUES ('decision', 'customer_updated', 'Customer #$cid:$audit_parts');"
+      info "✓ Updated customer #$cid:$audit_parts"
+      ;;
+
+    *)
+      echo "Usage: biz-ops customer <add|list|get|update>"
+      echo ""
+      echo "  add --name NAME --email EMAIL [--plan PLAN] [--rate RATE] [--notes NOTES]"
+      echo "  list [active|paused|churned|trial|all]"
+      echo "  get <id>"
+      echo "  update --id ID [--status STATUS] [--plan PLAN] [--rate RATE] [--notes NOTES]"
+      ;;
+  esac
+}
+
+# ── AUDIT ─────────────────────────────────────────────────────────────────────
+cmd_audit() {
+  ensure_db
+  local subcmd="${1:-help}"
+  shift || true
+
+  case "$subcmd" in
+    log)
+      local category="" action="" reasoning="" alternatives="" reversible=1 outcome="pending" context=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --category) category="$2"; shift 2 ;;
+          --action) action="$2"; shift 2 ;;
+          --reasoning) reasoning="$2"; shift 2 ;;
+          --alternatives) alternatives="$2"; shift 2 ;;
+          --irreversible) reversible=0; shift ;;
+          --outcome) outcome="$2"; shift 2 ;;
+          --context) context="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+      [[ -n "$category" ]] || die "Missing --category (decision|delivery|payment|gate|system|non-action)"
+      [[ -n "$action" ]] || die "Missing --action"
+      [[ -n "$reasoning" ]] || die "Missing --reasoning"
+
+      local aid
+      aid=$(sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning, alternatives, reversible, outcome, context) VALUES ('$(echo "$category" | sed "s/'/''/g")', '$(echo "$action" | sed "s/'/''/g")', '$(echo "$reasoning" | sed "s/'/''/g")', '$(echo "$alternatives" | sed "s/'/''/g")', $reversible, '$(echo "$outcome" | sed "s/'/''/g")', '$(echo "$context" | sed "s/'/''/g")'); SELECT last_insert_rowid();")
+      info "✓ Audit entry #$aid: [$category] $action"
+      ;;
+
+    list)
+      local limit="${1:-20}"
+      local category="${2:-}"
+      local query="SELECT id, ts, category, action, substr(reasoning, 1, 60) as reasoning, outcome FROM audit_log"
+      if [[ -n "$category" ]]; then
+        query="$query WHERE category='$category'"
+      fi
+      query="$query ORDER BY ts DESC LIMIT $limit;"
+      sqlite3 -header -column "$DB_PATH" "$query"
+      ;;
+
+    search)
+      local term="${1:-}"
+      [[ -n "$term" ]] || die "Usage: biz-ops audit search <term>"
+      sqlite3 -header -column "$DB_PATH" "SELECT id, ts, category, action, substr(reasoning, 1, 80) FROM audit_log WHERE reasoning LIKE '%$term%' OR action LIKE '%$term%' ORDER BY ts DESC LIMIT 20;"
+      ;;
+
+    non-actions)
+      info "Non-action audit entries (things NOT done, with reasons):"
+      sqlite3 -header -column "$DB_PATH" "SELECT id, ts, action, reasoning FROM audit_log WHERE category='non-action' ORDER BY ts DESC LIMIT 20;"
+      ;;
+
+    *)
+      echo "Usage: biz-ops audit <log|list|search|non-actions>"
+      echo ""
+      echo "  log --category CAT --action ACT --reasoning WHY [--alternatives ALT] [--irreversible] [--outcome OUT] [--context CTX]"
+      echo "  list [limit] [category]"
+      echo "  search <term>"
+      echo "  non-actions"
+      echo ""
+      echo "Categories: decision, delivery, payment, gate, system, non-action"
+      ;;
+  esac
+}
+
+# ── DELIVER ───────────────────────────────────────────────────────────────────
+cmd_deliver() {
+  ensure_db
+  local subcmd="${1:-help}"
+  shift || true
+
+  case "$subcmd" in
+    log)
+      local customer_id="" type="" content_ref="" notes="" scheduled=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --customer) customer_id="$2"; shift 2 ;;
+          --type) type="$2"; shift 2 ;;
+          --content) content_ref="$2"; shift 2 ;;
+          --notes) notes="$2"; shift 2 ;;
+          --scheduled) scheduled="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+      [[ -n "$customer_id" ]] || die "Missing --customer <id>"
+      [[ -n "$type" ]] || die "Missing --type (email|report|product|api|other)"
+
+      # Verify customer exists
+      local cname
+      cname=$(sqlite3 "$DB_PATH" "SELECT name FROM customers WHERE id=$customer_id;" 2>/dev/null) || die "Customer #$customer_id not found"
+      [[ -n "$cname" ]] || die "Customer #$customer_id not found"
+
+      local did
+      did=$(sqlite3 "$DB_PATH" "INSERT INTO deliveries (customer_id, type, content_ref, notes, scheduled_at) VALUES ($customer_id, '$type', '$(echo "$content_ref" | sed "s/'/''/g")', '$(echo "$notes" | sed "s/'/''/g")', '$(echo "$scheduled" | sed "s/'/''/g")'); SELECT last_insert_rowid();")
+
+      # Audit
+      sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning) VALUES ('delivery', 'delivery_scheduled', 'Delivery #$did for customer #$customer_id ($cname): type=$type');"
+      info "✓ Delivery #$did scheduled for $cname ($type)"
+      ;;
+
+    mark)
+      local did="${1:-}"
+      local new_status="${2:-}"
+      [[ -n "$did" ]] || die "Usage: biz-ops deliver mark <id> <sent|confirmed|failed|cancelled>"
+      [[ -n "$new_status" ]] || die "Usage: biz-ops deliver mark <id> <sent|confirmed|failed|cancelled>"
+
+      local ts_field=""
+      if [[ "$new_status" == "sent" || "$new_status" == "confirmed" ]]; then
+        ts_field=", delivered_at=datetime('now')"
+      fi
+
+      sqlite3 "$DB_PATH" "UPDATE deliveries SET status='$new_status'$ts_field WHERE id=$did;"
+      
+      # Audit
+      sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning) VALUES ('delivery', 'delivery_status_changed', 'Delivery #$did marked as $new_status');"
+      info "✓ Delivery #$did → $new_status"
+      ;;
+
+    list)
+      local filter="${1:-pending}"
+      local query="SELECT d.id, c.name, d.type, d.status, d.scheduled_at, d.delivered_at FROM deliveries d JOIN customers c ON d.customer_id=c.id"
+      if [[ "$filter" != "all" ]]; then
+        query="$query WHERE d.status='$filter'"
+      fi
+      query="$query ORDER BY d.id DESC LIMIT 20;"
+      sqlite3 -header -column "$DB_PATH" "$query"
+      ;;
+
+    *)
+      echo "Usage: biz-ops deliver <log|mark|list>"
+      echo ""
+      echo "  log --customer ID --type TYPE [--content REF] [--notes NOTES] [--scheduled DATETIME]"
+      echo "  mark <id> <sent|confirmed|failed|cancelled>"
+      echo "  list [pending|sent|confirmed|failed|all]"
+      ;;
+  esac
+}
+
+# ── GATE (Human-in-the-loop) ────────────────────────────────────────────────
+cmd_gate() {
+  ensure_db
+  local subcmd="${1:-help}"
+  shift || true
+
+  case "$subcmd" in
+    create)
+      local description="" severity="high" context="" category="irreversible"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --desc) description="$2"; shift 2 ;;
+          --severity) severity="$2"; shift 2 ;;
+          --context) context="$2"; shift 2 ;;
+          --category) category="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+      [[ -n "$description" ]] || die "Missing --desc"
+
+      # Create audit entry
+      local aid
+      aid=$(sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning, reversible) VALUES ('gate', 'gate_created', '$(echo "$description" | sed "s/'/''/g")', 0); SELECT last_insert_rowid();")
+
+      local gid
+      gid=$(sqlite3 "$DB_PATH" "INSERT INTO gates (description, category, severity, context, audit_log_id) VALUES ('$(echo "$description" | sed "s/'/''/g")', '$category', '$severity', '$(echo "$context" | sed "s/'/''/g")', $aid); SELECT last_insert_rowid();")
+      
+      info "🚧 Gate #$gid created [$severity]: $description"
+      info "  Resolve with: biz-ops gate resolve $gid approved|rejected"
+      ;;
+
+    resolve)
+      local gid="${1:-}"
+      local resolution="${2:-}"
+      local by="${3:-teejay}"
+      [[ -n "$gid" ]] || die "Usage: biz-ops gate resolve <id> <approved|rejected> [by]"
+      [[ -n "$resolution" ]] || die "Usage: biz-ops gate resolve <id> <approved|rejected> [by]"
+
+      sqlite3 "$DB_PATH" "UPDATE gates SET status='$resolution', resolved_at=datetime('now'), resolved_by='$by' WHERE id=$gid;"
+      
+      # Audit
+      sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning) VALUES ('gate', 'gate_resolved', 'Gate #$gid $resolution by $by');"
+      info "✓ Gate #$gid → $resolution (by $by)"
+      ;;
+
+    list)
+      local filter="${1:-pending}"
+      local query="SELECT id, severity, status, description, created_at FROM gates"
+      if [[ "$filter" != "all" ]]; then
+        query="$query WHERE status='$filter'"
+      fi
+      query="$query ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at DESC LIMIT 20;"
+      sqlite3 -header -column "$DB_PATH" "$query"
+      ;;
+
+    pending)
+      local count
+      count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM gates WHERE status='pending';")
+      if [[ "$count" -gt 0 ]]; then
+        warn "$count pending gate(s) requiring human approval:"
+        sqlite3 -header -column "$DB_PATH" "SELECT id, severity, description, created_at FROM gates WHERE status='pending' ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END;"
+      else
+        info "No pending gates. All clear."
+      fi
+      ;;
+
+    *)
+      echo "Usage: biz-ops gate <create|resolve|list|pending>"
+      echo ""
+      echo "  create --desc DESCRIPTION [--severity low|medium|high|critical] [--context CTX]"
+      echo "  resolve <id> <approved|rejected> [resolved_by]"
+      echo "  list [pending|approved|rejected|all]"
+      echo "  pending"
+      ;;
+  esac
+}
+
+# ── METRIC ────────────────────────────────────────────────────────────────────
+cmd_metric() {
+  ensure_db
+  local subcmd="${1:-help}"
+  shift || true
+
+  case "$subcmd" in
+    record)
+      local name="" value="" notes=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --name) name="$2"; shift 2 ;;
+          --value) value="$2"; shift 2 ;;
+          --notes) notes="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+      [[ -n "$name" ]] || die "Missing --name"
+      [[ -n "$value" ]] || die "Missing --value"
+
+      sqlite3 "$DB_PATH" "INSERT INTO metrics (name, value, notes) VALUES ('$(echo "$name" | sed "s/'/''/g")', $value, '$(echo "$notes" | sed "s/'/''/g")');"
+      info "✓ Recorded: $name = $value"
+      ;;
+
+    latest)
+      echo "Latest metrics (most recent value per metric):"
+      sqlite3 -header -column "$DB_PATH" "SELECT m.name, m.value, m.recorded_at, m.notes FROM metrics m INNER JOIN (SELECT name, MAX(id) as max_id FROM metrics GROUP BY name) latest ON m.id = latest.max_id ORDER BY m.name;"
+      ;;
+
+    history)
+      local name="${1:-}"
+      [[ -n "$name" ]] || die "Usage: biz-ops metric history <name>"
+      sqlite3 -header -column "$DB_PATH" "SELECT value, recorded_at, notes FROM metrics WHERE name='$name' ORDER BY recorded_at DESC LIMIT 30;"
+      ;;
+
+    stale)
+      local days="${1:-7}"
+      info "Metrics not updated in $days+ days (potential stale marks):"
+      sqlite3 -header -column "$DB_PATH" "SELECT m.name, m.value, m.recorded_at, CAST(julianday('now') - julianday(m.recorded_at) AS INTEGER) as days_old FROM metrics m INNER JOIN (SELECT name, MAX(id) as max_id FROM metrics GROUP BY name) latest ON m.id = latest.max_id WHERE julianday('now') - julianday(m.recorded_at) > $days ORDER BY days_old DESC;"
+      ;;
+
+    *)
+      echo "Usage: biz-ops metric <record|latest|history|stale>"
+      echo ""
+      echo "  record --name NAME --value VALUE [--notes NOTES]"
+      echo "  latest"
+      echo "  history <name>"
+      echo "  stale [days]  — find metrics not updated in N+ days"
+      ;;
+  esac
+}
+
+# ── STATUS (Dashboard) ───────────────────────────────────────────────────────
+cmd_status() {
+  ensure_db
+  echo "══════════════════════════════════════"
+  echo "  biz-ops dashboard  v$VERSION"
+  echo "══════════════════════════════════════"
+  echo ""
+
+  # Customers
+  local active churned mrr
+  active=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM customers WHERE status='active';")
+  churned=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM customers WHERE status='churned';")
+  mrr=$(sqlite3 "$DB_PATH" "SELECT COALESCE(SUM(monthly_rate), 0) FROM customers WHERE status='active';")
+  echo "📊 Customers"
+  echo "   Active: $active | Churned: $churned | MRR: \$$mrr"
+  echo ""
+
+  # Pending gates
+  local pending_gates
+  pending_gates=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM gates WHERE status='pending';")
+  if [[ "$pending_gates" -gt 0 ]]; then
+    echo "🚧 PENDING GATES: $pending_gates (require human approval!)"
+    sqlite3 "$DB_PATH" "SELECT '   #' || id || ' [' || severity || '] ' || description FROM gates WHERE status='pending';"
+    echo ""
+  else
+    echo "🚧 Gates: None pending"
+    echo ""
+  fi
+
+  # Deliveries
+  local pending_del sent_del failed_del
+  pending_del=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM deliveries WHERE status='pending';")
+  sent_del=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM deliveries WHERE status='sent';")
+  failed_del=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM deliveries WHERE status='failed';")
+  echo "📦 Deliveries"
+  echo "   Pending: $pending_del | Sent: $sent_del | Failed: $failed_del"
+  echo ""
+
+  # Recent audit
+  echo "📋 Recent Audit (last 5):"
+  sqlite3 "$DB_PATH" "SELECT '   [' || category || '] ' || action || ' — ' || substr(reasoning, 1, 50) FROM audit_log ORDER BY ts DESC LIMIT 5;"
+  echo ""
+
+  # Stale metrics check
+  local stale_count
+  stale_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM (SELECT name, MAX(id) as max_id FROM metrics GROUP BY name) latest INNER JOIN metrics m ON m.id = latest.max_id WHERE julianday('now') - julianday(m.recorded_at) > 7;")
+  if [[ "$stale_count" -gt 0 ]]; then
+    echo "⚠ Stale metrics: $stale_count metric(s) not updated in 7+ days"
+  fi
+}
+
+# ── REPORT ────────────────────────────────────────────────────────────────────
+cmd_report() {
+  ensure_db
+  local period="${1:-daily}"
+  local days=1
+  case "$period" in
+    daily) days=1 ;;
+    weekly) days=7 ;;
+    monthly) days=30 ;;
+    all) days=9999 ;;
+    *) die "Unknown period: $period (use daily|weekly|monthly|all)" ;;
+  esac
+
+  echo "═══════════════════════════════════════"
+  echo "  Business Report — ${period^} (last ${days}d)"
+  echo "═══════════════════════════════════════"
+  echo ""
+
+  # Revenue summary
+  local mrr
+  mrr=$(sqlite3 "$DB_PATH" "SELECT COALESCE(SUM(monthly_rate), 0) FROM customers WHERE status='active';")
+  echo "💰 Revenue: MRR \$$mrr"
+  echo ""
+
+  # Customer changes
+  echo "👥 Customer Activity:"
+  sqlite3 "$DB_PATH" "SELECT '   + ' || name || ' (' || email || ') — ' || plan FROM customers WHERE julianday('now') - julianday(created_at) <= $days;"
+  local new_count
+  new_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM customers WHERE julianday('now') - julianday(created_at) <= $days;")
+  echo "   New: $new_count"
+  echo ""
+
+  # Deliveries
+  echo "📦 Deliveries:"
+  local sent failed
+  sent=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM deliveries WHERE status IN ('sent','confirmed') AND julianday('now') - julianday(delivered_at) <= $days;")
+  failed=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM deliveries WHERE status='failed' AND julianday('now') - julianday(COALESCE(delivered_at, scheduled_at)) <= $days;")
+  echo "   Sent: $sent | Failed: $failed"
+  if [[ "$failed" -gt 0 ]]; then
+    echo "   ⚠ Failed deliveries:"
+    sqlite3 "$DB_PATH" "SELECT '     #' || d.id || ' → ' || c.name || ' (' || d.type || ')' FROM deliveries d JOIN customers c ON d.customer_id=c.id WHERE d.status='failed' AND julianday('now') - julianday(COALESCE(d.delivered_at, d.scheduled_at)) <= $days;"
+  fi
+  echo ""
+
+  # Gates resolved
+  echo "🚧 Gates:"
+  local approved rejected pending
+  approved=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM gates WHERE status='approved' AND julianday('now') - julianday(resolved_at) <= $days;")
+  rejected=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM gates WHERE status='rejected' AND julianday('now') - julianday(resolved_at) <= $days;")
+  pending=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM gates WHERE status='pending';")
+  echo "   Approved: $approved | Rejected: $rejected | Still Pending: $pending"
+  echo ""
+
+  # Decisions
+  echo "📋 Key Decisions:"
+  sqlite3 "$DB_PATH" "SELECT '   [' || ts || '] ' || action || ': ' || substr(reasoning, 1, 70) FROM audit_log WHERE category='decision' AND julianday('now') - julianday(ts) <= $days ORDER BY ts DESC LIMIT 10;"
+  echo ""
+
+  # Non-actions
+  local na_count
+  na_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM audit_log WHERE category='non-action' AND julianday('now') - julianday(ts) <= $days;")
+  if [[ "$na_count" -gt 0 ]]; then
+    echo "⏸ Non-Actions (deliberate inactions):"
+    sqlite3 "$DB_PATH" "SELECT '   ' || action || ': ' || substr(reasoning, 1, 70) FROM audit_log WHERE category='non-action' AND julianday('now') - julianday(ts) <= $days ORDER BY ts DESC LIMIT 10;"
+  fi
+}
+
+# ── WORKFLOW ──────────────────────────────────────────────────────────────────
+cmd_workflow() {
+  ensure_db
+  local subcmd="${1:-help}"
+  shift || true
+
+  case "$subcmd" in
+    run)
+      # Execute a named workflow file
+      local wf_file="${1:-}"
+      [[ -n "$wf_file" ]] || die "Usage: biz-ops workflow run <workflow.sh>"
+      [[ -f "$wf_file" ]] || die "Workflow file not found: $wf_file"
+
+      info "Running workflow: $wf_file"
+      sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning) VALUES ('system', 'workflow_started', 'Running workflow: $wf_file');"
+
+      # Source the workflow (it should use biz-ops commands internally)
+      bash "$wf_file"
+      local rc=$?
+
+      if [[ $rc -eq 0 ]]; then
+        sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning, outcome) VALUES ('system', 'workflow_completed', 'Workflow $wf_file completed successfully', 'success');"
+        info "✓ Workflow completed successfully"
+      else
+        sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning, outcome) VALUES ('system', 'workflow_failed', 'Workflow $wf_file failed with exit code $rc', 'failed');"
+        warn "Workflow failed (exit code $rc)"
+      fi
+      return $rc
+      ;;
+
+    *)
+      echo "Usage: biz-ops workflow <run>"
+      echo ""
+      echo "  run <workflow.sh>  — Execute a workflow file"
+      echo ""
+      echo "Workflow files should use biz-ops commands internally."
+      echo "See projects/business/workflows/ for templates."
+      ;;
+  esac
+}
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    init)     cmd_init "$@" ;;
+    customer) cmd_customer "$@" ;;
+    audit)    cmd_audit "$@" ;;
+    deliver)  cmd_deliver "$@" ;;
+    gate)     cmd_gate "$@" ;;
+    metric)   cmd_metric "$@" ;;
+    status)   cmd_status "$@" ;;
+    report)   cmd_report "$@" ;;
+    workflow) cmd_workflow "$@" ;;
+    version)  echo "biz-ops v$VERSION" ;;
+    help|*)
+      cat <<'HELP'
+biz-ops — Business operations toolkit for agent-operated business
+
+Usage: biz-ops <command> [subcommand] [options]
+
+Commands:
+  init                    Initialize the database
+  customer <sub>          Manage customers (add|list|get|update)
+  audit <sub>             Decision audit trail (log|list|search|non-actions)
+  deliver <sub>           Delivery tracking (log|mark|list)
+  gate <sub>              Human-in-loop gates (create|resolve|list|pending)
+  metric <sub>            Business metrics (record|latest|history|stale)
+  status                  Dashboard overview
+  report [period]         Generate report (daily|weekly|monthly|all)
+  workflow run <file>     Execute a workflow
+  version                 Show version
+  help                    Show this help
+
+Design principles:
+  • Every decision is audited (including non-decisions)
+  • Irreversible actions require human approval (gates)
+  • Stale metrics are flagged automatically
+  • Error cascades prevented by checkpoint validation
+HELP
+      ;;
+  esac
+}
+
+main "$@"
