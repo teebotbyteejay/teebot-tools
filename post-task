@@ -47,10 +47,34 @@ C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_CYAN='\033[36m'; C_YE
 criteria_eval_output=""
 criteria_scores=""
 if [[ -f "$PRETASK_FILE" ]] && [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  # Task-match check: only use criteria if they were generated for THIS task (or a close variant)
+  pretask_task=$(jq -r '.task // ""' "$PRETASK_FILE" 2>/dev/null)
+  task_match=true
+  if [[ -n "$pretask_task" && -n "$TASK" ]]; then
+    # Quick heuristic: first 30 chars of both tasks should share significant overlap
+    t1=$(echo "${TASK:0:50}" | tr '[:upper:]' '[:lower:]')
+    t2=$(echo "${pretask_task:0:50}" | tr '[:upper:]' '[:lower:]')
+    if [[ "$t1" != "$t2" ]]; then
+      # Check word overlap: at least 40% of words should match
+      words1=$(echo "$t1" | tr -cs '[:alpha:]' '\n' | sort -u | grep -cE '.{3,}' || echo 0)
+      common=$(comm -12 <(echo "$t1" | tr -cs '[:alpha:]' '\n' | sort -u) <(echo "$t2" | tr -cs '[:alpha:]' '\n' | sort -u) | grep -cE '.{3,}' || echo 0)
+      if [[ "$words1" -gt 0 ]]; then
+        overlap_pct=$((common * 100 / words1))
+        if [[ "$overlap_pct" -lt 40 ]]; then
+          task_match=false
+          echo -e "${C_YELLOW}⚠${C_RESET} Pre-committed criteria skipped: task mismatch"
+          echo -e "  ${C_DIM}Pre-task was for: ${pretask_task:0:60}...${C_RESET}"
+          echo -e "  ${C_DIM}This task: ${TASK:0:60}...${C_RESET}"
+          echo ""
+        fi
+      fi
+    fi
+  fi
+  
   stored_criteria=$(jq -c '.eval_criteria // {}' "$PRETASK_FILE" 2>/dev/null)
   criteria_count=$(echo "$stored_criteria" | jq '.criteria // [] | length' 2>/dev/null || echo "0")
   
-  if [[ "$criteria_count" -gt 0 && "$criteria_count" != "null" ]]; then
+  if $task_match && [[ "$criteria_count" -gt 0 && "$criteria_count" != "null" ]]; then
     echo -e "${C_CYAN}${C_BOLD}Pre-committed Criteria Evaluation${C_RESET} ($criteria_count criteria locked at pre-task time)"
     echo ""
     

@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# eval-diversity — Measure output diversity across multi-agent or multi-session outputs
+# Evaluation Stack Level 2: Structural diversity measurement (detection-first)
+# v1.0.0 — 2026-03-20
+#
+# This tool measures embedding cosine distance between outputs. It doesn't judge
+# quality — it detects MONOCULTURE. If outputs are too similar regardless of
+# apparent quality, that's a structural red flag.
+#
+# Source: Evaluation Stack research (March 20, 2026)
+# - Sourati et al. 2026: LLMs homogenize not just outputs but evaluation criteria
+# - Cornelius-Trinity: Detection-first > storage-first
+# - Starfish: "The variance is where the breakthroughs were"
+#
+# Usage:
+#   eval-diversity "output1.txt" "output2.txt" ["output3.txt" ...]
+#   echo "text1" | eval-diversity --stdin "text2"
+#   eval-diversity --texts "response A" "response B" "response C"
+#   eval-diversity --dir outputs/         # all .txt/.md files in directory
+#   eval-diversity --history 5            # compare last 5 post-task outcomes
+#
+# Output: pairwise distances, mean distance, monoculture flag
+set -euo pipefail
+
+VERSION="1.0.0"
+WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
+
+# Monoculture threshold: below this mean distance, flag as monoculture risk
+# Calibration: typical same-model same-prompt outputs have cosine ~0.85-0.95 similarity
+# → distance 0.05-0.15. Diverse outputs: distance 0.3-0.7.
+# Threshold set at 0.20 (moderately conservative)
+MONOCULTURE_THRESHOLD="${MONOCULTURE_THRESHOLD:-0.20}"
+
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'; C_DIM='\033[2m'; C_CYAN='\033[36m'
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Get embedding from OpenAI
+get_embedding() {
+  local text="$1"
+  # Truncate to 8000 chars (token limit safety)
+  text="${text:0:8000}"
+  
+  local response
+  response=$(curl -s --max-time 20 "https://api.openai.com/v1/embeddings" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -d "$(jq -n --arg text "$text" '{
+      model: "text-embedding-3-small",
+      input: $text
+    }')" 2>/dev/null)
+  
+  echo "$response" | jq -r '.data[0].embedding // empty' 2>/dev/null
+}
+
+# Compute cosine distance between two embedding JSON arrays
+cosine_distance() {
+  local emb1="$1"
+  local emb2="$2"
+  
+  local tmp1 tmp2
+  tmp1=$(mktemp)
+  tmp2=$(mktemp)
+  echo "$emb1" > "$tmp1"
+  echo "$emb2" > "$tmp2"
+  
+  python3 -c "
+import json, math, sys
+with open('$tmp1') as f: a = json.load(f)
+with open('$tmp2') as f: b = json.load(f)
+dot = sum(x*y for x,y in zip(a,b))
+na = math.sqrt(sum(x*x for x in a))
+nb = math.sqrt(sum(x*x for x in b))
+sim = dot / (na * nb) if na > 0 and nb > 0 else 0
+print(f'{1 - sim:.4f}')
+" 2>/dev/null
+  local result=$?
+  rm -f "$tmp1" "$tmp2"
+  return $result
+}
+
+# Main
+main() {
+  [[ -n "${OPENAI_API_KEY:-}" ]] || die "OPENAI_API_KEY required"
+  
+  local mode="files"
+  local texts=()
+  local labels=()
+  local files=()
+  local history_count=0
+  
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --texts)
+        mode="texts"
+        shift
+        while [[ $# -gt 0 && ! "$1" == --* ]]; do
+          texts+=("$1")
+          labels+=("text_${#texts[@]}")
+          shift
+        done
+        ;;
+      --dir)
+        mode="dir"
+        local dir="$2"
+        shift 2
+        [[ -d "$dir" ]] || die "Directory not found: $dir"
+        for f in "$dir"/*.{txt,md}; do
+          [[ -f "$f" ]] || continue
+          files+=("$f")
+          labels+=("$(basename "$f")")
+        done
+        ;;
+      --history)
+        mode="history"
+        history_count="${2:-5}"
+        shift 2
+        ;;
+      --threshold)
+        MONOCULTURE_THRESHOLD="$2"
+        shift 2
+        ;;
+      --version) echo "eval-diversity v$VERSION"; exit 0 ;;
+      --help|-h)
+        cat <<'HELP'
+eval-diversity — Measure output diversity (Evaluation Stack Level 2)
+
+Usage:
+  eval-diversity file1.txt file2.txt [file3.txt ...]    # compare files
+  eval-diversity --texts "response A" "response B"       # compare text strings
+  eval-diversity --dir outputs/                          # compare all files in directory
+  eval-diversity --history 5                             # compare last 5 post-task outcomes
+  eval-diversity --threshold 0.25                        # custom monoculture threshold
+
+Options:
+  --threshold N    Monoculture threshold (default: 0.20). Below this = monoculture risk.
+  --version        Show version
+  --help           Show this help
+
+What it measures:
+  Cosine distance between output embeddings. Distance 0 = identical, 1 = orthogonal.
+  Does NOT judge quality — only structural independence of outputs.
+  Monoculture = outputs are suspiciously similar regardless of apparent quality.
+HELP
+        exit 0
+        ;;
+      *)
+        if [[ -f "$1" ]]; then
+          files+=("$1")
+          labels+=("$(basename "$1")")
+        else
+          die "Not a file or option: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  
+  # Load text from files
+  if [[ "$mode" == "files" || "$mode" == "dir" ]]; then
+    for f in "${files[@]}"; do
+      texts+=("$(cat "$f")")
+    done
+  fi
+  
+  # Load from history
+  if [[ "$mode" == "history" ]]; then
+    echo -e "${C_CYAN}${C_BOLD}Loading last $history_count post-task outcomes...${C_RESET}"
+    local eval_files
+    eval_files=$(ls -t "$WORKSPACE/memory/reflexion-evals/"*.json 2>/dev/null | head -"$history_count")
+    
+    for ef in $eval_files; do
+      local outcome
+      outcome=$(jq -r '.outcome // .evaluation.outcome // ""' "$ef" 2>/dev/null)
+      local task
+      task=$(jq -r '.task // ""' "$ef" 2>/dev/null)
+      if [[ -n "$outcome" && "$outcome" != "null" ]]; then
+        texts+=("$outcome")
+        labels+=("$(basename "$ef" .json | cut -c1-12)")
+      elif [[ -n "$task" ]]; then
+        texts+=("$task")
+        labels+=("$(basename "$ef" .json | cut -c1-12)")
+      fi
+    done
+  fi
+  
+  local n=${#texts[@]}
+  [[ $n -ge 2 ]] || die "Need at least 2 texts to compare (got $n)"
+  
+  echo -e "${C_CYAN}${C_BOLD}Diversity Measurement${C_RESET} ($n outputs)"
+  echo ""
+  
+  # Get embeddings
+  local embeddings=()
+  for i in "${!texts[@]}"; do
+    echo -ne "  ${C_DIM}Embedding ${labels[$i]}...${C_RESET}\r"
+    local emb
+    emb=$(get_embedding "${texts[$i]}")
+    if [[ -z "$emb" ]]; then
+      die "Failed to get embedding for ${labels[$i]}"
+    fi
+    embeddings+=("$emb")
+  done
+  echo -e "  ${C_GREEN}✓${C_RESET} All $n embeddings computed"
+  echo ""
+  
+  # Compute pairwise distances
+  local distances=()
+  local sum_dist=0
+  local pair_count=0
+  
+  echo "  Pairwise distances:"
+  for ((i=0; i<n; i++)); do
+    for ((j=i+1; j<n; j++)); do
+      local dist
+      dist=$(cosine_distance "${embeddings[$i]}" "${embeddings[$j]}")
+      distances+=("$dist")
+      sum_dist=$(python3 -c "print($sum_dist + $dist)" 2>/dev/null)
+      pair_count=$((pair_count + 1))
+      
+      # Color based on distance
+      local color="$C_RED"
+      if (( $(echo "$dist > $MONOCULTURE_THRESHOLD" | bc -l 2>/dev/null || echo 0) )); then
+        color="$C_GREEN"
+      elif (( $(echo "$dist > $MONOCULTURE_THRESHOLD * 0.75" | bc -l 2>/dev/null || echo 0) )); then
+        color="$C_YELLOW"
+      fi
+      
+      echo -e "    ${labels[$i]} ↔ ${labels[$j]}: ${color}${dist}${C_RESET}"
+    done
+  done
+  
+  # Compute mean
+  local mean_dist
+  mean_dist=$(python3 -c "print(f'{$sum_dist / $pair_count:.4f}')" 2>/dev/null)
+  
+  # Find min/max
+  local min_dist max_dist
+  min_dist=$(printf '%s\n' "${distances[@]}" | sort -n | head -1)
+  max_dist=$(printf '%s\n' "${distances[@]}" | sort -n | tail -1)
+  
+  echo ""
+  echo -e "  ${C_BOLD}Mean distance: $mean_dist${C_RESET}"
+  echo -e "  ${C_DIM}Min: $min_dist | Max: $max_dist | Pairs: $pair_count${C_RESET}"
+  echo -e "  ${C_DIM}Threshold: $MONOCULTURE_THRESHOLD${C_RESET}"
+  echo ""
+  
+  # Monoculture check
+  if (( $(echo "$mean_dist < $MONOCULTURE_THRESHOLD" | bc -l 2>/dev/null || echo 0) )); then
+    echo -e "  ${C_RED}${C_BOLD}⚠ MONOCULTURE RISK${C_RESET}"
+    echo -e "  ${C_RED}Mean distance ($mean_dist) is below threshold ($MONOCULTURE_THRESHOLD).${C_RESET}"
+    echo -e "  ${C_RED}Outputs are suspiciously similar — may indicate substrate homogeneity.${C_RESET}"
+    echo -e "  ${C_DIM}Consider: different model, different framing, external perspective.${C_RESET}"
+    echo ""
+    echo "MONOCULTURE_RISK=true"
+    return 1
+  else
+    echo -e "  ${C_GREEN}✓ Diversity check passed${C_RESET} (mean $mean_dist > threshold $MONOCULTURE_THRESHOLD)"
+    echo ""
+    echo "MONOCULTURE_RISK=false"
+    return 0
+  fi
+}
+
+main "$@"
