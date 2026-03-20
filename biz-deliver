@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+# biz-deliver — Send a report to subscribers via email, track in biz-ops
+# Handles: markdown→HTML conversion, email sending via gog, delivery logging, error handling
+# v1.0.0 — 2026-03-20
+#
+# Usage:
+#   biz-deliver --file report.md --subject "Weekly AI Intel" [--customer-id 1] [--dry-run]
+#   biz-deliver --file report.md --subject "Report" --all   # send to all active subscribers
+#   biz-deliver --test                                       # send test to self
+set -euo pipefail
+
+VERSION="1.0.0"
+BIZ_OPS="${BIZ_OPS:-biz-ops}"
+DB_PATH="$HOME/.openclaw/workspace/projects/business/biz-ops.db"
+TEMPLATE_DIR="$HOME/.openclaw/workspace/projects/business/templates"
+FROM_NAME="teebot research"
+FROM_EMAIL="teebot.by.teejay@gmail.com"
+
+# gog env
+export GOG_KEYRING_PASSWORD="${GOG_KEYRING_PASSWORD:-teebot}"
+export GOG_ACCOUNT="${GOG_ACCOUNT:-teebot.by.teejay@gmail.com}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "→ $*"; }
+warn() { echo "⚠ $*" >&2; }
+
+# ── Markdown to HTML ──────────────────────────────────────────────────────────
+md_to_html() {
+  local md_file="$1"
+  local title="${2:-Report}"
+
+  # Read the markdown content
+  local md_content
+  md_content=$(cat "$md_file")
+
+  # Convert markdown to HTML using simple sed/awk transformations
+  # This is intentionally basic — no external dependencies
+  local html_body
+  html_body=$(echo "$md_content" | awk '
+    BEGIN { in_list = 0; in_code = 0; in_para = 0 }
+
+    # Code blocks
+    /^```/ {
+      if (in_code) { print "</pre></code>"; in_code = 0 }
+      else { print "<code><pre>"; in_code = 1 }
+      next
+    }
+    in_code { print; next }
+
+    # Headers
+    /^#### / { gsub(/^#### /, ""); print "<h4>" $0 "</h4>"; next }
+    /^### /  { gsub(/^### /, "");  print "<h3>" $0 "</h3>"; next }
+    /^## /   { gsub(/^## /, "");   print "<h2>" $0 "</h2>"; next }
+    /^# /    { gsub(/^# /, "");    print "<h1>" $0 "</h1>"; next }
+
+    # Horizontal rules
+    /^---+$/ { print "<hr>"; next }
+
+    # Unordered list items
+    /^[*-] / {
+      if (!in_list) { print "<ul>"; in_list = 1 }
+      gsub(/^[*-] /, "")
+      print "<li>" $0 "</li>"
+      next
+    }
+
+    # End list on non-list line
+    in_list && !/^[*-] / && !/^$/ {
+      print "</ul>"; in_list = 0
+    }
+    in_list && /^$/ {
+      print "</ul>"; in_list = 0
+      next
+    }
+
+    # Empty lines
+    /^$/ {
+      if (in_para) { print "</p>"; in_para = 0 }
+      next
+    }
+
+    # Regular text → paragraphs
+    {
+      if (!in_para) { printf "<p>"; in_para = 1 }
+      else { printf "<br>" }
+      # Inline formatting
+      line = $0
+      # Bold
+      while (match(line, /\*\*[^*]+\*\*/)) {
+        pre = substr(line, 1, RSTART-1)
+        bold = substr(line, RSTART+2, RLENGTH-4)
+        line = pre "<strong>" bold "</strong>" substr(line, RSTART+RLENGTH)
+      }
+      # Italic
+      while (match(line, /\*[^*]+\*/)) {
+        pre = substr(line, 1, RSTART-1)
+        ital = substr(line, RSTART+1, RLENGTH-2)
+        line = pre "<em>" ital "</em>" substr(line, RSTART+RLENGTH)
+      }
+      # Links
+      while (match(line, /\[[^\]]+\]\([^)]+\)/)) {
+        pre = substr(line, 1, RSTART-1)
+        rest = substr(line, RSTART)
+        match(rest, /\[([^\]]+)\]\(([^)]+)\)/)
+        text_part = substr(rest, 2)
+        match(text_part, /\]/)
+        link_text = substr(text_part, 1, RSTART-1)
+        url_part = substr(rest, RSTART+1)
+        match(url_part, /\(([^)]+)\)/)
+        url = substr(url_part, RSTART+1, RLENGTH-2)
+        line = pre "<a href=\"" url "\">" link_text "</a>" substr(url_part, RSTART+RLENGTH)
+      }
+      print line
+    }
+
+    END {
+      if (in_list) print "</ul>"
+      if (in_para) print "</p>"
+    }
+  ')
+
+  # Wrap in email template
+  cat <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${title}</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    line-height: 1.6;
+    color: #1a1a1a;
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 20px;
+    background: #f5f5f5;
+  }
+  .container {
+    background: #ffffff;
+    border-radius: 8px;
+    padding: 32px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  }
+  h1 { color: #111; font-size: 24px; margin-top: 0; border-bottom: 2px solid #eee; padding-bottom: 12px; }
+  h2 { color: #333; font-size: 20px; margin-top: 28px; }
+  h3 { color: #555; font-size: 16px; margin-top: 20px; }
+  p { margin: 12px 0; }
+  a { color: #2563eb; }
+  code { background: #f3f4f6; padding: 2px 6px; border-radius: 3px; font-size: 14px; }
+  pre { background: #f3f4f6; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 13px; }
+  ul, ol { padding-left: 24px; }
+  li { margin: 6px 0; }
+  hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
+  blockquote { border-left: 3px solid #d1d5db; margin: 16px 0; padding: 8px 16px; color: #4b5563; }
+  strong { color: #111; }
+  .footer {
+    margin-top: 32px;
+    padding-top: 16px;
+    border-top: 1px solid #e5e7eb;
+    font-size: 13px;
+    color: #6b7280;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+${html_body}
+<div class="footer">
+  Delivered by teebot research · <a href="mailto:${FROM_EMAIL}">Reply to this email</a> to give feedback or unsubscribe.
+</div>
+</div>
+</body>
+</html>
+EOF
+}
+
+# ── Send email ────────────────────────────────────────────────────────────────
+send_email() {
+  local to="$1"
+  local subject="$2"
+  local html_body="$3"
+  local plain_body="$4"
+  local dry_run="${5:-false}"
+  local attach="${6:-}"
+
+  local args=(
+    --to "$to"
+    --subject "$subject"
+    --body "$plain_body"
+    --body-html "$html_body"
+    --force
+    --no-input
+  )
+
+  if [[ -n "$attach" ]]; then
+    args+=(--attach "$attach")
+  fi
+
+  if [[ "$dry_run" == "true" ]]; then
+    args+=(--dry-run)
+  fi
+
+  gog send "${args[@]}" 2>&1
+}
+
+# ── Main logic ────────────────────────────────────────────────────────────────
+main() {
+  local file="" subject="" customer_id="" send_all=false dry_run=false test_mode=false
+  local extra_note=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file)        file="$2"; shift 2 ;;
+      --subject)     subject="$2"; shift 2 ;;
+      --customer-id) customer_id="$2"; shift 2 ;;
+      --all)         send_all=true; shift ;;
+      --dry-run)     dry_run=true; shift ;;
+      --test)        test_mode=true; shift ;;
+      --note)        extra_note="$2"; shift 2 ;;
+      --version)     echo "biz-deliver v$VERSION"; exit 0 ;;
+      --help|-h)
+        cat <<'HELP'
+biz-deliver — Send reports to subscribers via email
+
+Usage:
+  biz-deliver --file report.md --subject "Title" --all          # all active subscribers
+  biz-deliver --file report.md --subject "Title" --customer-id 3 # specific customer
+  biz-deliver --test                                             # test email to self
+  biz-deliver --file report.md --subject "Title" --all --dry-run # preview without sending
+
+Options:
+  --file FILE         Markdown report file to send
+  --subject SUBJECT   Email subject line
+  --customer-id ID    Send to specific customer
+  --all               Send to all active subscribers
+  --dry-run           Preview without actually sending
+  --test              Send a test email to self
+  --note TEXT         Optional note logged with delivery
+  --version           Show version
+  --help              Show this help
+HELP
+        exit 0
+        ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  # ── Test mode ──
+  if [[ "$test_mode" == "true" ]]; then
+    info "Sending test email to self ($FROM_EMAIL)..."
+
+    local test_md
+    test_md=$(mktemp /tmp/biz-deliver-test-XXXXXX.md)
+    cat > "$test_md" <<'TESTMD'
+# biz-ops Pipeline Test
+
+This is a test email from the **biz-deliver** tool.
+
+## What this verifies
+
+- Markdown → HTML conversion works
+- `gog send` integration works
+- Email deliverability from teebot.by.teejay@gmail.com
+
+## Details
+
+- **Sent at**: $(date)
+- **Tool version**: biz-deliver v1.0.0
+- **Pipeline**: research-deliver.sh → biz-deliver → gog send
+
+---
+
+If you received this, the pipeline is operational. 🐣
+TESTMD
+
+    # Replace date placeholder
+    sed -i "s/\$(date)/$(date)/" "$test_md"
+
+    local html
+    html=$(md_to_html "$test_md" "Pipeline Test")
+    local plain
+    plain=$(cat "$test_md")
+
+    local result
+    result=$(send_email "$FROM_EMAIL" "[TEST] biz-ops Pipeline Verification" "$html" "$plain" "$dry_run")
+    echo "$result"
+
+    rm -f "$test_md"
+
+    if [[ "$dry_run" == "true" ]]; then
+      info "Dry run complete."
+    else
+      info "✓ Test email sent to $FROM_EMAIL"
+    fi
+    return 0
+  fi
+
+  # ── Production mode ──
+  [[ -n "$file" ]] || die "Missing --file. Use --help for usage."
+  [[ -f "$file" ]] || die "File not found: $file"
+  [[ -n "$subject" ]] || die "Missing --subject. Use --help for usage."
+  [[ "$send_all" == "true" || -n "$customer_id" ]] || die "Specify --all or --customer-id"
+
+  # Ensure biz-ops DB exists
+  [[ -f "$DB_PATH" ]] || die "biz-ops database not found. Run: biz-ops init"
+
+  # Convert to HTML
+  info "Converting report to HTML..."
+  local html_body
+  html_body=$(md_to_html "$file" "$subject")
+  local plain_body
+  plain_body=$(cat "$file")
+
+  # Get word count for validation
+  local word_count
+  word_count=$(wc -w < "$file")
+  info "Report: $word_count words"
+
+  # Collect recipients
+  local recipients=""
+  if [[ "$send_all" == "true" ]]; then
+    recipients=$(sqlite3 "$DB_PATH" "SELECT id || '|' || name || '|' || email FROM customers WHERE status='active';")
+  elif [[ -n "$customer_id" ]]; then
+    recipients=$(sqlite3 "$DB_PATH" "SELECT id || '|' || name || '|' || email FROM customers WHERE id=$customer_id AND status='active';")
+    [[ -n "$recipients" ]] || die "Customer #$customer_id not found or not active"
+  fi
+
+  if [[ -z "$recipients" ]]; then
+    warn "No active subscribers found."
+    $BIZ_OPS audit log \
+      --category non-action \
+      --action "delivery_skipped" \
+      --reasoning "No active subscribers for: $subject" 2>/dev/null || true
+    exit 0
+  fi
+
+  local sent=0 failed=0 total=0
+
+  while IFS='|' read -r cid cname cemail; do
+    ((total++)) || true
+    info "[$total] Sending to: $cname ($cemail)..."
+
+    # Log delivery in biz-ops
+    $BIZ_OPS deliver log \
+      --customer "$cid" \
+      --type email \
+      --content "$file" \
+      --notes "${subject}${extra_note:+ — $extra_note}" 2>/dev/null || true
+
+    # Get the delivery ID we just created
+    local did
+    did=$(sqlite3 "$DB_PATH" "SELECT MAX(id) FROM deliveries WHERE customer_id=$cid;")
+
+    # Send the email
+    local send_result
+    if send_result=$(send_email "$cemail" "$subject" "$html_body" "$plain_body" "$dry_run" 2>&1); then
+      if [[ "$dry_run" != "true" ]]; then
+        $BIZ_OPS deliver mark "$did" sent 2>/dev/null || true
+        info "  ✓ Sent to $cname"
+      else
+        info "  [DRY RUN] Would send to $cname ($cemail)"
+      fi
+      ((sent++)) || true
+    else
+      $BIZ_OPS deliver mark "$did" failed 2>/dev/null || true
+      warn "  ✗ Failed for $cname: $send_result"
+      ((failed++)) || true
+
+      # Audit the failure
+      $BIZ_OPS audit log \
+        --category delivery \
+        --action "email_send_failed" \
+        --reasoning "Failed to send '$subject' to $cname ($cemail): $send_result" 2>/dev/null || true
+    fi
+  done <<< "$recipients"
+
+  # Record metrics
+  if [[ "$dry_run" != "true" ]]; then
+    local today
+    today=$(date +%Y-%m-%d)
+    $BIZ_OPS metric record --name "emails_sent" --value "$sent" \
+      --notes "$subject ($today)" 2>/dev/null || true
+    $BIZ_OPS metric record --name "emails_failed" --value "$failed" \
+      --notes "$subject ($today)" 2>/dev/null || true
+
+    $BIZ_OPS audit log \
+      --category delivery \
+      --action "batch_delivery_completed" \
+      --reasoning "Sent '$subject': $sent/$total succeeded, $failed failed. File: $file" 2>/dev/null || true
+  fi
+
+  echo ""
+  echo "══════════════════════════════════════"
+  if [[ "$dry_run" == "true" ]]; then
+    echo "  DRY RUN complete"
+  else
+    echo "  ✓ Delivery complete"
+  fi
+  echo "  Sent: $sent | Failed: $failed | Total: $total"
+  echo "══════════════════════════════════════"
+
+  # Return failure if any sends failed
+  [[ "$failed" -eq 0 ]]
+}
+
+main "$@"

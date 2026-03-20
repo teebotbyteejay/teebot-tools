@@ -91,6 +91,19 @@ CREATE TABLE IF NOT EXISTS metrics (
   notes TEXT DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS rejections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (datetime('now')),
+  context TEXT NOT NULL,
+  rejected_option TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  chosen_instead TEXT DEFAULT '',
+  confidence REAL DEFAULT 0.8 CHECK(confidence >= 0 AND confidence <= 1),
+  category TEXT DEFAULT 'decision' CHECK(category IN ('decision','feature','customer','strategy','tool','other')),
+  revisit_date TEXT DEFAULT '',
+  audit_log_id INTEGER REFERENCES audit_log(id)
+);
+
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_category ON audit_log(category);
@@ -98,6 +111,8 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_customer ON deliveries(customer_id);
 CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
 CREATE INDEX IF NOT EXISTS idx_gates_status ON gates(status);
 CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(name);
+CREATE INDEX IF NOT EXISTS idx_rejections_ts ON rejections(ts);
+CREATE INDEX IF NOT EXISTS idx_rejections_category ON rejections(category);
 SQL
 
   info "✓ Initialized biz-ops database at $DB_PATH"
@@ -637,6 +652,117 @@ cmd_workflow() {
   esac
 }
 
+# ── REJECT (Negative space logging) ──────────────────────────────────────────
+# Research shows rejection-to-action ratio of 3.2x — negative space has more signal.
+# This makes it trivially easy to log what we DIDN'T do and why.
+cmd_reject() {
+  ensure_db
+  local subcmd="${1:-help}"
+  shift || true
+
+  case "$subcmd" in
+    log)
+      local context="" option="" reason="" chosen="" confidence="0.8" category="decision" revisit=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --context)  context="$2"; shift 2 ;;
+          --option)   option="$2"; shift 2 ;;
+          --reason)   reason="$2"; shift 2 ;;
+          --chosen)   chosen="$2"; shift 2 ;;
+          --confidence) confidence="$2"; shift 2 ;;
+          --category) category="$2"; shift 2 ;;
+          --revisit)  revisit="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+      [[ -n "$context" ]] || die "Missing --context (what situation prompted this decision)"
+      [[ -n "$option" ]] || die "Missing --option (what was rejected)"
+      [[ -n "$reason" ]] || die "Missing --reason (why it was rejected)"
+
+      # Create audit entry
+      local aid
+      aid=$(sqlite3 "$DB_PATH" "INSERT INTO audit_log (category, action, reasoning, alternatives) VALUES ('non-action', 'rejection_logged', '$(echo "Rejected: $option. Reason: $reason" | sed "s/'/''/g")', '$(echo "$chosen" | sed "s/'/''/g")'); SELECT last_insert_rowid();")
+
+      # Create rejection record
+      local rid
+      rid=$(sqlite3 "$DB_PATH" "INSERT INTO rejections (context, rejected_option, reason, chosen_instead, confidence, category, revisit_date, audit_log_id) VALUES ('$(echo "$context" | sed "s/'/''/g")', '$(echo "$option" | sed "s/'/''/g")', '$(echo "$reason" | sed "s/'/''/g")', '$(echo "$chosen" | sed "s/'/''/g")', $confidence, '$category', '$(echo "$revisit" | sed "s/'/''/g")', $aid); SELECT last_insert_rowid();")
+      info "✗ Rejection #$rid logged: $option"
+      [[ -z "$chosen" ]] || info "  Chosen instead: $chosen"
+      [[ -z "$revisit" ]] || info "  Revisit on: $revisit"
+      ;;
+
+    list)
+      local limit="${1:-20}"
+      local cat_filter="${2:-}"
+      local query="SELECT id, ts, category, substr(rejected_option, 1, 40) as rejected, substr(reason, 1, 40) as reason, confidence FROM rejections"
+      if [[ -n "$cat_filter" ]]; then
+        query="$query WHERE category='$cat_filter'"
+      fi
+      query="$query ORDER BY ts DESC LIMIT $limit;"
+      sqlite3 -header -column "$DB_PATH" "$query"
+      ;;
+
+    revisit)
+      info "Rejections due for revisit:"
+      sqlite3 -header -column "$DB_PATH" "SELECT id, category, rejected_option, reason, revisit_date FROM rejections WHERE revisit_date != '' AND revisit_date <= date('now') ORDER BY revisit_date;"
+      local count
+      count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM rejections WHERE revisit_date != '' AND revisit_date <= date('now');")
+      echo ""
+      info "$count rejection(s) due for revisit"
+      ;;
+
+    ratio)
+      local days="${1:-30}"
+      local actions decisions rejections_count ratio
+      actions=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM audit_log WHERE category='decision' AND julianday('now') - julianday(ts) <= $days;")
+      rejections_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM rejections WHERE julianday('now') - julianday(ts) <= $days;")
+
+      echo "═══ Rejection-to-Action Ratio (last ${days}d) ═══"
+      echo "  Actions:    $actions"
+      echo "  Rejections: $rejections_count"
+      if [[ "$actions" -gt 0 ]]; then
+        ratio=$(awk "BEGIN { printf \"%.1f\", $rejections_count / $actions }")
+        echo "  Ratio:      ${ratio}x"
+        if (( $(awk "BEGIN { print ($rejections_count / $actions) < 1.0 }") )); then
+          warn "Low rejection ratio (<1.0x). Are we logging enough non-decisions?"
+          warn "Research benchmark: 3.2x rejection-to-action ratio."
+        fi
+      else
+        echo "  Ratio:      N/A (no actions logged)"
+      fi
+      echo ""
+
+      # Category breakdown
+      echo "Rejection categories:"
+      sqlite3 -header -column "$DB_PATH" "SELECT category, COUNT(*) as count FROM rejections WHERE julianday('now') - julianday(ts) <= $days GROUP BY category ORDER BY count DESC;"
+      ;;
+
+    patterns)
+      info "Common rejection reasons (last 30 days):"
+      sqlite3 "$DB_PATH" "SELECT '  • ' || reason || ' (' || COUNT(*) || 'x)' FROM rejections WHERE julianday('now') - julianday(ts) <= 30 GROUP BY reason ORDER BY COUNT(*) DESC LIMIT 10;"
+      echo ""
+      info "Categories with most rejections:"
+      sqlite3 "$DB_PATH" "SELECT '  • ' || category || ': ' || COUNT(*) FROM rejections WHERE julianday('now') - julianday(ts) <= 30 GROUP BY category ORDER BY COUNT(*) DESC;"
+      ;;
+
+    *)
+      echo "Usage: biz-ops reject <log|list|revisit|ratio|patterns>"
+      echo ""
+      echo "  log --context CTX --option OPT --reason WHY [--chosen ALT] [--confidence 0-1] [--category CAT] [--revisit DATE]"
+      echo "  list [limit] [category]"
+      echo "  revisit              Show rejections due for re-evaluation"
+      echo "  ratio [days]         Rejection-to-action ratio (benchmark: 3.2x)"
+      echo "  patterns             Common rejection reasons and categories"
+      echo ""
+      echo "Categories: decision, feature, customer, strategy, tool, other"
+      echo ""
+      echo "Why log rejections? The 3.2x insight: negative space (what you didn't do)"
+      echo "contains more information than actions taken. Rejection patterns reveal"
+      echo "hidden biases, recurring blockers, and strategy drift."
+      ;;
+  esac
+}
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 main() {
   local cmd="${1:-help}"
@@ -649,6 +775,7 @@ main() {
     deliver)  cmd_deliver "$@" ;;
     gate)     cmd_gate "$@" ;;
     metric)   cmd_metric "$@" ;;
+    reject)   cmd_reject "$@" ;;
     status)   cmd_status "$@" ;;
     report)   cmd_report "$@" ;;
     workflow) cmd_workflow "$@" ;;
@@ -666,6 +793,7 @@ Commands:
   deliver <sub>           Delivery tracking (log|mark|list)
   gate <sub>              Human-in-loop gates (create|resolve|list|pending)
   metric <sub>            Business metrics (record|latest|history|stale)
+  reject <sub>            Rejection logging — what we DIDN'T do and why (log|list|revisit|ratio|patterns)
   status                  Dashboard overview
   report [period]         Generate report (daily|weekly|monthly|all)
   workflow run <file>     Execute a workflow
@@ -674,6 +802,7 @@ Commands:
 
 Design principles:
   • Every decision is audited (including non-decisions)
+  • Rejections tracked separately — 3.2x more signal in negative space
   • Irreversible actions require human approval (gates)
   • Stale metrics are flagged automatically
   • Error cascades prevented by checkpoint validation
