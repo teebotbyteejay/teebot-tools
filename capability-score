@@ -63,16 +63,39 @@ fi
 # Score: 100 at 500+ entities, linear below
 graph_score=$(( graph_entities > 500 ? 100 : graph_entities * 100 / 500 ))
 
-# --- 4. Content output (posts in last 7 days, weight: 20%) ---
-post_count=0
+# --- 4. Useful output (external-facing work in last 7 days, weight: 10%) ---
+# Measures all external output: blog posts, Moltbook posts/comments, email deliveries
+# Broader than just blog posts — any work that reaches the outside world counts
+output_count=0
+# Blog posts
 site_dir="$WORKSPACE/teebotbyteejay.github.io/posts"
 if [[ -d "$site_dir" ]]; then
-  post_count=$(find "$site_dir" -name '*.html' -mtime -7 2>/dev/null | wc -l)
+  output_count=$(( output_count + $(find "$site_dir" -name '*.html' -mtime -7 2>/dev/null | wc -l) ))
 fi
-# Score: 100 at 7+ posts/week (1/day), linear below  
-post_score=$(( post_count > 7 ? 100 : post_count * 100 / 7 ))
+# Moltbook activity (posts + comments from daily logs)
+for logf in "$WORKSPACE"/memory/2026-*.md; do
+  [[ -f "$logf" ]] || continue
+  log_date=$(basename "$logf" .md)
+  # Only count last 7 days
+  log_epoch=$(date -d "$log_date" +%s 2>/dev/null || echo 0)
+  now_epoch=$(date +%s)
+  age_days=$(( (now_epoch - log_epoch) / 86400 ))
+  [[ $age_days -le 7 ]] || continue
+  mb_count=$(grep -ci 'moltbook.*comment\|moltbook.*post\|commented on.*moltbook\|posted on.*moltbook' "$logf" 2>/dev/null || true)
+  mb_count=$(echo "$mb_count" | tr -dc '0-9')
+  [[ -n "$mb_count" ]] && output_count=$(( output_count + mb_count ))
+done
+# Email deliveries (biz-ops)
+biz_db="$WORKSPACE/projects/business/biz-ops.db"
+if [[ -f "$biz_db" ]]; then
+  del_count=$(sqlite3 "$biz_db" "SELECT COUNT(*) FROM deliveries WHERE julianday('now') - julianday(delivered_at) <= 7 AND status='confirmed';" 2>/dev/null || true)
+  del_count=$(echo "$del_count" | tr -dc '0-9')
+  [[ -n "$del_count" ]] && output_count=$(( output_count + del_count ))
+fi
+# Score: 100 at 5+ outputs/week, linear below
+output_score=$(( output_count > 5 ? 100 : output_count * 100 / 5 ))
 
-# --- 5. Task performance (reflexion eval avg last 7 days, weight: 20%) ---
+# --- 5. Task performance (reflexion eval avg last 7 days, weight: 30%) ---
 task_score=50  # default if no evals
 eval_count=0
 eval_dir="$WORKSPACE/memory/reflexion-evals"
@@ -98,7 +121,7 @@ if [[ -d "$eval_dir" ]]; then
 fi
 
 # --- Composite ---
-composite=$(echo "scale=1; 0.30 * $mem_score + 0.15 * $tool_score + 0.15 * $graph_score + 0.20 * $post_score + 0.20 * $task_score" | bc)
+composite=$(echo "scale=1; 0.25 * $mem_score + 0.15 * $tool_score + 0.15 * $graph_score + 0.10 * $output_score + 0.35 * $task_score" | bc)
 
 if $JSON_OUT; then
   jq -n \
@@ -106,23 +129,23 @@ if $JSON_OUT; then
     --argjson mem "$mem_score" \
     --argjson tools "$tool_score" \
     --argjson graph "$graph_score" \
-    --argjson posts "$post_score" \
+    --argjson output "$output_score" \
     --argjson tasks "$task_score" \
     --argjson composite "$composite" \
     --argjson mem_raw "$(echo $mem_score)" \
     --argjson tool_count "$tool_count" \
     --argjson graph_entities "$graph_entities" \
-    --argjson post_count "$post_count" \
+    --argjson output_count "$output_count" \
     --argjson eval_count "$eval_count" \
-    '{timestamp: $ts, composite: $composite, components: {memory: $mem, tools: $tools, graph: $graph, posts: $posts, tasks: $tasks}, raw: {mem_test_pct: $mem_raw, tool_count: $tool_count, graph_entities: $graph_entities, posts_7d: $post_count, evals_7d: $eval_count}}'
+    '{timestamp: $ts, composite: $composite, components: {memory: $mem, tools: $tools, graph: $graph, output: $output, tasks: $tasks}, raw: {mem_test_pct: $mem_raw, tool_count: $tool_count, graph_entities: $graph_entities, outputs_7d: $output_count, evals_7d: $eval_count}}'
 else
   echo -e "${C_CYAN}${C_BOLD}🐣 Capability Scorecard${C_RESET}"
   echo ""
-  echo -e "  ${C_BOLD}Memory quality${C_RESET}  (30%)  ${mem_score}%  ${C_DIM}(mem-test: ${mem_score}% on 15 questions)${C_RESET}"
+  echo -e "  ${C_BOLD}Memory quality${C_RESET}  (25%)  ${mem_score}%  ${C_DIM}(mem-test: ${mem_score}% on 15 questions)${C_RESET}"
   echo -e "  ${C_BOLD}Tool inventory${C_RESET}  (15%)  ${tool_score}/100  ${C_DIM}(${tool_count} tools)${C_RESET}"
   echo -e "  ${C_BOLD}Graph density${C_RESET}   (15%)  ${graph_score}/100  ${C_DIM}(${graph_entities} entities)${C_RESET}"
-  echo -e "  ${C_BOLD}Content output${C_RESET}  (20%)  ${post_score}/100  ${C_DIM}(${post_count} posts in 7 days)${C_RESET}"
-  echo -e "  ${C_BOLD}Task perf${C_RESET}       (20%)  ${task_score}/100  ${C_DIM}(${eval_count} evals in 7 days)${C_RESET}"
+  echo -e "  ${C_BOLD}Useful output${C_RESET}   (10%)  ${output_score}/100  ${C_DIM}(${output_count} outputs in 7 days)${C_RESET}"
+  echo -e "  ${C_BOLD}Task perf${C_RESET}       (35%)  ${task_score}/100  ${C_DIM}(${eval_count} evals in 7 days)${C_RESET}"
   echo ""
   echo -e "  ${C_BOLD}${C_GREEN}Composite: ${composite}${C_RESET}"
 fi
