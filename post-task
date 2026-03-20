@@ -41,6 +41,112 @@ WORKSPACE="${WORKSPACE:-$HOME/.openclaw/workspace}"
 PRETASK_FILE="$WORKSPACE/memory/last-pretask.json"
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREEN='\033[32m'; C_CYAN='\033[36m'; C_YELLOW='\033[33m'; C_DIM='\033[2m'
 
+# --- Evaluate against pre-committed criteria (Evaluation Stack Level 1) ---
+# If pre-task generated locked criteria, evaluate against them FIRST.
+# This happens BEFORE the general reflexion-eval to prevent post-hoc criteria shift.
+criteria_eval_output=""
+criteria_scores=""
+if [[ -f "$PRETASK_FILE" ]] && [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  stored_criteria=$(jq -c '.eval_criteria // {}' "$PRETASK_FILE" 2>/dev/null)
+  criteria_count=$(echo "$stored_criteria" | jq '.criteria // [] | length' 2>/dev/null || echo "0")
+  
+  if [[ "$criteria_count" -gt 0 && "$criteria_count" != "null" ]]; then
+    echo -e "${C_CYAN}${C_BOLD}Pre-committed Criteria Evaluation${C_RESET} ($criteria_count criteria locked at pre-task time)"
+    echo ""
+    
+    # Build criteria list for evaluation
+    criteria_list=$(echo "$stored_criteria" | jq -r '.criteria[] | "[\(.id)] (\(.type)): \(.description)"' 2>/dev/null)
+    assumptions=$(echo "$stored_criteria" | jq -r '.assumptions[]? // empty' 2>/dev/null | tr '\n' '; ')
+    contrastive=$(echo "$stored_criteria" | jq -r '.contrastive // ""' 2>/dev/null)
+    
+    ce_system="You evaluate task outcomes against PRE-COMMITTED criteria. These criteria were locked BEFORE the task ran. You CANNOT add, modify, or reinterpret them.
+
+For each criterion, output a JSON array:
+[{\"id\": \"c1\", \"met\": true/false, \"evidence\": \"specific evidence from the outcome\", \"confidence\": 0.0-1.0}]
+
+Rules:
+- Evaluate ONLY the listed criteria — do not add your own
+- 'met' must be based on concrete evidence in the outcome, not vibes
+- For falsification criteria: 'met'=true means the failure condition WAS triggered (task failed)
+- confidence < 0.6 means the criterion can't be reliably evaluated from the outcome
+- Be STRICT. Ambiguous evidence = not met.
+- Only output the JSON array."
+
+    ce_user="TASK: $TASK
+
+OUTCOME: $OUTCOME
+
+PRE-COMMITTED CRITERIA (locked, do not modify):
+$criteria_list
+
+ASSUMPTIONS: $assumptions
+CONTRASTIVE QUESTION: $contrastive"
+
+    ce_response=$(curl -s --max-time 20 "https://api.openai.com/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d "$(jq -n --arg sys "$ce_system" --arg usr "$ce_user" '{
+        model: "gpt-4o-mini",
+        messages: [{role: "system", content: $sys}, {role: "user", content: $usr}],
+        temperature: 0.1,
+        max_tokens: 500
+      }')" 2>/dev/null)
+    
+    criteria_scores=$(echo "$ce_response" | jq -r '.choices[0].message.content // "[]"' 2>/dev/null | sed 's/^```json//;s/^```//;s/```$//')
+    
+    # Display results
+    met_count=0
+    failed_count=0
+    uncertain_count=0
+    falsification_triggered=false
+    
+    while IFS= read -r result; do
+      [[ -z "$result" || "$result" == "null" ]] && continue
+      r_id=$(echo "$result" | jq -r '.id' 2>/dev/null)
+      r_met=$(echo "$result" | jq -r '.met' 2>/dev/null)
+      r_evidence=$(echo "$result" | jq -r '.evidence // ""' 2>/dev/null)
+      r_confidence=$(echo "$result" | jq -r '.confidence // 0' 2>/dev/null)
+      
+      # Look up the original criterion type
+      r_type=$(echo "$stored_criteria" | jq -r ".criteria[] | select(.id == \"$r_id\") | .type" 2>/dev/null)
+      r_desc=$(echo "$stored_criteria" | jq -r ".criteria[] | select(.id == \"$r_id\") | .description" 2>/dev/null)
+      
+      if (( $(echo "$r_confidence < 0.6" | bc -l 2>/dev/null || echo 0) )); then
+        echo -e "  ${C_YELLOW}?${C_RESET} [$r_id] $r_desc"
+        echo -e "    ${C_DIM}Uncertain (confidence=$r_confidence): $r_evidence${C_RESET}"
+        uncertain_count=$((uncertain_count + 1))
+      elif [[ "$r_type" == "falsification" ]]; then
+        if [[ "$r_met" == "true" ]]; then
+          echo -e "  ${C_YELLOW}⚠ FALSIFICATION TRIGGERED${C_RESET} [$r_id] $r_desc"
+          echo -e "    ${C_DIM}Evidence: $r_evidence${C_RESET}"
+          falsification_triggered=true
+          failed_count=$((failed_count + 1))
+        else
+          echo -e "  ${C_GREEN}✓${C_RESET} [$r_id] Falsification NOT triggered: $r_desc"
+          met_count=$((met_count + 1))
+        fi
+      elif [[ "$r_met" == "true" ]]; then
+        echo -e "  ${C_GREEN}✓${C_RESET} [$r_id] $r_desc"
+        echo -e "    ${C_DIM}$r_evidence${C_RESET}"
+        met_count=$((met_count + 1))
+      else
+        echo -e "  ${C_YELLOW}✗${C_RESET} [$r_id] $r_desc"
+        echo -e "    ${C_DIM}$r_evidence${C_RESET}"
+        failed_count=$((failed_count + 1))
+      fi
+    done < <(echo "$criteria_scores" | jq -c '.[]' 2>/dev/null)
+    
+    echo ""
+    echo -e "  ${C_BOLD}Criteria: $met_count met, $failed_count failed, $uncertain_count uncertain${C_RESET}"
+    if $falsification_triggered; then
+      echo -e "  ${C_YELLOW}⚠ Falsification criterion was triggered — review needed${C_RESET}"
+    fi
+    
+    criteria_eval_output="criteria_met=$met_count criteria_failed=$failed_count criteria_uncertain=$uncertain_count falsification=$falsification_triggered"
+    echo ""
+  fi
+fi
+
 # --- Run reflexion evaluation (extract new rules) ---
 eval_id=""
 if command -v reflexion-eval &>/dev/null; then
@@ -312,6 +418,56 @@ HEADER
         '. + {behavior_extraction: {candidates: $behaviors, count: ($behaviors | length)}}' \
         "$eval_file" > "$tmp" 2>/dev/null && mv "$tmp" "$eval_file" && \
         echo -e "  ${C_GREEN}✓${C_RESET} Extraction data persisted" || rm -f "$tmp"
+    fi
+  fi
+fi
+
+# --- Persist pre-committed criteria results ---
+if [[ -n "$criteria_scores" && "$criteria_scores" != "[]" ]]; then
+  _eval_ls=$(ls -t "$WORKSPACE/memory/reflexion-evals/"*.json 2>/dev/null); eval_file=$(head -1 <<< "$_eval_ls")
+  if [[ -n "$eval_file" ]]; then
+    tmp=$(mktemp)
+    stored_criteria=$(jq -c '.eval_criteria // {}' "$PRETASK_FILE" 2>/dev/null || echo '{}')
+    jq --argjson precommitted "$stored_criteria" \
+       --argjson results "$(echo "$criteria_scores" | jq -c '.' 2>/dev/null || echo '[]')" \
+       --arg summary "$criteria_eval_output" \
+       '. + {precommitted_eval: {criteria: $precommitted, results: $results, summary: $summary}}' \
+       "$eval_file" > "$tmp" 2>/dev/null && mv "$tmp" "$eval_file" && \
+      echo -e "  ${C_GREEN}✓${C_RESET} Pre-committed criteria results persisted" || rm -f "$tmp"
+    
+    # --- Score adjustment: give pre-committed criteria TEETH ---
+    # If the LLM self-eval gave a high score but pre-committed criteria failed,
+    # cap the score. This injects deterministic signal into otherwise overconfident evals.
+    # Addresses: eval distribution overconfidence (93% of scores ≥80).
+    current_score=$(jq -r '.score // .evaluation.score // 0' "$eval_file" 2>/dev/null || echo "0")
+    criteria_failed=$(echo "$criteria_eval_output" | grep -oP 'criteria_failed=\K[0-9]+' || echo "0")
+    falsification=$(echo "$criteria_eval_output" | grep -oP 'falsification=\K\w+' || echo "false")
+    criteria_met=$(echo "$criteria_eval_output" | grep -oP 'criteria_met=\K[0-9]+' || echo "0")
+    criteria_total=$((criteria_met + criteria_failed + $(echo "$criteria_eval_output" | grep -oP 'criteria_uncertain=\K[0-9]+' || echo "0")))
+    
+    score_cap=100
+    cap_reason=""
+    if [[ "$falsification" == "true" ]]; then
+      score_cap=50
+      cap_reason="falsification criterion triggered"
+    elif [[ "$criteria_failed" -gt 0 ]]; then
+      # Cap proportional to failure rate: 1 of 3 failed → cap at 75, 2 of 3 → 60
+      if [[ "$criteria_total" -gt 0 ]]; then
+        met_pct=$((criteria_met * 100 / criteria_total))
+        score_cap=$((50 + met_pct / 2))  # Range: 50 (all failed) to 100 (none failed)
+      else
+        score_cap=75
+      fi
+      cap_reason="$criteria_failed/$criteria_total pre-committed criteria failed"
+    fi
+    
+    if [[ "$current_score" -gt "$score_cap" && "$score_cap" -lt 100 ]]; then
+      tmp2=$(mktemp)
+      jq --argjson cap "$score_cap" --argjson original "$current_score" --arg reason "$cap_reason" \
+        'if .evaluation then .evaluation.score = $cap | .evaluation.original_score = $original | .evaluation.cap_reason = $reason
+         else .score = $cap | .original_score = $original | .cap_reason = $reason end' \
+        "$eval_file" > "$tmp2" 2>/dev/null && mv "$tmp2" "$eval_file" && \
+        echo -e "  ${C_YELLOW}⚠ Score capped: $current_score → $score_cap ($cap_reason)${C_RESET}" || rm -f "$tmp2"
     fi
   fi
 fi
