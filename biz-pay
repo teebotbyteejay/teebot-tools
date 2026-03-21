@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+# biz-pay — Payment integration for agent-operated business
+# Wraps Stripe API for product management, Payment Links, checkout, and revenue tracking.
+# Integrates with biz-ops for audit trail and human-in-loop gates.
+# v1.0.0 — 2026-03-21
+#
+# Design principles:
+#   1. Human gate on all real charges — sandbox mode for testing
+#   2. Audit everything — every payment action logged in biz-ops
+#   3. Simple wrapper — delegates to Stripe API, handles business logic
+#   4. Key injection — works with STRIPE_SECRET_KEY env var or config file
+#
+# Setup:
+#   1. Set STRIPE_SECRET_KEY (restricted key preferred: rk_test_... or rk_live_...)
+#   2. Run: biz-pay init
+#   3. Create products: biz-pay product create "Research Brief" 2900 (= $29.00)
+#   4. Create payment link: biz-pay link create <product_id>
+#
+# Usage:
+#   biz-pay init                              # Initialize + verify Stripe connection
+#   biz-pay product create <name> <price_cents> [currency] [interval]
+#   biz-pay product list                      # List all products
+#   biz-pay link create <product_id>          # Create a Payment Link
+#   biz-pay link list                         # List active Payment Links
+#   biz-pay checkout <customer_email> <product_id>  # Create checkout session
+#   biz-pay revenue [--period 30d]            # Revenue summary
+#   biz-pay status                            # Connection + account status
+#   biz-pay config                            # Show configuration
+set -euo pipefail
+
+VERSION="1.0.0"
+STRIPE_API="https://api.stripe.com/v1"
+DB_DIR="$HOME/.openclaw/workspace/projects/business"
+BIZ_OPS_DB="$DB_DIR/biz-ops.db"
+PAY_DB="$DB_DIR/biz-pay.db"
+CONFIG_FILE="$DB_DIR/.stripe-config"
+
+# Colors
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'
+C_CYAN='\033[36m'
+
+die() { echo -e "${C_RED}ERROR: $*${C_RESET}" >&2; exit 1; }
+info() { echo -e "${C_CYAN}→${C_RESET} $*"; }
+warn() { echo -e "${C_YELLOW}⚠${C_RESET} $*" >&2; }
+success() { echo -e "${C_GREEN}✓${C_RESET} $*"; }
+
+# ── Key Management ────────────────────────────────────────────────────────────
+get_stripe_key() {
+  # Priority: env var > config file
+  if [[ -n "${STRIPE_SECRET_KEY:-}" ]]; then
+    echo "$STRIPE_SECRET_KEY"
+    return 0
+  fi
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local key
+    key=$(grep "^STRIPE_SECRET_KEY=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2-)
+    if [[ -n "$key" ]]; then
+      echo "$key"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+is_test_mode() {
+  local key
+  key=$(get_stripe_key 2>/dev/null) || return 0
+  [[ "$key" == sk_test_* || "$key" == rk_test_* ]]
+}
+
+require_key() {
+  get_stripe_key >/dev/null 2>&1 || die "No Stripe API key. Set STRIPE_SECRET_KEY or run: biz-pay init"
+}
+
+# ── Stripe API Calls ──────────────────────────────────────────────────────────
+stripe_api() {
+  local method="$1"
+  local endpoint="$2"
+  shift 2
+  local key
+  key=$(get_stripe_key) || die "No Stripe API key"
+
+  local curl_args=(-s --max-time 30 -X "$method" "$STRIPE_API/$endpoint"
+    -u "$key:"
+    -H "Stripe-Version: 2024-12-18.acacia")
+
+  # Add POST data if provided
+  for arg in "$@"; do
+    curl_args+=(-d "$arg")
+  done
+
+  local response
+  response=$(curl "${curl_args[@]}" 2>/dev/null)
+
+  # Check for errors
+  local error
+  error=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
+  if [[ -n "$error" ]]; then
+    die "Stripe API error: $error"
+  fi
+
+  echo "$response"
+}
+
+# ── Audit Logging ─────────────────────────────────────────────────────────────
+audit_log() {
+  local category="$1"
+  local action="$2"
+  local details="$3"
+
+  # Log to biz-pay db
+  sqlite3 "$PAY_DB" "INSERT INTO payment_log (category, action, details) VALUES ('$(echo "$category" | sed "s/'/''/g")', '$(echo "$action" | sed "s/'/''/g")', '$(echo "$details" | sed "s/'/''/g")');" 2>/dev/null || true
+
+  # Also log to biz-ops if available
+  if command -v biz-ops &>/dev/null && [[ -f "$BIZ_OPS_DB" ]]; then
+    biz-ops audit log payment "$action: $details" 2>/dev/null || true
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INIT
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_init() {
+  mkdir -p "$DB_DIR"
+
+  # Create payment tracking database
+  sqlite3 "$PAY_DB" <<'SQL'
+CREATE TABLE IF NOT EXISTS products (
+  id TEXT PRIMARY KEY,              -- Stripe product ID
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  price_cents INTEGER NOT NULL,
+  currency TEXT DEFAULT 'usd',
+  interval TEXT,                    -- null = one-time, 'month', 'year'
+  price_id TEXT,                    -- Stripe price ID
+  active INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS payment_links (
+  id TEXT PRIMARY KEY,              -- Stripe payment link ID
+  product_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  active INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (product_id) REFERENCES products(id)
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+  id TEXT PRIMARY KEY,              -- Stripe charge/payment intent ID
+  customer_email TEXT,
+  product_id TEXT,
+  amount_cents INTEGER,
+  currency TEXT DEFAULT 'usd',
+  status TEXT,                      -- succeeded, pending, failed, refunded
+  stripe_customer_id TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (product_id) REFERENCES products(id)
+);
+
+CREATE TABLE IF NOT EXISTS payment_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (datetime('now')),
+  category TEXT NOT NULL,
+  action TEXT NOT NULL,
+  details TEXT
+);
+SQL
+
+  # Check for API key
+  local key
+  if key=$(get_stripe_key 2>/dev/null); then
+    local mode="LIVE"
+    is_test_mode && mode="TEST"
+    info "Stripe key found ($mode mode)"
+
+    # Verify connection
+    local account
+    account=$(stripe_api GET "account" 2>/dev/null) || { warn "Could not verify Stripe connection"; return 0; }
+    local account_name
+    account_name=$(echo "$account" | jq -r '.settings.dashboard.display_name // .business_profile.name // "Unknown"' 2>/dev/null)
+    success "Connected to Stripe account: $account_name ($mode)"
+    audit_log "system" "init" "Initialized biz-pay. Account: $account_name ($mode)"
+  else
+    warn "No Stripe API key found."
+    echo ""
+    echo "To configure Stripe:"
+    echo "  Option 1: export STRIPE_SECRET_KEY=sk_test_..."
+    echo "  Option 2: echo 'STRIPE_SECRET_KEY=sk_test_...' > $CONFIG_FILE"
+    echo ""
+    echo "Get your key at: https://dashboard.stripe.com/apikeys"
+    echo "Use a restricted key (rk_*) for better security."
+  fi
+
+  success "Payment database initialized at $PAY_DB"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRODUCT — Create and manage products
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_product() {
+  local subcmd="${1:-list}"
+  shift 2>/dev/null || true
+
+  case "$subcmd" in
+    create)
+      require_key
+      local name="${1:-}"
+      local price_cents="${2:-}"
+      local currency="${3:-usd}"
+      local interval="${4:-}"  # empty = one-time, 'month', 'year'
+
+      [[ -z "$name" || -z "$price_cents" ]] && die "Usage: biz-pay product create <name> <price_cents> [currency] [interval]"
+
+      # Confirm if live mode
+      if ! is_test_mode; then
+        echo -e "${C_YELLOW}⚠ LIVE MODE — Creating real product${C_RESET}"
+        echo "  Name: $name"
+        echo "  Price: $(echo "scale=2; $price_cents / 100" | bc) $currency"
+        [[ -n "$interval" ]] && echo "  Billing: per $interval"
+        echo ""
+        read -p "Confirm? (y/N) " -r
+        [[ "$REPLY" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 1; }
+      fi
+
+      info "Creating product: $name ($price_cents cents $currency)"
+
+      # Create product
+      local product
+      product=$(stripe_api POST "products" "name=$(echo "$name" | sed 's/ /+/g')")
+      local product_id
+      product_id=$(echo "$product" | jq -r '.id')
+
+      # Create price
+      local price_args=("product=$product_id" "unit_amount=$price_cents" "currency=$currency")
+      if [[ -n "$interval" ]]; then
+        price_args+=("recurring[interval]=$interval")
+      fi
+
+      local price
+      price=$(stripe_api POST "prices" "${price_args[@]}")
+      local price_id
+      price_id=$(echo "$price" | jq -r '.id')
+
+      # Store locally
+      sqlite3 "$PAY_DB" "INSERT OR REPLACE INTO products (id, name, price_cents, currency, interval, price_id)
+        VALUES ('$product_id', '$(echo "$name" | sed "s/'/''/g")', $price_cents, '$currency', '$(echo "$interval" | sed "s/'/''/g")', '$price_id');"
+
+      audit_log "product" "create" "Product: $name ($product_id), Price: $price_id, Amount: $price_cents $currency"
+
+      success "Created product: $name"
+      echo "  Product ID: $product_id"
+      echo "  Price ID: $price_id"
+      echo "  Amount: \$$(echo "scale=2; $price_cents / 100" | bc) $currency"
+      [[ -n "$interval" ]] && echo "  Billing: per $interval"
+      ;;
+
+    list)
+      echo -e "${C_BOLD}📦 Products${C_RESET}"
+
+      if [[ -f "$PAY_DB" ]]; then
+        local count
+        count=$(sqlite3 "$PAY_DB" "SELECT COUNT(*) FROM products;" 2>/dev/null) || count=0
+        if [[ "$count" -gt 0 ]]; then
+          sqlite3 -column -header "$PAY_DB" "SELECT id, name, printf('\$%.2f', price_cents/100.0) as price, currency, COALESCE(interval, 'one-time') as billing, CASE WHEN active THEN '✅' ELSE '❌' END as status FROM products ORDER BY name;"
+        else
+          echo -e "${C_DIM}No local products. Create with: biz-pay product create <name> <price_cents>${C_RESET}"
+        fi
+      else
+        echo -e "${C_DIM}Database not initialized. Run: biz-pay init${C_RESET}"
+      fi
+
+      # Also check Stripe if key available
+      if get_stripe_key >/dev/null 2>&1; then
+        echo ""
+        info "Checking Stripe..."
+        local stripe_products
+        stripe_products=$(stripe_api GET "products?limit=10&active=true" 2>/dev/null) || { warn "Could not fetch from Stripe"; return 0; }
+        local stripe_count
+        stripe_count=$(echo "$stripe_products" | jq '.data | length' 2>/dev/null) || stripe_count=0
+        echo -e "${C_DIM}$stripe_count active products on Stripe${C_RESET}"
+      fi
+      ;;
+
+    *)
+      die "Unknown product subcommand: $subcmd. Use: create, list"
+      ;;
+  esac
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LINK — Create and manage Payment Links
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_link() {
+  local subcmd="${1:-list}"
+  shift 2>/dev/null || true
+
+  case "$subcmd" in
+    create)
+      require_key
+      local product_id="${1:-}"
+      [[ -z "$product_id" ]] && die "Usage: biz-pay link create <product_id>"
+
+      # Get price ID for this product
+      local price_id
+      price_id=$(sqlite3 "$PAY_DB" "SELECT price_id FROM products WHERE id='$product_id';" 2>/dev/null)
+      [[ -z "$price_id" ]] && die "Product not found locally: $product_id. Run 'biz-pay product list' first."
+
+      info "Creating Payment Link for product: $product_id"
+
+      local link
+      link=$(stripe_api POST "payment_links" "line_items[0][price]=$price_id" "line_items[0][quantity]=1")
+      local link_id link_url
+      link_id=$(echo "$link" | jq -r '.id')
+      link_url=$(echo "$link" | jq -r '.url')
+
+      # Store locally
+      sqlite3 "$PAY_DB" "INSERT OR REPLACE INTO payment_links (id, product_id, url)
+        VALUES ('$link_id', '$product_id', '$(echo "$link_url" | sed "s/'/''/g")');"
+
+      audit_log "link" "create" "Payment Link: $link_id for product $product_id → $link_url"
+
+      success "Payment Link created!"
+      echo "  Link ID: $link_id"
+      echo "  URL: $link_url"
+      echo ""
+      echo "Share this URL with customers to collect payment."
+      ;;
+
+    list)
+      echo -e "${C_BOLD}🔗 Payment Links${C_RESET}"
+      if [[ -f "$PAY_DB" ]]; then
+        sqlite3 -column -header "$PAY_DB" "SELECT pl.id, p.name as product, pl.url, CASE WHEN pl.active THEN '✅' ELSE '❌' END as status, pl.created_at
+          FROM payment_links pl
+          JOIN products p ON pl.product_id = p.id
+          ORDER BY pl.created_at DESC;" 2>/dev/null
+      else
+        echo -e "${C_DIM}No payment links. Create with: biz-pay link create <product_id>${C_RESET}"
+      fi
+      ;;
+
+    *)
+      die "Unknown link subcommand: $subcmd. Use: create, list"
+      ;;
+  esac
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECKOUT — Create a checkout session for a specific customer
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_checkout() {
+  require_key
+  local customer_email="${1:-}"
+  local product_id="${2:-}"
+
+  [[ -z "$customer_email" || -z "$product_id" ]] && die "Usage: biz-pay checkout <customer_email> <product_id>"
+
+  # Human gate for live mode
+  if ! is_test_mode; then
+    local product_name price_cents
+    product_name=$(sqlite3 "$PAY_DB" "SELECT name FROM products WHERE id='$product_id';" 2>/dev/null)
+    price_cents=$(sqlite3 "$PAY_DB" "SELECT price_cents FROM products WHERE id='$product_id';" 2>/dev/null)
+
+    echo -e "${C_YELLOW}⚠ LIVE MODE — Creating checkout for real payment${C_RESET}"
+    echo "  Customer: $customer_email"
+    echo "  Product: $product_name ($product_id)"
+    echo "  Amount: \$$(echo "scale=2; $price_cents / 100" | bc)"
+    echo ""
+
+    # Log gate in biz-ops
+    if command -v biz-ops &>/dev/null; then
+      biz-ops gate create "Payment checkout for $customer_email — $product_name (\$$(echo "scale=2; $price_cents / 100" | bc))" high 2>/dev/null || true
+    fi
+
+    read -p "Confirm? (y/N) " -r
+    [[ "$REPLY" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 1; }
+  fi
+
+  local price_id
+  price_id=$(sqlite3 "$PAY_DB" "SELECT price_id FROM products WHERE id='$product_id';" 2>/dev/null)
+  [[ -z "$price_id" ]] && die "Product not found: $product_id"
+
+  info "Creating checkout session..."
+
+  local session
+  session=$(stripe_api POST "checkout/sessions" \
+    "customer_email=$customer_email" \
+    "line_items[0][price]=$price_id" \
+    "line_items[0][quantity]=1" \
+    "mode=payment" \
+    "success_url=https://teebotbyteejay.github.io/thanks" \
+    "cancel_url=https://teebotbyteejay.github.io/")
+
+  local session_id checkout_url
+  session_id=$(echo "$session" | jq -r '.id')
+  checkout_url=$(echo "$session" | jq -r '.url')
+
+  audit_log "checkout" "create" "Checkout: $session_id for $customer_email, product $product_id"
+
+  success "Checkout session created!"
+  echo "  Session ID: $session_id"
+  echo "  Checkout URL: $checkout_url"
+  echo ""
+  echo "Send this URL to the customer to complete payment."
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REVENUE — Revenue tracking and summary
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_revenue() {
+  local period="${1:-30d}"
+  local days
+  case "$period" in
+    *d) days="${period%d}" ;;
+    *w) days=$(( ${period%w} * 7 )) ;;
+    *m) days=$(( ${period%m} * 30 )) ;;
+    *) days=30 ;;
+  esac
+
+  echo -e "${C_BOLD}💰 Revenue Summary (last $days days)${C_RESET}"
+  echo ""
+
+  if ! get_stripe_key >/dev/null 2>&1; then
+    warn "No Stripe key — showing local data only"
+  fi
+
+  if [[ -f "$PAY_DB" ]]; then
+    local local_total local_count
+    local_total=$(sqlite3 "$PAY_DB" "SELECT COALESCE(SUM(amount_cents), 0) FROM transactions WHERE status='succeeded' AND created_at >= datetime('now', '-$days days');" 2>/dev/null) || local_total=0
+    local_count=$(sqlite3 "$PAY_DB" "SELECT COUNT(*) FROM transactions WHERE status='succeeded' AND created_at >= datetime('now', '-$days days');" 2>/dev/null) || local_count=0
+
+    echo -e "  Local records:"
+    echo -e "    Transactions: $local_count"
+    echo -e "    Revenue: \$$(echo "scale=2; $local_total / 100" | bc 2>/dev/null || echo "0.00")"
+  fi
+
+  # Also check Stripe directly if key available
+  if get_stripe_key >/dev/null 2>&1; then
+    local since
+    since=$(date -d "$days days ago" +%s 2>/dev/null || date -v-${days}d +%s 2>/dev/null)
+
+    if [[ -n "$since" ]]; then
+      echo ""
+      info "Checking Stripe..."
+      local charges
+      charges=$(stripe_api GET "charges?limit=100&created[gte]=$since" 2>/dev/null) || { warn "Could not fetch charges"; return 0; }
+      local stripe_total stripe_count
+      stripe_count=$(echo "$charges" | jq '[.data[] | select(.status == "succeeded")] | length' 2>/dev/null) || stripe_count=0
+      stripe_total=$(echo "$charges" | jq '[.data[] | select(.status == "succeeded") | .amount] | add // 0' 2>/dev/null) || stripe_total=0
+
+      echo -e "  Stripe records:"
+      echo -e "    Successful charges: $stripe_count"
+      echo -e "    Total revenue: \$$(echo "scale=2; $stripe_total / 100" | bc 2>/dev/null || echo "0.00")"
+    fi
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATUS — Connection and configuration status
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_status() {
+  echo -e "${C_BOLD}💳 biz-pay status${C_RESET}"
+  echo ""
+
+  # Key status
+  if get_stripe_key >/dev/null 2>&1; then
+    local key_type="LIVE"
+    is_test_mode && key_type="TEST"
+    echo -e "  Stripe key: ${C_GREEN}configured${C_RESET} ($key_type mode)"
+
+    # Account info
+    local account
+    account=$(stripe_api GET "account" 2>/dev/null)
+    if [[ -n "$account" ]]; then
+      local name country
+      name=$(echo "$account" | jq -r '.settings.dashboard.display_name // .business_profile.name // "Unknown"' 2>/dev/null)
+      country=$(echo "$account" | jq -r '.country // "?"' 2>/dev/null)
+      echo -e "  Account: $name ($country)"
+    fi
+  else
+    echo -e "  Stripe key: ${C_RED}not configured${C_RESET}"
+    echo -e "  ${C_DIM}Set STRIPE_SECRET_KEY or run: biz-pay init${C_RESET}"
+  fi
+
+  echo ""
+
+  # Database status
+  if [[ -f "$PAY_DB" ]]; then
+    local products links transactions
+    products=$(sqlite3 "$PAY_DB" "SELECT COUNT(*) FROM products;" 2>/dev/null) || products=0
+    links=$(sqlite3 "$PAY_DB" "SELECT COUNT(*) FROM payment_links;" 2>/dev/null) || links=0
+    transactions=$(sqlite3 "$PAY_DB" "SELECT COUNT(*) FROM transactions;" 2>/dev/null) || transactions=0
+    echo -e "  Database: ${C_GREEN}initialized${C_RESET}"
+    echo -e "  Products: $products"
+    echo -e "  Payment Links: $links"
+    echo -e "  Transactions: $transactions"
+  else
+    echo -e "  Database: ${C_RED}not initialized${C_RESET}"
+    echo -e "  ${C_DIM}Run: biz-pay init${C_RESET}"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_config() {
+  echo -e "${C_BOLD}⚙️  biz-pay configuration${C_RESET}"
+  echo ""
+  echo "  Config file: $CONFIG_FILE"
+  echo "  Payment DB: $PAY_DB"
+  echo "  Biz-ops DB: $BIZ_OPS_DB"
+  echo ""
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    echo -e "  ${C_DIM}Config file contents (key redacted):${C_RESET}"
+    local key
+    key=$(grep "^STRIPE_SECRET_KEY=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2-)
+    if [[ -n "$key" ]]; then
+      echo "  STRIPE_SECRET_KEY=${key:0:12}...${key: -4}"
+    fi
+  else
+    echo -e "  ${C_DIM}No config file. Using environment variable.${C_RESET}"
+  fi
+
+  echo ""
+  echo "To set key:"
+  echo "  export STRIPE_SECRET_KEY=sk_test_..."
+  echo "  # or"
+  echo "  echo 'STRIPE_SECRET_KEY=sk_test_...' > $CONFIG_FILE"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SETUP-PRODUCTS — Quick setup for standard product tiers
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_setup_products() {
+  require_key
+
+  echo -e "${C_BOLD}🚀 Setting up standard product tiers${C_RESET}"
+  echo ""
+  echo "This will create:"
+  echo "  1. Starter — \$49/mo (2 research briefs)"
+  echo "  2. Pro — \$149/mo (6 briefs + weekly monitoring)"
+  echo "  3. Single Brief — \$29 one-time"
+  echo ""
+
+  if ! is_test_mode; then
+    echo -e "${C_YELLOW}⚠ LIVE MODE${C_RESET}"
+    read -p "Confirm? (y/N) " -r
+    [[ "$REPLY" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 1; }
+  fi
+
+  # Starter
+  info "Creating Starter tier..."
+  cmd_product create "Starter — Research Intelligence" 4900 usd month
+
+  # Pro
+  info "Creating Pro tier..."
+  cmd_product create "Pro — Research Intelligence" 14900 usd month
+
+  # Single Brief
+  info "Creating Single Brief..."
+  cmd_product create "Research Brief (Single)" 2900 usd
+
+  echo ""
+  success "Standard products created!"
+  echo ""
+  info "Next: create Payment Links with 'biz-pay link create <product_id>'"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN DISPATCHER
+# ══════════════════════════════════════════════════════════════════════════════
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    init)            cmd_init "$@" ;;
+    product)         cmd_product "$@" ;;
+    link)            cmd_link "$@" ;;
+    checkout)        cmd_checkout "$@" ;;
+    revenue)         cmd_revenue "$@" ;;
+    status)          cmd_status "$@" ;;
+    config)          cmd_config "$@" ;;
+    setup-products)  cmd_setup_products "$@" ;;
+    version)         echo "biz-pay v$VERSION" ;;
+    help|--help|-h)
+      echo "biz-pay v$VERSION — Payment integration for agent business"
+      echo ""
+      echo "Setup:"
+      echo "  init                              Initialize database + verify Stripe"
+      echo "  config                            Show configuration"
+      echo "  setup-products                    Quick-create standard product tiers"
+      echo ""
+      echo "Products:"
+      echo "  product create <name> <cents> [currency] [interval]"
+      echo "  product list                      List products"
+      echo ""
+      echo "Payment Links:"
+      echo "  link create <product_id>          Create Payment Link"
+      echo "  link list                         List active links"
+      echo ""
+      echo "Checkout:"
+      echo "  checkout <email> <product_id>     Create checkout session"
+      echo ""
+      echo "Revenue:"
+      echo "  revenue [30d|7d|...]              Revenue summary"
+      echo "  status                            Connection status"
+      echo ""
+      echo "Environment:"
+      echo "  STRIPE_SECRET_KEY                 Stripe API key (sk_test_* or rk_*)"
+      ;;
+    *)
+      die "Unknown command: $cmd. Run 'biz-pay help' for usage."
+      ;;
+  esac
+}
+
+main "$@"
