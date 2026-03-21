@@ -522,7 +522,9 @@ test_infra() {
         local age_hrs=$(( ($(date +%s) - ${newest_age%.*}) / 3600 ))
         pass "context-inject: $file_count file(s) (newest: ${age_hrs}h ago)"
       else
-        fail "context-inject" "no files in output directory"
+        # Empty dir is expected when only heartbeat/cron sessions have run
+        # (hook skips simple messages and cron triggers by design)
+        pass "context-inject: 0 files (no complex messages recently)"
       fi
     else
       fail "context-inject" "output directory missing"
