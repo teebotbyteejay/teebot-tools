@@ -1,0 +1,1056 @@
+#!/usr/bin/env bash
+# biz-sense — Market sensing layer for agent-operated business
+# The "head" for the headless pipeline: monitors markets, tracks competitors,
+# processes customer signals, generates actionable intelligence.
+# v1.0.0 — 2026-03-21
+#
+# Design principles:
+#   1. Domain-agnostic — configure via `biz-sense config`, works for any business
+#   2. Signal > noise — every finding gets relevance scoring, dedup, classification
+#   3. Change detection — track what's different, not just what exists
+#   4. Actionable output — market briefs with recommendations, not raw data dumps
+#   5. Integrated — feeds into biz-ops decision context
+#
+# Usage:
+#   biz-sense init                           # Create database + config
+#   biz-sense config set domain "AI research intelligence"
+#   biz-sense config set keywords "AI research,market intelligence,research newsletter"
+#   biz-sense config add competitor "Perplexity Pro" "https://perplexity.ai/pro"
+#   biz-sense config show                    # Show current configuration
+#   biz-sense scan [market|competitor|all]    # Run intelligence scan
+#   biz-sense brief [--period 7d|30d]        # Generate market intelligence brief
+#   biz-sense signals [--limit 20]           # List recent signals
+#   biz-sense watch                          # List monitored targets
+#   biz-sense changes [--since 7d]           # Show significant changes detected
+#   biz-sense stats                          # Sensing layer health/activity stats
+set -euo pipefail
+
+VERSION="1.0.0"
+DB_DIR="$HOME/.openclaw/workspace/projects/business"
+DB_PATH="$DB_DIR/biz-sense.db"
+BRAVE_SEARCH_URL="https://api.search.brave.com/res/v1/web/search"
+OPENAI_URL="https://api.openai.com/v1"
+
+# Colors
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'
+C_CYAN='\033[36m'; C_MAGENTA='\033[35m'
+
+die() { echo -e "${C_RED}ERROR: $*${C_RESET}" >&2; exit 1; }
+info() { echo -e "${C_CYAN}→${C_RESET} $*"; }
+warn() { echo -e "${C_YELLOW}⚠${C_RESET} $*" >&2; }
+success() { echo -e "${C_GREEN}✓${C_RESET} $*"; }
+
+ensure_db() {
+  [[ -f "$DB_PATH" ]] || die "Database not initialized. Run: biz-sense init"
+}
+
+ensure_key() {
+  local key_name="$1"
+  local env_var="$2"
+  [[ -n "${!env_var:-}" ]] || die "$key_name not set. Export $env_var."
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INIT
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_init() {
+  mkdir -p "$DB_DIR"
+  if [[ -f "$DB_PATH" ]]; then
+    info "Database already exists at $DB_PATH"
+    return 0
+  fi
+
+  sqlite3 "$DB_PATH" <<'SQL'
+-- Configuration: key-value store for domain settings
+CREATE TABLE IF NOT EXISTS config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Competitors: tracked competitors with URLs and metadata
+CREATE TABLE IF NOT EXISTS competitors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  url TEXT,
+  category TEXT DEFAULT 'direct',  -- direct, indirect, adjacent
+  pricing TEXT,
+  notes TEXT DEFAULT '',
+  last_checked TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Signals: every piece of market intelligence captured
+CREATE TABLE IF NOT EXISTS signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (datetime('now')),
+  source TEXT NOT NULL,              -- 'brave_search', 'web_fetch', 'manual', 'customer_feedback'
+  source_url TEXT,
+  category TEXT NOT NULL CHECK(category IN (
+    'market_trend', 'competitor_move', 'customer_signal',
+    'pricing_intel', 'technology_shift', 'opportunity', 'threat'
+  )),
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  relevance REAL DEFAULT 0.0,       -- 0.0-1.0, set by LLM scoring
+  sentiment TEXT DEFAULT 'neutral',  -- positive, negative, neutral
+  actionable INTEGER DEFAULT 0,     -- 1 if requires action
+  action_taken TEXT,                 -- what we did about it (nullable)
+  competitor_id INTEGER,             -- FK to competitors if relevant
+  raw_data TEXT,                     -- original source text for provenance
+  embedding TEXT,                    -- JSON array for dedup/similarity
+  dedup_hash TEXT,                   -- SHA256 of normalized title+summary for exact dedup
+  FOREIGN KEY (competitor_id) REFERENCES competitors(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
+CREATE INDEX IF NOT EXISTS idx_signals_category ON signals(category);
+CREATE INDEX IF NOT EXISTS idx_signals_relevance ON signals(relevance);
+CREATE INDEX IF NOT EXISTS idx_signals_dedup ON signals(dedup_hash);
+
+-- Competitor snapshots: periodic snapshots for change detection
+CREATE TABLE IF NOT EXISTS competitor_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  competitor_id INTEGER NOT NULL,
+  ts TEXT DEFAULT (datetime('now')),
+  content_hash TEXT NOT NULL,       -- SHA256 of page content
+  pricing TEXT,                     -- extracted pricing info
+  features TEXT,                    -- extracted feature list
+  positioning TEXT,                 -- extracted positioning/messaging
+  raw_excerpt TEXT,                 -- first 2000 chars of page for context
+  changed INTEGER DEFAULT 0,       -- 1 if different from previous snapshot
+  FOREIGN KEY (competitor_id) REFERENCES competitors(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_competitor ON competitor_snapshots(competitor_id);
+
+-- Market briefs: generated intelligence reports
+CREATE TABLE IF NOT EXISTS briefs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (datetime('now')),
+  period TEXT NOT NULL,             -- '7d', '30d', etc.
+  signal_count INTEGER,
+  brief_text TEXT NOT NULL,
+  key_findings TEXT,                -- JSON array of top findings
+  recommendations TEXT              -- JSON array of recommended actions
+);
+
+-- Scan log: track when scans ran and what they found
+CREATE TABLE IF NOT EXISTS scan_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (datetime('now')),
+  scan_type TEXT NOT NULL,          -- 'market', 'competitor', 'all'
+  signals_found INTEGER DEFAULT 0,
+  signals_new INTEGER DEFAULT 0,
+  duration_sec REAL,
+  status TEXT DEFAULT 'success',
+  error TEXT
+);
+
+-- Default config
+INSERT OR IGNORE INTO config (key, value) VALUES
+  ('domain', ''),
+  ('keywords', ''),
+  ('scan_queries_market', ''),
+  ('scan_queries_competitor', ''),
+  ('brief_model', 'gpt-4o-mini'),
+  ('relevance_threshold', '0.3'),
+  ('max_signals_per_scan', '20');
+SQL
+
+  success "Initialized biz-sense database at $DB_PATH"
+  info "Next: configure your domain with 'biz-sense config set domain \"your domain\"'"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_config() {
+  ensure_db
+  local subcmd="${1:-show}"
+  shift 2>/dev/null || true
+
+  case "$subcmd" in
+    show)
+      echo -e "${C_BOLD}📡 biz-sense configuration${C_RESET}"
+      echo ""
+      echo -e "${C_CYAN}Domain settings:${C_RESET}"
+      sqlite3 -column -header "$DB_PATH" "SELECT key, value, updated_at FROM config ORDER BY key;"
+      echo ""
+      echo -e "${C_CYAN}Competitors ($(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM competitors;")):${C_RESET}"
+      sqlite3 -column -header "$DB_PATH" "SELECT id, name, category, url, last_checked FROM competitors ORDER BY name;"
+      ;;
+    set)
+      local key="${1:-}"
+      local value="${2:-}"
+      [[ -z "$key" || -z "$value" ]] && die "Usage: biz-sense config set <key> <value>"
+      sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('$key', '$(echo "$value" | sed "s/'/''/g")', datetime('now'));"
+      success "Set $key = $value"
+      ;;
+    add)
+      local what="${1:-}"
+      case "$what" in
+        competitor)
+          local name="${2:-}"
+          local url="${3:-}"
+          local category="${4:-direct}"
+          [[ -z "$name" ]] && die "Usage: biz-sense config add competitor <name> [url] [category]"
+          sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO competitors (name, url, category) VALUES ('$(echo "$name" | sed "s/'/''/g")', '$(echo "$url" | sed "s/'/''/g")', '$category');"
+          success "Added competitor: $name ($category)"
+          ;;
+        *)
+          die "Unknown config add target: $what. Use: competitor"
+          ;;
+      esac
+      ;;
+    remove)
+      local what="${1:-}"
+      case "$what" in
+        competitor)
+          local name="${2:-}"
+          [[ -z "$name" ]] && die "Usage: biz-sense config remove competitor <name>"
+          sqlite3 "$DB_PATH" "DELETE FROM competitors WHERE name='$(echo "$name" | sed "s/'/''/g")';"
+          success "Removed competitor: $name"
+          ;;
+        *)
+          die "Unknown config remove target: $what"
+          ;;
+      esac
+      ;;
+    *)
+      die "Unknown config subcommand: $subcmd. Use: show, set, add, remove"
+      ;;
+  esac
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+get_config() {
+  local key="$1"
+  sqlite3 "$DB_PATH" "SELECT value FROM config WHERE key='$key';"
+}
+
+compute_dedup_hash() {
+  local title="$1"
+  local summary="$2"
+  # Normalize: lowercase, strip extra whitespace
+  echo -n "$(echo "$title|$summary" | tr '[:upper:]' '[:lower:]' | tr -s ' ')" | sha256sum | cut -d' ' -f1
+}
+
+is_duplicate() {
+  local hash="$1"
+  local count
+  count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM signals WHERE dedup_hash='$hash';")
+  [[ "$count" -gt 0 ]]
+}
+
+get_embedding() {
+  local text="$1"
+  ensure_key "OpenAI API" "OPENAI_API_KEY"
+  local response
+  response=$(curl -s --max-time 15 "$OPENAI_URL/embeddings" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -d "$(jq -n --arg text "$text" '{
+      model: "text-embedding-3-small",
+      input: $text,
+      dimensions: 256
+    }')" 2>/dev/null)
+  echo "$response" | jq -c '.data[0].embedding // empty' 2>/dev/null
+}
+
+llm_call() {
+  local system_prompt="$1"
+  local user_prompt="$2"
+  local model="${3:-gpt-4o-mini}"
+  ensure_key "OpenAI API" "OPENAI_API_KEY"
+  local response
+  response=$(curl -s --max-time 60 "$OPENAI_URL/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -d "$(jq -n \
+      --arg model "$model" \
+      --arg system "$system_prompt" \
+      --arg user "$user_prompt" \
+      '{
+        model: $model,
+        messages: [
+          {role: "system", content: $system},
+          {role: "user", content: $user}
+        ],
+        temperature: 0.3
+      }')" 2>/dev/null)
+  echo "$response" | jq -r '.choices[0].message.content // "ERROR: No response"' 2>/dev/null
+}
+
+brave_search() {
+  local query="$1"
+  local count="${2:-10}"
+  ensure_key "Brave Search API" "BRAVE_API_KEY"
+  curl -s --max-time 15 "$BRAVE_SEARCH_URL" \
+    -H "Accept: application/json" \
+    -H "Accept-Encoding: gzip" \
+    -H "X-Subscription-Token: $BRAVE_API_KEY" \
+    --data-urlencode "q=$query" \
+    --data-urlencode "count=$count" \
+    --data-urlencode "freshness=pw" \
+    --compressed 2>/dev/null
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCAN — Run market intelligence scans
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_scan() {
+  ensure_db
+  local scan_type="${1:-all}"
+  local start_time=$(date +%s)
+
+  local domain
+  domain=$(get_config "domain")
+  [[ -z "$domain" ]] && die "No domain configured. Run: biz-sense config set domain \"your domain\""
+
+  # Check for required API keys
+  if [[ -z "${BRAVE_API_KEY:-}" ]]; then
+    warn "BRAVE_API_KEY not set. Direct scanning unavailable."
+    warn "Use the agent workflow instead: web_search → biz-sense batch-ingest"
+    warn "See: projects/business/workflows/sense-scan.md"
+    return 1
+  fi
+
+  local keywords
+  keywords=$(get_config "keywords")
+
+  local max_signals
+  max_signals=$(get_config "max_signals_per_scan")
+  [[ -z "$max_signals" ]] && max_signals=20
+
+  local relevance_threshold
+  relevance_threshold=$(get_config "relevance_threshold")
+  [[ -z "$relevance_threshold" ]] && relevance_threshold=0.3
+
+  local signals_found=0
+  local signals_new=0
+  local errors=""
+
+  echo -e "${C_BOLD}📡 Running $scan_type scan${C_RESET}"
+  echo -e "${C_DIM}Domain: $domain | Keywords: $keywords${C_RESET}"
+  echo ""
+
+  # ── Market scan ──
+  if [[ "$scan_type" == "market" || "$scan_type" == "all" ]]; then
+    info "Scanning market trends..."
+
+    # Build search queries from domain + keywords
+    local -a queries=()
+    queries+=("$domain market trends $(date +%Y)")
+    queries+=("$domain industry news this week")
+    if [[ -n "$keywords" ]]; then
+      IFS=',' read -ra kw_array <<< "$keywords"
+      for kw in "${kw_array[@]}"; do
+        kw=$(echo "$kw" | xargs)  # trim whitespace
+        queries+=("$kw latest developments")
+      done
+    fi
+
+    # Also use custom scan queries if configured
+    local custom_queries
+    custom_queries=$(get_config "scan_queries_market")
+    if [[ -n "$custom_queries" ]]; then
+      IFS=',' read -ra cq_array <<< "$custom_queries"
+      for cq in "${cq_array[@]}"; do
+        queries+=("$(echo "$cq" | xargs)")
+      done
+    fi
+
+    for query in "${queries[@]}"; do
+      [[ "$signals_found" -ge "$max_signals" ]] && break
+      echo -e "  ${C_DIM}Query: $query${C_RESET}"
+
+      local results
+      results=$(brave_search "$query" 5 2>/dev/null) || { warn "Search failed for: $query"; continue; }
+
+      # Extract results
+      local result_count
+      result_count=$(echo "$results" | jq '.web.results | length' 2>/dev/null) || continue
+      [[ "$result_count" == "0" || "$result_count" == "null" ]] && continue
+
+      # Process each result through LLM for extraction
+      local batch_text=""
+      for i in $(seq 0 $((result_count - 1))); do
+        local title url description
+        title=$(echo "$results" | jq -r ".web.results[$i].title // \"\"" 2>/dev/null)
+        url=$(echo "$results" | jq -r ".web.results[$i].url // \"\"" 2>/dev/null)
+        description=$(echo "$results" | jq -r ".web.results[$i].description // \"\"" 2>/dev/null)
+        batch_text+="[$((i+1))] $title | $url
+$description
+
+"
+      done
+
+      # LLM extraction: classify and score each result
+      local extraction
+      extraction=$(llm_call \
+        "You are a market intelligence analyst. Given search results about '$domain', extract actionable signals. For each result, output a JSON array. Each element: {\"title\": \"...\", \"summary\": \"1-2 sentence insight\", \"url\": \"...\", \"category\": \"market_trend|competitor_move|pricing_intel|technology_shift|opportunity|threat\", \"relevance\": 0.0-1.0, \"sentiment\": \"positive|negative|neutral\", \"actionable\": true/false}. Only include results with relevance >= $relevance_threshold. Output ONLY the JSON array, nothing else." \
+        "Search results for '$query':
+$batch_text")
+
+      # Parse extraction (handle markdown code fences)
+      extraction=$(echo "$extraction" | sed 's/^```json//' | sed 's/^```//' | sed 's/```$//')
+      local signal_count
+      signal_count=$(echo "$extraction" | jq 'length' 2>/dev/null) || { warn "Failed to parse extraction"; continue; }
+
+      for j in $(seq 0 $((signal_count - 1))); do
+        [[ "$signals_found" -ge "$max_signals" ]] && break
+
+        local s_title s_summary s_url s_category s_relevance s_sentiment s_actionable
+        s_title=$(echo "$extraction" | jq -r ".[$j].title // \"\"" 2>/dev/null)
+        s_summary=$(echo "$extraction" | jq -r ".[$j].summary // \"\"" 2>/dev/null)
+        s_url=$(echo "$extraction" | jq -r ".[$j].url // \"\"" 2>/dev/null)
+        s_category=$(echo "$extraction" | jq -r ".[$j].category // \"market_trend\"" 2>/dev/null)
+        s_relevance=$(echo "$extraction" | jq -r ".[$j].relevance // 0.5" 2>/dev/null)
+        s_sentiment=$(echo "$extraction" | jq -r ".[$j].sentiment // \"neutral\"" 2>/dev/null)
+        s_actionable=$(echo "$extraction" | jq -r ".[$j].actionable // false" 2>/dev/null)
+
+        [[ -z "$s_title" || "$s_title" == "null" ]] && continue
+
+        # Dedup check
+        local hash
+        hash=$(compute_dedup_hash "$s_title" "$s_summary")
+        if is_duplicate "$hash"; then
+          echo -e "  ${C_DIM}  ↳ duplicate: $s_title${C_RESET}"
+          continue
+        fi
+
+        # Convert actionable bool to int
+        local actionable_int=0
+        [[ "$s_actionable" == "true" ]] && actionable_int=1
+
+        # Validate category
+        case "$s_category" in
+          market_trend|competitor_move|customer_signal|pricing_intel|technology_shift|opportunity|threat) ;;
+          *) s_category="market_trend" ;;
+        esac
+
+        # Store signal
+        sqlite3 "$DB_PATH" "INSERT INTO signals (source, source_url, category, title, summary, relevance, sentiment, actionable, dedup_hash)
+          VALUES ('brave_search', '$(echo "$s_url" | sed "s/'/''/g")', '$s_category',
+                  '$(echo "$s_title" | sed "s/'/''/g")', '$(echo "$s_summary" | sed "s/'/''/g")',
+                  $s_relevance, '$s_sentiment', $actionable_int, '$hash');"
+
+        signals_found=$((signals_found + 1))
+        signals_new=$((signals_new + 1))
+        local indicator="  "
+        [[ "$actionable_int" -eq 1 ]] && indicator="🎯"
+        echo -e "  ${C_GREEN}+${C_RESET} [$s_category] $indicator $s_title (relevance: $s_relevance)"
+      done
+    done
+  fi
+
+  # ── Competitor scan ──
+  if [[ "$scan_type" == "competitor" || "$scan_type" == "all" ]]; then
+    info "Scanning competitors..."
+
+    local competitors
+    competitors=$(sqlite3 -json "$DB_PATH" "SELECT id, name, url, category FROM competitors;" 2>/dev/null)
+    local comp_count
+    comp_count=$(echo "$competitors" | jq 'length' 2>/dev/null) || comp_count=0
+
+    if [[ "$comp_count" -eq 0 ]]; then
+      warn "No competitors configured. Add with: biz-sense config add competitor <name> <url>"
+    else
+      for i in $(seq 0 $((comp_count - 1))); do
+        local c_id c_name c_url
+        c_id=$(echo "$competitors" | jq -r ".[$i].id" 2>/dev/null)
+        c_name=$(echo "$competitors" | jq -r ".[$i].name" 2>/dev/null)
+        c_url=$(echo "$competitors" | jq -r ".[$i].url" 2>/dev/null)
+
+        echo -e "  ${C_DIM}Checking: $c_name ($c_url)${C_RESET}"
+
+        # Search for recent competitor news
+        local comp_results
+        comp_results=$(brave_search "\"$c_name\" news OR update OR launch OR pricing" 3 2>/dev/null) || { warn "Search failed for $c_name"; continue; }
+
+        local comp_result_count
+        comp_result_count=$(echo "$comp_results" | jq '.web.results | length' 2>/dev/null) || continue
+        [[ "$comp_result_count" == "0" || "$comp_result_count" == "null" ]] && continue
+
+        local comp_batch=""
+        for k in $(seq 0 $((comp_result_count - 1))); do
+          local ct cu cd
+          ct=$(echo "$comp_results" | jq -r ".web.results[$k].title // \"\"" 2>/dev/null)
+          cu=$(echo "$comp_results" | jq -r ".web.results[$k].url // \"\"" 2>/dev/null)
+          cd=$(echo "$comp_results" | jq -r ".web.results[$k].description // \"\"" 2>/dev/null)
+          comp_batch+="[$((k+1))] $ct | $cu
+$cd
+
+"
+        done
+
+        local comp_extraction
+        comp_extraction=$(llm_call \
+          "You are a competitive intelligence analyst. Extract signals about competitor '$c_name' from these search results. Output a JSON array. Each element: {\"title\": \"...\", \"summary\": \"1-2 sentence competitive insight\", \"url\": \"...\", \"category\": \"competitor_move|pricing_intel|technology_shift|threat|opportunity\", \"relevance\": 0.0-1.0, \"sentiment\": \"positive|negative|neutral\", \"actionable\": true/false}. Focus on: pricing changes, new features, positioning shifts, partnerships, funding. Only include results with relevance >= $relevance_threshold. Output ONLY the JSON array." \
+          "Search results for competitor '$c_name':
+$comp_batch")
+
+        comp_extraction=$(echo "$comp_extraction" | sed 's/^```json//' | sed 's/^```//' | sed 's/```$//')
+        local comp_sig_count
+        comp_sig_count=$(echo "$comp_extraction" | jq 'length' 2>/dev/null) || continue
+
+        for j in $(seq 0 $((comp_sig_count - 1))); do
+          [[ "$signals_found" -ge "$max_signals" ]] && break
+
+          local cs_title cs_summary cs_url cs_category cs_relevance cs_sentiment cs_actionable
+          cs_title=$(echo "$comp_extraction" | jq -r ".[$j].title // \"\"" 2>/dev/null)
+          cs_summary=$(echo "$comp_extraction" | jq -r ".[$j].summary // \"\"" 2>/dev/null)
+          cs_url=$(echo "$comp_extraction" | jq -r ".[$j].url // \"\"" 2>/dev/null)
+          cs_category=$(echo "$comp_extraction" | jq -r ".[$j].category // \"competitor_move\"" 2>/dev/null)
+          cs_relevance=$(echo "$comp_extraction" | jq -r ".[$j].relevance // 0.5" 2>/dev/null)
+          cs_sentiment=$(echo "$comp_extraction" | jq -r ".[$j].sentiment // \"neutral\"" 2>/dev/null)
+          cs_actionable=$(echo "$comp_extraction" | jq -r ".[$j].actionable // false" 2>/dev/null)
+
+          [[ -z "$cs_title" || "$cs_title" == "null" ]] && continue
+
+          local hash
+          hash=$(compute_dedup_hash "$cs_title" "$cs_summary")
+          is_duplicate "$hash" && continue
+
+          local actionable_int=0
+          [[ "$cs_actionable" == "true" ]] && actionable_int=1
+
+          case "$cs_category" in
+            market_trend|competitor_move|customer_signal|pricing_intel|technology_shift|opportunity|threat) ;;
+            *) cs_category="competitor_move" ;;
+          esac
+
+          sqlite3 "$DB_PATH" "INSERT INTO signals (source, source_url, category, title, summary, relevance, sentiment, actionable, competitor_id, dedup_hash)
+            VALUES ('brave_search', '$(echo "$cs_url" | sed "s/'/''/g")', '$cs_category',
+                    '$(echo "$cs_title" | sed "s/'/''/g")', '$(echo "$cs_summary" | sed "s/'/''/g")',
+                    $cs_relevance, '$cs_sentiment', $actionable_int, $c_id, '$hash');"
+
+          signals_found=$((signals_found + 1))
+          signals_new=$((signals_new + 1))
+          echo -e "  ${C_GREEN}+${C_RESET} [$cs_category] $cs_title (relevance: $cs_relevance)"
+        done
+
+        # Update last_checked timestamp
+        sqlite3 "$DB_PATH" "UPDATE competitors SET last_checked=datetime('now') WHERE id=$c_id;"
+
+        # ── Competitor URL snapshot (change detection) ──
+        if [[ -n "$c_url" && "$c_url" != "null" ]]; then
+          echo -e "  ${C_DIM}  Snapshotting: $c_url${C_RESET}"
+
+          local page_content
+          page_content=$(curl -sL --max-time 20 "$c_url" 2>/dev/null | head -c 10000 || true)
+
+          if [[ -n "$page_content" ]]; then
+            local content_hash
+            content_hash=$(echo -n "$page_content" | sha256sum | cut -d' ' -f1)
+            local raw_excerpt
+            raw_excerpt=$(echo "$page_content" | head -c 2000 | sed "s/'/''/g")
+
+            # Check if changed from last snapshot
+            local last_hash
+            last_hash=$(sqlite3 "$DB_PATH" "SELECT content_hash FROM competitor_snapshots WHERE competitor_id=$c_id ORDER BY ts DESC LIMIT 1;" 2>/dev/null)
+
+            local changed=0
+            if [[ -n "$last_hash" && "$last_hash" != "$content_hash" ]]; then
+              changed=1
+              echo -e "  ${C_YELLOW}⚡ CHANGE DETECTED${C_RESET} for $c_name"
+
+              # Extract what changed via LLM
+              local last_excerpt
+              last_excerpt=$(sqlite3 "$DB_PATH" "SELECT raw_excerpt FROM competitor_snapshots WHERE competitor_id=$c_id ORDER BY ts DESC LIMIT 1;" 2>/dev/null)
+
+              if [[ -n "$last_excerpt" ]]; then
+                local change_analysis
+                change_analysis=$(llm_call \
+                  "Compare these two snapshots of a competitor's page and describe what changed. Focus on pricing, features, positioning. Be concise (2-3 sentences)." \
+                  "PREVIOUS:
+$last_excerpt
+
+CURRENT:
+$raw_excerpt")
+
+                # Store as a signal
+                local change_hash
+                change_hash=$(compute_dedup_hash "Change: $c_name" "$change_analysis")
+                if ! is_duplicate "$change_hash"; then
+                  sqlite3 "$DB_PATH" "INSERT INTO signals (source, source_url, category, title, summary, relevance, sentiment, actionable, competitor_id, dedup_hash)
+                    VALUES ('web_fetch', '$(echo "$c_url" | sed "s/'/''/g")', 'competitor_move',
+                            'Change detected: $c_name', '$(echo "$change_analysis" | sed "s/'/''/g")',
+                            0.8, 'neutral', 1, $c_id, '$change_hash');"
+                  signals_found=$((signals_found + 1))
+                  signals_new=$((signals_new + 1))
+                  echo -e "  ${C_GREEN}+${C_RESET} [competitor_move] 🎯 Change detected: $c_name"
+                fi
+              fi
+            elif [[ -z "$last_hash" ]]; then
+              echo -e "  ${C_DIM}  ↳ First snapshot captured${C_RESET}"
+            else
+              echo -e "  ${C_DIM}  ↳ No changes${C_RESET}"
+            fi
+
+            sqlite3 "$DB_PATH" "INSERT INTO competitor_snapshots (competitor_id, content_hash, raw_excerpt, changed)
+              VALUES ($c_id, '$content_hash', '$raw_excerpt', $changed);"
+          fi
+        fi
+      done
+    fi
+  fi
+
+  # ── Log scan results ──
+  local end_time=$(date +%s)
+  local duration=$((end_time - start_time))
+
+  sqlite3 "$DB_PATH" "INSERT INTO scan_log (scan_type, signals_found, signals_new, duration_sec, status)
+    VALUES ('$scan_type', $signals_found, $signals_new, $duration, 'success');"
+
+  echo ""
+  echo -e "${C_BOLD}Scan complete${C_RESET}"
+  echo -e "  Signals found: ${C_GREEN}$signals_found${C_RESET} ($signals_new new)"
+  echo -e "  Duration: ${duration}s"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIGNALS — List recent intelligence signals
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_signals() {
+  ensure_db
+  local limit="${1:-20}"
+  local category="${2:-}"
+
+  echo -e "${C_BOLD}📊 Recent signals${C_RESET}"
+
+  local where=""
+  [[ -n "$category" ]] && where="WHERE category='$category'"
+
+  local total
+  total=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM signals $where;")
+  echo -e "${C_DIM}Total signals: $total (showing last $limit)${C_RESET}"
+  echo ""
+
+  local results
+  results=$(sqlite3 -json "$DB_PATH" "SELECT id, ts, category, title, summary, relevance, sentiment, actionable, source_url FROM signals $where ORDER BY ts DESC LIMIT $limit;" 2>/dev/null)
+
+  local count
+  count=$(echo "$results" | jq 'length' 2>/dev/null) || count=0
+
+  for i in $(seq 0 $((count - 1))); do
+    local s_id s_ts s_cat s_title s_summary s_rel s_sent s_act
+    s_id=$(echo "$results" | jq -r ".[$i].id" 2>/dev/null)
+    s_ts=$(echo "$results" | jq -r ".[$i].ts" 2>/dev/null)
+    s_cat=$(echo "$results" | jq -r ".[$i].category" 2>/dev/null)
+    s_title=$(echo "$results" | jq -r ".[$i].title" 2>/dev/null)
+    s_summary=$(echo "$results" | jq -r ".[$i].summary" 2>/dev/null)
+    s_rel=$(echo "$results" | jq -r ".[$i].relevance" 2>/dev/null)
+    s_act=$(echo "$results" | jq -r ".[$i].actionable" 2>/dev/null)
+
+    local indicator=" "
+    [[ "$s_act" == "1" ]] && indicator="🎯"
+
+    local cat_color="$C_DIM"
+    case "$s_cat" in
+      threat) cat_color="$C_RED" ;;
+      opportunity) cat_color="$C_GREEN" ;;
+      competitor_move) cat_color="$C_YELLOW" ;;
+      pricing_intel) cat_color="$C_MAGENTA" ;;
+    esac
+
+    echo -e "${C_DIM}#$s_id ${s_ts}${C_RESET} ${cat_color}[$s_cat]${C_RESET} $indicator"
+    echo -e "  ${C_BOLD}$s_title${C_RESET} (rel: $s_rel)"
+    echo -e "  ${C_DIM}$s_summary${C_RESET}"
+    echo ""
+  done
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BRIEF — Generate market intelligence brief
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_brief() {
+  ensure_db
+  local period="${1:-7d}"
+
+  # Convert period to days
+  local days
+  case "$period" in
+    *d) days="${period%d}" ;;
+    *w) days=$(( ${period%w} * 7 )) ;;
+    *m) days=$(( ${period%m} * 30 )) ;;
+    *) days=7 ;;
+  esac
+
+  local domain
+  domain=$(get_config "domain")
+
+  echo -e "${C_BOLD}📋 Generating $period market intelligence brief${C_RESET}"
+
+  # Gather signals from the period
+  local signals
+  signals=$(sqlite3 -json "$DB_PATH" "SELECT category, title, summary, relevance, sentiment, actionable, source_url
+    FROM signals
+    WHERE ts >= datetime('now', '-$days days')
+    ORDER BY relevance DESC
+    LIMIT 50;" 2>/dev/null)
+
+  local signal_count
+  signal_count=$(echo "$signals" | jq 'length' 2>/dev/null) || signal_count=0
+
+  if [[ "$signal_count" -eq 0 ]]; then
+    warn "No signals found in the last $days days. Run 'biz-sense scan' first."
+    return 1
+  fi
+
+  info "Synthesizing $signal_count signals..."
+
+  # Gather competitor changes
+  local changes
+  changes=$(sqlite3 -json "$DB_PATH" "SELECT c.name, cs.changed, cs.pricing, cs.features, cs.positioning
+    FROM competitor_snapshots cs
+    JOIN competitors c ON cs.competitor_id = c.id
+    WHERE cs.ts >= datetime('now', '-$days days') AND cs.changed = 1;" 2>/dev/null)
+
+  local model
+  model=$(get_config "brief_model")
+  [[ -z "$model" ]] && model="gpt-4o-mini"
+
+  local brief
+  brief=$(llm_call \
+    "You are a market intelligence analyst producing a brief for a business in the '$domain' space. Write a concise, actionable intelligence brief. Structure:
+
+## Market Intelligence Brief — [date range]
+
+### Key Findings (top 3-5)
+Numbered list of the most important signals.
+
+### Competitive Landscape
+What competitors are doing. Changes detected.
+
+### Opportunities
+Specific opportunities identified.
+
+### Threats & Risks
+What to watch out for.
+
+### Recommended Actions
+2-3 specific, concrete actions to take based on this intelligence.
+
+Be specific. Use data from the signals. No filler." \
+    "Signals from the last $days days:
+$(echo "$signals" | jq -r '.[] | "[\(.category)] \(.title): \(.summary) (relevance: \(.relevance), sentiment: \(.sentiment))"' 2>/dev/null)
+
+Competitor changes:
+$(echo "$changes" | jq -r '.[] | "\(.name): changed" // "No changes detected"' 2>/dev/null)" \
+    "$model")
+
+  # Extract key findings and recommendations as JSON for storage
+  local key_findings recommendations
+  key_findings=$(llm_call \
+    "Extract the key findings from this brief as a JSON array of strings. Output ONLY the JSON array." \
+    "$brief" \
+    "gpt-4o-mini")
+  key_findings=$(echo "$key_findings" | sed 's/^```json//' | sed 's/^```//' | sed 's/```$//')
+
+  recommendations=$(llm_call \
+    "Extract the recommended actions from this brief as a JSON array of strings. Output ONLY the JSON array." \
+    "$brief" \
+    "gpt-4o-mini")
+  recommendations=$(echo "$recommendations" | sed 's/^```json//' | sed 's/^```//' | sed 's/```$//')
+
+  # Store brief
+  sqlite3 "$DB_PATH" "INSERT INTO briefs (period, signal_count, brief_text, key_findings, recommendations)
+    VALUES ('$period', $signal_count,
+            '$(echo "$brief" | sed "s/'/''/g")',
+            '$(echo "$key_findings" | sed "s/'/''/g")',
+            '$(echo "$recommendations" | sed "s/'/''/g")');"
+
+  echo ""
+  echo "$brief"
+  echo ""
+  echo -e "${C_DIM}Brief stored. View past briefs with: sqlite3 $DB_PATH \"SELECT id, ts, period, signal_count FROM briefs;\"${C_RESET}"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WATCH — List monitored targets
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_watch() {
+  ensure_db
+
+  echo -e "${C_BOLD}👁️  Monitored targets${C_RESET}"
+  echo ""
+
+  echo -e "${C_CYAN}Competitors:${C_RESET}"
+  sqlite3 -column -header "$DB_PATH" "SELECT c.id, c.name, c.category, c.url,
+    c.last_checked,
+    (SELECT COUNT(*) FROM competitor_snapshots cs WHERE cs.competitor_id = c.id) as snapshots,
+    (SELECT COUNT(*) FROM competitor_snapshots cs WHERE cs.competitor_id = c.id AND cs.changed = 1) as changes
+  FROM competitors c ORDER BY c.name;"
+
+  echo ""
+  echo -e "${C_CYAN}Keywords:${C_RESET}"
+  local kw
+  kw=$(get_config "keywords")
+  if [[ -n "$kw" ]]; then
+    IFS=',' read -ra kw_array <<< "$kw"
+    for kw in "${kw_array[@]}"; do
+      echo -e "  • $(echo "$kw" | xargs)"
+    done
+  else
+    echo -e "  ${C_DIM}(none configured)${C_RESET}"
+  fi
+
+  echo ""
+  echo -e "${C_CYAN}Custom scan queries:${C_RESET}"
+  local mq cq
+  mq=$(get_config "scan_queries_market")
+  cq=$(get_config "scan_queries_competitor")
+  [[ -n "$mq" ]] && echo -e "  Market: $mq" || echo -e "  Market: ${C_DIM}(using defaults)${C_RESET}"
+  [[ -n "$cq" ]] && echo -e "  Competitor: $cq" || echo -e "  Competitor: ${C_DIM}(using defaults)${C_RESET}"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHANGES — Show significant changes detected
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_changes() {
+  ensure_db
+  local since="${1:-7d}"
+  local days
+  case "$since" in
+    *d) days="${since%d}" ;;
+    *w) days=$(( ${since%w} * 7 )) ;;
+    *) days=7 ;;
+  esac
+
+  echo -e "${C_BOLD}⚡ Changes detected (last $days days)${C_RESET}"
+  echo ""
+
+  echo -e "${C_CYAN}Competitor page changes:${C_RESET}"
+  sqlite3 -column -header "$DB_PATH" "SELECT c.name, cs.ts, cs.changed
+    FROM competitor_snapshots cs
+    JOIN competitors c ON cs.competitor_id = c.id
+    WHERE cs.ts >= datetime('now', '-$days days')
+    ORDER BY cs.ts DESC;"
+
+  echo ""
+  echo -e "${C_CYAN}Actionable signals:${C_RESET}"
+  local actionable
+  actionable=$(sqlite3 -json "$DB_PATH" "SELECT id, ts, category, title, summary, relevance
+    FROM signals
+    WHERE ts >= datetime('now', '-$days days') AND actionable = 1
+    ORDER BY relevance DESC;" 2>/dev/null)
+
+  local act_count
+  act_count=$(echo "$actionable" | jq 'length' 2>/dev/null) || act_count=0
+
+  if [[ "$act_count" -eq 0 ]]; then
+    echo -e "  ${C_DIM}No actionable signals in this period.${C_RESET}"
+  else
+    for i in $(seq 0 $((act_count - 1))); do
+      local a_title a_summary a_rel a_cat
+      a_title=$(echo "$actionable" | jq -r ".[$i].title" 2>/dev/null)
+      a_summary=$(echo "$actionable" | jq -r ".[$i].summary" 2>/dev/null)
+      a_rel=$(echo "$actionable" | jq -r ".[$i].relevance" 2>/dev/null)
+      a_cat=$(echo "$actionable" | jq -r ".[$i].category" 2>/dev/null)
+      echo -e "  🎯 ${C_BOLD}$a_title${C_RESET} [$a_cat, rel: $a_rel]"
+      echo -e "     ${C_DIM}$a_summary${C_RESET}"
+    done
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INGEST — Manually add a signal (from customer feedback, conversations, etc.)
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_ingest() {
+  ensure_db
+  local category="${1:-}"
+  local title="${2:-}"
+  local summary="${3:-}"
+  local source="${4:-manual}"
+
+  [[ -z "$category" || -z "$title" || -z "$summary" ]] && die "Usage: biz-sense ingest <category> <title> <summary> [source]"
+
+  # Validate category
+  case "$category" in
+    market_trend|competitor_move|customer_signal|pricing_intel|technology_shift|opportunity|threat) ;;
+    *) die "Invalid category. Use: market_trend, competitor_move, customer_signal, pricing_intel, technology_shift, opportunity, threat" ;;
+  esac
+
+  local hash
+  hash=$(compute_dedup_hash "$title" "$summary")
+  if is_duplicate "$hash"; then
+    warn "Duplicate signal: $title"
+    return 0
+  fi
+
+  sqlite3 "$DB_PATH" "INSERT INTO signals (source, category, title, summary, relevance, actionable, dedup_hash)
+    VALUES ('$source', '$category', '$(echo "$title" | sed "s/'/''/g")', '$(echo "$summary" | sed "s/'/''/g")', 0.5, 0, '$hash');"
+
+  success "Ingested signal: [$category] $title"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BATCH-INGEST — Bulk import signals from JSON (stdin or file)
+# Format: [{"category":"...","title":"...","summary":"...","source":"...","source_url":"...","relevance":0.5,"sentiment":"neutral","actionable":false}]
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_batch_ingest() {
+  ensure_db
+  local input_file="${1:--}"
+  local json
+
+  if [[ "$input_file" == "-" ]]; then
+    json=$(cat)
+  else
+    json=$(cat "$input_file")
+  fi
+
+  local count
+  count=$(echo "$json" | jq 'length' 2>/dev/null) || die "Invalid JSON input"
+
+  local ingested=0
+  local dupes=0
+
+  for i in $(seq 0 $((count - 1))); do
+    local s_cat s_title s_summary s_source s_url s_rel s_sent s_act
+    s_cat=$(echo "$json" | jq -r ".[$i].category // \"market_trend\"" 2>/dev/null)
+    s_title=$(echo "$json" | jq -r ".[$i].title // \"\"" 2>/dev/null)
+    s_summary=$(echo "$json" | jq -r ".[$i].summary // \"\"" 2>/dev/null)
+    s_source=$(echo "$json" | jq -r ".[$i].source // \"agent_scan\"" 2>/dev/null)
+    s_url=$(echo "$json" | jq -r ".[$i].source_url // \"\"" 2>/dev/null)
+    s_rel=$(echo "$json" | jq -r ".[$i].relevance // 0.5" 2>/dev/null)
+    s_sent=$(echo "$json" | jq -r ".[$i].sentiment // \"neutral\"" 2>/dev/null)
+    s_act=$(echo "$json" | jq -r ".[$i].actionable // false" 2>/dev/null)
+
+    [[ -z "$s_title" || "$s_title" == "null" ]] && continue
+
+    # Validate category
+    case "$s_cat" in
+      market_trend|competitor_move|customer_signal|pricing_intel|technology_shift|opportunity|threat) ;;
+      *) s_cat="market_trend" ;;
+    esac
+
+    local hash
+    hash=$(compute_dedup_hash "$s_title" "$s_summary")
+    if is_duplicate "$hash"; then
+      dupes=$((dupes + 1))
+      continue
+    fi
+
+    local actionable_int=0
+    [[ "$s_act" == "true" || "$s_act" == "1" ]] && actionable_int=1
+
+    sqlite3 "$DB_PATH" "INSERT INTO signals (source, source_url, category, title, summary, relevance, sentiment, actionable, dedup_hash)
+      VALUES ('$(echo "$s_source" | sed "s/'/''/g")', '$(echo "$s_url" | sed "s/'/''/g")', '$s_cat',
+              '$(echo "$s_title" | sed "s/'/''/g")', '$(echo "$s_summary" | sed "s/'/''/g")',
+              $s_rel, '$s_sent', $actionable_int, '$hash');"
+
+    ingested=$((ingested + 1))
+  done
+
+  # Log scan
+  sqlite3 "$DB_PATH" "INSERT INTO scan_log (scan_type, signals_found, signals_new, duration_sec, status)
+    VALUES ('batch_ingest', $count, $ingested, 0, 'success');"
+
+  success "Batch ingested: $ingested new signals ($dupes duplicates skipped)"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATS — Sensing layer health and activity stats
+# ══════════════════════════════════════════════════════════════════════════════
+cmd_stats() {
+  ensure_db
+
+  echo -e "${C_BOLD}📈 biz-sense stats${C_RESET}"
+  echo ""
+
+  local total_signals total_actionable total_competitors total_scans total_briefs
+  total_signals=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM signals;")
+  total_actionable=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM signals WHERE actionable=1;")
+  total_competitors=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM competitors;")
+  total_scans=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM scan_log;")
+  total_briefs=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM briefs;")
+
+  echo -e "  Signals:      ${C_BOLD}$total_signals${C_RESET} ($total_actionable actionable)"
+  echo -e "  Competitors:  ${C_BOLD}$total_competitors${C_RESET}"
+  echo -e "  Scans:        ${C_BOLD}$total_scans${C_RESET}"
+  echo -e "  Briefs:       ${C_BOLD}$total_briefs${C_RESET}"
+  echo ""
+
+  echo -e "${C_CYAN}Signals by category:${C_RESET}"
+  sqlite3 -column -header "$DB_PATH" "SELECT category, COUNT(*) as count, ROUND(AVG(relevance), 2) as avg_relevance
+    FROM signals GROUP BY category ORDER BY count DESC;"
+
+  echo ""
+  echo -e "${C_CYAN}Recent scans:${C_RESET}"
+  sqlite3 -column -header "$DB_PATH" "SELECT ts, scan_type, signals_found, signals_new, duration_sec, status
+    FROM scan_log ORDER BY ts DESC LIMIT 5;"
+
+  echo ""
+  echo -e "${C_CYAN}Signal coverage:${C_RESET}"
+  local week_signals month_signals
+  week_signals=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM signals WHERE ts >= datetime('now', '-7 days');")
+  month_signals=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM signals WHERE ts >= datetime('now', '-30 days');")
+  echo -e "  Last 7 days:  $week_signals signals"
+  echo -e "  Last 30 days: $month_signals signals"
+
+  # Domain config status
+  local domain
+  domain=$(get_config "domain")
+  echo ""
+  if [[ -z "$domain" ]]; then
+    echo -e "${C_RED}⚠ No domain configured!${C_RESET} Run: biz-sense config set domain \"your domain\""
+  else
+    echo -e "  Domain: ${C_GREEN}$domain${C_RESET}"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN DISPATCHER
+# ══════════════════════════════════════════════════════════════════════════════
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    init)      cmd_init "$@" ;;
+    config)    cmd_config "$@" ;;
+    scan)      cmd_scan "$@" ;;
+    signals)   cmd_signals "$@" ;;
+    brief)     cmd_brief "$@" ;;
+    watch)     cmd_watch "$@" ;;
+    changes)   cmd_changes "$@" ;;
+    ingest)    cmd_ingest "$@" ;;
+    batch-ingest) cmd_batch_ingest "$@" ;;
+    stats)     cmd_stats "$@" ;;
+    version)   echo "biz-sense v$VERSION" ;;
+    help|--help|-h)
+      echo "biz-sense v$VERSION — Market sensing layer"
+      echo ""
+      echo "Commands:"
+      echo "  init                           Initialize database"
+      echo "  config show|set|add|remove     Manage domain configuration"
+      echo "  scan [market|competitor|all]    Run intelligence scan"
+      echo "  brief [7d|30d|...]             Generate market intelligence brief"
+      echo "  signals [--limit N] [category]  List recent signals"
+      echo "  watch                          List monitored targets"
+      echo "  changes [7d|30d|...]           Show significant changes"
+      echo "  ingest <cat> <title> <summary>  Manually add a signal"
+      echo "  batch-ingest [file|-]          Bulk import signals from JSON"
+      echo "  stats                          Sensing layer health stats"
+      echo ""
+      echo "Agent scan workflow:"
+      echo "  1. Use web_search to find market signals"
+      echo "  2. Format as JSON array and pipe to: biz-sense batch-ingest"
+      echo "  3. Run: biz-sense brief 7d"
+      echo ""
+      echo "Categories: market_trend, competitor_move, customer_signal,"
+      echo "            pricing_intel, technology_shift, opportunity, threat"
+      ;;
+    *)
+      die "Unknown command: $cmd. Run 'biz-sense help' for usage."
+      ;;
+  esac
+}
+
+main "$@"
