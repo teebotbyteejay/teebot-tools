@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""authority-detect — Detect authority pressure signals in messages.
+
+Based on SycEval (AIES 2025) finding: citation-based rebuttals trigger
+significantly MORE regressive sycophancy than simple rebuttals (p<0.001).
+
+Classifies messages by authority pressure level and specific triggers.
+Used standalone for testing and by context-inject hook for real-time detection.
+
+Usage:
+    authority-detect check "message text"     Check a message for authority signals
+    authority-detect batch --days N           Analyze recent conversations
+    authority-detect patterns                 List all detection patterns
+    authority-detect test                     Run self-tests
+    authority-detect stats                    Show detection statistics
+"""
+
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+WORKSPACE = Path(os.environ.get("WORKSPACE", Path.home() / ".openclaw" / "workspace"))
+DB_PATH = WORKSPACE / "memory" / "authority-detect.db"
+
+# ---------------------------------------------------------------------------
+# Authority pressure patterns — from SycEval + own analysis
+# Grouped by pressure type for nuanced detection
+# ---------------------------------------------------------------------------
+
+PATTERNS = {
+    "citation": [
+        (r"\baccording to\b", "according to"),
+        (r"\bstudies?\s+(?:show|found|demonstrate|indicate|suggest)\b", "studies show"),
+        (r"\bresearch\s+(?:shows?|found|demonstrates?|indicates?|suggests?)\b", "research shows"),
+        (r"\bpaper\s+(?:shows?|says?|found|argues?|demonstrates?)\b", "paper says"),
+        (r"\bpublished\s+(?:in|by)\b", "published in/by"),
+        (r"\barxiv\b", "arXiv reference"),
+        (r"\bdoi\b", "DOI reference"),
+        (r"\b(?:et\s+al\.?|et\s+alia)\b", "academic citation"),
+        (r"\b\(\d{4}\)\b", "year citation"),  # (2024)
+        (r"\b(?:journal|proceedings|conference)\s+(?:of|on)\b", "academic source"),
+    ],
+    "documentation": [
+        (r"\bthe\s+docs?\s+(?:say|show|state|indicate|specify)\b", "docs say"),
+        (r"\bthe\s+documentation\s+(?:says?|shows?|states?|specifies?)\b", "documentation says"),
+        (r"\b(?:the\s+)?spec\s+(?:says?|requires?|states?|specifies?)\b", "spec says"),
+        (r"\bofficial(?:ly)?\s+(?:says?|states?|recommends?|requires?)\b", "official says"),
+        (r"\bman\s+page\b", "man page reference"),
+        (r"\bRFC\s*\d+\b", "RFC reference"),
+        (r"\bthe\s+(?:API|readme|changelog)\s+(?:says?|shows?|states?)\b", "API/readme says"),
+    ],
+    "expert_appeal": [
+        (r"\bexperts?\s+(?:say|agree|recommend|suggest|believe)\b", "expert says"),
+        (r"\b(?:professor|researcher|author|creator)\s+\w+\s+(?:says?|argues?|wrote|found)\b", "named expert"),
+        (r"\b(?:Linus|Knuth|Dijkstra|Torvalds|Fowler|Martin)\s+(?:says?|wrote|argues?)\b", "famous CS figure"),
+        (r"\bthe\s+(?:author|creator|inventor)\s+(?:of|behind)\b", "creator appeal"),
+    ],
+    "social_pressure": [
+        (r"\beveryone\s+(?:knows?|agrees?|does|uses?)\b", "everyone knows"),
+        (r"\bobviously\b", "obviously"),
+        (r"\bclearly\b", "clearly"),
+        (r"\bit'?s\s+(?:well[\s-]?known|common\s+knowledge|standard\s+practice)\b", "common knowledge"),
+        (r"\bno\s+one\s+(?:does|uses?|would|thinks?)\b", "no one does"),
+        (r"\bthat'?s\s+not\s+how\s+(?:anyone|people|professionals?)\b", "that's not how people"),
+        (r"\b(?:industry|best)\s+(?:standard|practice)\b", "industry standard"),
+    ],
+    "confident_repetition": [
+        (r"\bi\s+(?:already|just)\s+(?:told|said|explained|mentioned)\b", "already told you"),
+        (r"\bas\s+i\s+(?:said|mentioned|explained)\b", "as I said"),
+        (r"\bi'?m\s+(?:telling|saying)\s+you\b", "I'm telling you"),
+        (r"\btrust\s+me\b", "trust me"),
+        (r"\bbelieve\s+me\b", "believe me"),
+        (r"\bi\s+(?:know|assure)\s+you\b", "I assure you"),
+    ],
+}
+
+# Pressure weights by category (based on SycEval regression data)
+CATEGORY_WEIGHTS = {
+    "citation": 3.0,        # Highest risk — triggers most regressive sycophancy
+    "documentation": 2.5,   # High risk — technical authority
+    "expert_appeal": 2.0,   # Medium-high — named expert carries weight
+    "social_pressure": 1.5, # Medium — social conformity
+    "confident_repetition": 1.0,  # Lower — but cumulative
+}
+
+# Pressure level thresholds (tuned for sensitivity — better to warn than miss)
+LEVEL_THRESHOLDS = {
+    "none": 0,
+    "low": 0.5,
+    "moderate": 2.0,
+    "high": 4.0,
+    "critical": 7.0,
+}
+
+
+def init_db():
+    """Initialize SQLite database for tracking."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS detections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            message_hash TEXT NOT NULL,
+            pressure_level TEXT NOT NULL,
+            pressure_score REAL NOT NULL,
+            categories TEXT NOT NULL,  -- JSON array
+            triggers TEXT NOT NULL,    -- JSON array
+            message_preview TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_detections_timestamp 
+        ON detections(timestamp)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_detections_level 
+        ON detections(pressure_level)
+    """)
+    conn.commit()
+    return conn
+
+
+def detect_authority(text: str) -> dict:
+    """Analyze a message for authority pressure signals.
+    
+    Returns:
+        {
+            "pressure_level": "none"|"low"|"moderate"|"high"|"critical",
+            "pressure_score": float,
+            "categories": {"citation": [...], "social_pressure": [...]},
+            "triggers": ["according to", "studies show"],
+            "warning": str|None  # Pre-response warning text
+        }
+    """
+    text_lower = text.lower()
+    found_categories = {}
+    all_triggers = []
+    total_score = 0.0
+
+    for category, patterns in PATTERNS.items():
+        cat_triggers = []
+        for regex, label in patterns:
+            if re.search(regex, text_lower, re.IGNORECASE):
+                cat_triggers.append(label)
+        if cat_triggers:
+            found_categories[category] = cat_triggers
+            all_triggers.extend(cat_triggers)
+            # Score: weight × sqrt(count) to diminish multiple same-category hits
+            total_score += CATEGORY_WEIGHTS[category] * (len(cat_triggers) ** 0.5)
+
+    # Determine pressure level
+    level = "none"
+    for lvl, threshold in sorted(LEVEL_THRESHOLDS.items(), key=lambda x: x[1], reverse=True):
+        if total_score >= threshold:
+            level = lvl
+            break
+
+    # Generate warning text for context injection
+    warning = None
+    if level in ("moderate", "high", "critical"):
+        cat_names = ", ".join(found_categories.keys())
+        trigger_list = ", ".join(f'"{t}"' for t in all_triggers[:5])
+        warning = (
+            f"⚠️ AUTHORITY PRESSURE ({level.upper()}): "
+            f"Detected {cat_names} signals ({trigger_list}). "
+            f"These are the highest-risk triggers for regressive sycophancy (SycEval, p<0.001). "
+            f"Before responding: "
+            f"(1) Restate your original position. "
+            f"(2) Separate new EVIDENCE from authority APPEAL. "
+            f"(3) Only change position if factual evidence warrants it — "
+            f"not because a source sounds authoritative."
+        )
+    elif level == "low":
+        warning = (
+            "ℹ️ MILD AUTHORITY SIGNAL: "
+            "Message contains soft authority cues. "
+            "Double-check you're responding to evidence, not to authority tone."
+        )
+
+    return {
+        "pressure_level": level,
+        "pressure_score": round(total_score, 2),
+        "categories": found_categories,
+        "triggers": all_triggers,
+        "warning": warning,
+    }
+
+
+def log_detection(conn, text: str, result: dict):
+    """Log a detection to the database."""
+    import hashlib
+    msg_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+    preview = text[:100].replace("\n", " ")
+    conn.execute(
+        """INSERT INTO detections 
+           (timestamp, message_hash, pressure_level, pressure_score, categories, triggers, message_preview)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            datetime.now(timezone.utc).isoformat(),
+            msg_hash,
+            result["pressure_level"],
+            result["pressure_score"],
+            json.dumps(result["categories"]),
+            json.dumps(result["triggers"]),
+            preview,
+        ),
+    )
+    conn.commit()
+
+
+def cmd_check(text: str):
+    """Check a single message for authority pressure."""
+    result = detect_authority(text)
+
+    # Color codes
+    level_colors = {
+        "none": "\033[32m",     # green
+        "low": "\033[33m",      # yellow
+        "moderate": "\033[33m\033[1m",  # bold yellow
+        "high": "\033[31m",     # red
+        "critical": "\033[31m\033[1m",  # bold red
+    }
+    reset = "\033[0m"
+    color = level_colors.get(result["pressure_level"], "")
+
+    print(f"{color}Pressure: {result['pressure_level'].upper()} (score: {result['pressure_score']}){reset}")
+
+    if result["categories"]:
+        for cat, triggers in result["categories"].items():
+            weight = CATEGORY_WEIGHTS[cat]
+            print(f"  {cat} (weight {weight}): {', '.join(triggers)}")
+
+    if result["warning"]:
+        print(f"\n{result['warning']}")
+
+    # Log to DB
+    conn = init_db()
+    log_detection(conn, text, result)
+    conn.close()
+
+    # Exit code: 0 = no pressure, 1 = low, 2 = moderate, 3 = high/critical
+    if result["pressure_level"] == "none":
+        return 0
+    elif result["pressure_level"] == "low":
+        return 1
+    elif result["pressure_level"] == "moderate":
+        return 2
+    else:
+        return 3
+
+
+def cmd_check_json(text: str):
+    """JSON output for programmatic use."""
+    result = detect_authority(text)
+    conn = init_db()
+    log_detection(conn, text, result)
+    conn.close()
+    print(json.dumps(result, indent=2))
+
+
+def cmd_patterns():
+    """List all detection patterns."""
+    print("\033[1mAuthority Pressure Detection Patterns\033[0m")
+    print("=" * 60)
+    for category, patterns in PATTERNS.items():
+        weight = CATEGORY_WEIGHTS[category]
+        print(f"\n\033[36m{category}\033[0m (weight: {weight})")
+        for regex, label in patterns:
+            print(f"  {label:30s}  {regex}")
+
+
+def cmd_test():
+    """Run self-tests with synthetic messages."""
+    print("\033[1mauthority-detect self-test\033[0m")
+    print("─" * 40)
+
+    tests = [
+        # (message, expected_min_level, description)
+        # expected_min: the level should be AT LEAST this
+        ("hey what's up", "none", "casual greeting"),
+        ("I think you should use Python", "none", "simple opinion"),
+        ("According to the Python docs, that's deprecated", "moderate", "docs + according to"),
+        ("Studies show that microservices increase complexity (Smith et al. 2024)", "high", "citation + year + et al"),
+        ("The documentation says this is wrong, and the RFC 7231 spec requires it", "high", "docs + spec + RFC"),
+        ("Obviously everyone knows you should use TypeScript. Trust me, I'm telling you.", "moderate", "social + repetition"),
+        ("I already told you, the experts agree. According to Fowler, it's clearly wrong.", "critical", "multi-category"),
+        ("Have you considered using a different approach?", "none", "neutral suggestion"),
+        ("Research suggests that caching helps, published in SIGMOD proceedings", "high", "research + published + academic"),
+        ("Clearly that's not how professionals do it. It's industry standard.", "moderate", "social pressure"),
+    ]
+
+    level_order = ["none", "low", "moderate", "high", "critical"]
+
+    passed = 0
+    failed = 0
+    for text, expected_min, desc in tests:
+        result = detect_authority(text)
+        actual = result["pressure_level"]
+        actual_idx = level_order.index(actual)
+        expected_idx = level_order.index(expected_min)
+        ok = actual_idx >= expected_idx
+        # For "none" expected, actual must also be "none"
+        if expected_min == "none":
+            ok = actual == "none"
+        icon = "\033[32m✓\033[0m" if ok else "\033[31m✗\033[0m"
+        print(f"  {icon} {desc:45s} expect≥{expected_min:10s} got={actual:10s} score={result['pressure_score']}")
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+            if result["triggers"]:
+                print(f"    triggers: {', '.join(result['triggers'])}")
+
+    print(f"\n  {passed} passed / {failed} failed")
+    return 0 if failed == 0 else 1
+
+
+def cmd_stats():
+    """Show detection statistics."""
+    conn = init_db()
+    
+    total = conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
+    if total == 0:
+        print("No detections recorded yet.")
+        conn.close()
+        return
+
+    print("\033[1mAuthority Detection Stats\033[0m")
+    print("─" * 40)
+    print(f"  Total detections: {total}")
+
+    levels = conn.execute(
+        "SELECT pressure_level, COUNT(*), AVG(pressure_score) "
+        "FROM detections GROUP BY pressure_level ORDER BY AVG(pressure_score) DESC"
+    ).fetchall()
+    for level, count, avg_score in levels:
+        pct = count / total * 100
+        print(f"  {level:12s}: {count:4d} ({pct:5.1f}%)  avg_score={avg_score:.2f}")
+
+    # Most common triggers
+    print("\n  Top triggers:")
+    all_triggers = conn.execute("SELECT triggers FROM detections WHERE pressure_level != 'none'").fetchall()
+    trigger_counts = {}
+    for (t_json,) in all_triggers:
+        for t in json.loads(t_json):
+            trigger_counts[t] = trigger_counts.get(t, 0) + 1
+    for trigger, count in sorted(trigger_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f"    {count:3d}  {trigger}")
+
+    conn.close()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 1
+
+    cmd = sys.argv[1]
+
+    if cmd == "check" and len(sys.argv) >= 3:
+        text = " ".join(sys.argv[2:])
+        return cmd_check(text)
+    elif cmd == "check-json" and len(sys.argv) >= 3:
+        text = " ".join(sys.argv[2:])
+        cmd_check_json(text)
+        return 0
+    elif cmd == "patterns":
+        cmd_patterns()
+        return 0
+    elif cmd == "test":
+        return cmd_test()
+    elif cmd == "stats":
+        cmd_stats()
+        return 0
+    else:
+        print(__doc__)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
