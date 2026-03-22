@@ -190,7 +190,7 @@ test_tools() {
     workspace-status mailcheck nightly-consolidation
     graphmem-sqlite mem-test capability-score
     moltbook-read reflexion-eval eval-examples
-    graphmem-consolidate rule-matcher
+    graphmem-consolidate rule-matcher drift-detect
   )
 
   for tool in "${core_tools[@]}"; do
@@ -281,6 +281,25 @@ test_pipeline() {
     fi
   else
     fail "eval-embeddings" "file missing"
+  fi
+
+  # Test 7: drift-detect has snapshots and can parse MEMORY.md
+  if command -v drift-detect &>/dev/null; then
+    local drift_stats
+    drift_stats=$(drift-detect stats 2>/dev/null || echo "")
+    if echo "$drift_stats" | grep -q "Snapshots:"; then
+      local snap_count
+      snap_count=$(echo "$drift_stats" | grep -oP 'Snapshots:\s*\K\d+' || echo "0")
+      if [[ "$snap_count" -gt 0 ]]; then
+        pass "drift-detect: $snap_count snapshots"
+      else
+        fail "drift-detect" "no snapshots (run drift-detect snapshot)"
+      fi
+    else
+      fail "drift-detect" "stats command failed"
+    fi
+  else
+    fail "drift-detect" "not found on PATH"
   fi
 }
 

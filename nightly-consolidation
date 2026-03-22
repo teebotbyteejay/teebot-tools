@@ -65,6 +65,7 @@ RULES:
 - MEMORY.md: Long-term memory. Only ADD items that matter weeks/months later: projects, decisions, key people, capability changes, important learnings. Do NOT add things already covered (even if worded differently). Do NOT add routine maintenance or debugging.
 - When updating MEMORY.md, preserve the existing structure and sections. Only modify what needs changing.
 - The 'Current' section of MEMORY.md should reflect what's actively happening THIS WEEK. Replace stale items.
+- PROVENANCE PRESERVATION (critical): Key Findings in MEMORY.md include [source, date] annotations in brackets. You MUST preserve these annotations exactly. Do NOT strip attribution, generalize timeframes ('within 30 days' → always), or expand scope. If you reword a finding, keep the original specificity — do not smooth it into a more general claim. This prevents compounding semantic drift across consolidation cycles.
 ${prune_instruction}
 
 OUTPUT FORMAT (strict — follow exactly):
@@ -86,6 +87,12 @@ ${memory}
 ${daily_input}
 
 Update both files now."
+
+# --- Pre-consolidation drift snapshot ---
+if command -v drift-detect &>/dev/null; then
+  echo -e "${C_DIM}Taking pre-consolidation snapshot...${C_RESET}"
+  drift-detect snapshot 2>/dev/null && echo -e "${C_GREEN}✓${C_RESET} Drift snapshot stored" || echo -e "${C_YELLOW}⚠ Drift snapshot failed (non-blocking)${C_RESET}"
+fi
 
 # --- Single LLM call ---
 echo -e "${C_DIM}Calling Claude Sonnet...${C_RESET}"
@@ -156,6 +163,23 @@ if [[ -n "$archive" && "$archive" != "none" && "$archive" != "None" ]]; then
 
   if [[ "$should_prune" == "true" ]]; then
     date -u +%Y-%m-%dT%H:%M:%SZ > "$PRUNE_MARKER"
+  fi
+fi
+
+# --- Post-consolidation drift detection ---
+if command -v drift-detect &>/dev/null && [[ -n "$new_memory" ]]; then
+  echo -e "${C_DIM}Checking for semantic drift...${C_RESET}"
+  drift_output=$(drift-detect compare 2>&1) || true
+  echo "$drift_output"
+
+  # Check for critical drift — restore backup if found
+  if echo "$drift_output" | grep -q "CRITICAL DRIFT"; then
+    echo -e "${C_RED}${C_BOLD}🚨 Critical drift detected! Restoring MEMORY.md from backup.${C_RESET}"
+    if [[ -f "${MEMORY}.bak" ]]; then
+      cp "${MEMORY}.bak" "$MEMORY"
+      echo -e "${C_YELLOW}MEMORY.md reverted to pre-consolidation state.${C_RESET}"
+      echo -e "${C_YELLOW}Review drift-detect history and fix manually.${C_RESET}"
+    fi
   fi
 fi
 

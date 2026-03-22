@@ -1,0 +1,755 @@
+#!/usr/bin/env python3
+"""drift-detect — Semantic drift detection for MEMORY.md consolidation cycles.
+
+Compares embeddings of MEMORY.md content before and after nightly consolidation
+to detect meaning drift that accumulates across LLM rewrite cycles.
+
+Usage:
+  drift-detect snapshot [--file PATH]                 Store pre-consolidation embeddings
+  drift-detect compare [--file PATH] [--threshold N]  Compare against last snapshot, report drift
+  drift-detect history [--limit N]                    Show drift event history
+  drift-detect stats                                  Overview of drift tracking data
+  drift-detect test                                   Run self-test with synthetic data
+"""
+
+import sys
+import os
+import json
+import struct
+import re
+import sqlite3
+import hashlib
+from datetime import datetime, timezone
+
+WORKSPACE = os.environ.get("WORKSPACE", os.path.expanduser("~/.openclaw/workspace"))
+MEMORY_FILE = os.path.join(WORKSPACE, "MEMORY.md")
+DB_PATH = os.path.join(WORKSPACE, "memory", "drift-detect.db")
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIM = 1536
+
+# Thresholds for cosine similarity (1.0 = identical)
+THRESHOLD_WARNING = 0.92
+THRESHOLD_CRITICAL = 0.85
+
+# Colors
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[2m"
+C_RED = "\033[31m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_CYAN = "\033[36m"
+
+
+# ── Embedding helpers ──────────────────────────────────────────────────
+
+def get_embedding(text: str) -> list[float]:
+    """Get embedding from OpenAI API."""
+    import urllib.request
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    payload = json.dumps({
+        "model": EMBEDDING_MODEL,
+        "input": text[:8000],
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/embeddings",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+
+    return data["data"][0]["embedding"]
+
+
+def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """Get embeddings for multiple texts in one API call."""
+    import urllib.request
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    # Truncate each text
+    truncated = [t[:8000] for t in texts]
+
+    payload = json.dumps({
+        "model": EMBEDDING_MODEL,
+        "input": truncated,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/embeddings",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+
+    # Sort by index to preserve order
+    sorted_data = sorted(data["data"], key=lambda x: x["index"])
+    return [item["embedding"] for item in sorted_data]
+
+
+def pack_embedding(emb: list[float]) -> bytes:
+    return struct.pack(f"{len(emb)}f", *emb)
+
+
+def unpack_embedding(blob: bytes) -> "numpy.ndarray":
+    import numpy as np
+    n = len(blob) // 4
+    return np.array(struct.unpack(f"{n}f", blob), dtype=np.float32)
+
+
+def cosine_similarity(a, b) -> float:
+    import numpy as np
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+# ── MEMORY.md Parser ───────────────────────────────────────────────────
+
+def parse_memory_units(content: str) -> list[dict]:
+    """Parse MEMORY.md into discrete semantic units.
+    
+    Returns list of dicts: {type, key, content}
+    - type: 'key_finding', 'section', 'current_item'
+    - key: unique identifier for matching across snapshots
+    - content: the actual text
+    """
+    units = []
+
+    # Extract Key Findings (most important for drift detection)
+    # Pattern: **Bold title** — description [source, date]
+    findings_match = re.search(
+        r"## Key Findings\n(.*?)(?=\n## |\Z)", content, re.DOTALL
+    )
+    if findings_match:
+        findings_text = findings_match.group(1)
+        # Each finding starts with "- **"
+        finding_blocks = re.split(r"\n- \*\*", findings_text)
+        for block in finding_blocks:
+            block = block.strip()
+            if not block:
+                continue
+            # Restore the "- **" prefix if we split it off
+            if not block.startswith("- **"):
+                block = "- **" + block
+
+            # Extract the key (bold title)
+            title_match = re.match(r"- \*\*(.+?)\*\*", block)
+            if title_match:
+                key = title_match.group(1).strip().lower()
+                # Normalize key: remove special chars, truncate
+                key = re.sub(r"[^a-z0-9 ]", "", key)[:80]
+                units.append({
+                    "type": "key_finding",
+                    "key": key,
+                    "content": block.strip(),
+                })
+
+    # Extract ## sections (excluding Key Findings, which we already parsed)
+    sections = re.split(r"\n(?=## )", content)
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+        header_match = re.match(r"## (.+)", section)
+        if not header_match:
+            continue
+        header = header_match.group(1).strip()
+        # Skip Key Findings (already parsed as individual findings)
+        if header.lower() == "key findings":
+            continue
+
+        key = header.lower().strip()
+        key = re.sub(r"[^a-z0-9 ]", "", key)[:80]
+
+        units.append({
+            "type": "section",
+            "key": key,
+            "content": section.strip(),
+        })
+
+    # Extract Current items (the week-of section has individual items)
+    current_match = re.search(
+        r"## Current \(.*?\)\n(.*?)(?=\n## |\Z)", content, re.DOTALL
+    )
+    if current_match:
+        current_text = current_match.group(1)
+        items = re.split(r"\n- \*\*", current_text)
+        for item in items:
+            item = item.strip()
+            if not item:
+                continue
+            if not item.startswith("- **"):
+                item = "- **" + item
+            title_match = re.match(r"- \*\*(.+?)\*\*", item)
+            if title_match:
+                key = "current_" + re.sub(
+                    r"[^a-z0-9 ]", "",
+                    title_match.group(1).strip().lower()
+                )[:60]
+                units.append({
+                    "type": "current_item",
+                    "key": key,
+                    "content": item.strip(),
+                })
+
+    return units
+
+
+# ── Database ───────────────────────────────────────────────────────────
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            unit_count INTEGER NOT NULL,
+            note TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS units (
+            id INTEGER PRIMARY KEY,
+            snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+            unit_type TEXT NOT NULL,
+            unit_key TEXT NOT NULL,
+            content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            embedding BLOB NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS drift_events (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            snapshot_old_id INTEGER NOT NULL,
+            snapshot_new_id INTEGER,
+            unit_key TEXT NOT NULL,
+            unit_type TEXT NOT NULL,
+            similarity REAL,
+            old_content TEXT,
+            new_content TEXT,
+            event_type TEXT NOT NULL,  -- 'drift_warning', 'drift_critical', 'removed', 'added', 'stable'
+            acknowledged INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_units_snapshot ON units(snapshot_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_units_key ON units(unit_key)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_drift_events_time ON drift_events(timestamp)
+    """)
+    conn.commit()
+    return conn
+
+
+# ── Commands ───────────────────────────────────────────────────────────
+
+def cmd_snapshot(args):
+    """Store a snapshot of MEMORY.md embeddings."""
+    file_path = MEMORY_FILE
+    for i, a in enumerate(args):
+        if a == "--file" and i + 1 < len(args):
+            file_path = args[i + 1]
+
+    if not os.path.exists(file_path):
+        print(f"{C_RED}File not found: {file_path}{C_RESET}")
+        return 1
+
+    content = open(file_path).read()
+    file_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    # Parse into units
+    units = parse_memory_units(content)
+    if not units:
+        print(f"{C_YELLOW}No parseable units found in {file_path}{C_RESET}")
+        return 1
+
+    print(f"{C_DIM}Parsed {len(units)} units from {os.path.basename(file_path)}{C_RESET}")
+
+    # Check if identical to last snapshot (skip if no changes)
+    conn = init_db()
+    last = conn.execute(
+        "SELECT file_hash FROM snapshots ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if last and last[0] == file_hash:
+        print(f"{C_DIM}File unchanged since last snapshot — skipping{C_RESET}")
+        conn.close()
+        return 0
+
+    # Get embeddings in batch
+    texts = [u["content"] for u in units]
+    print(f"{C_DIM}Embedding {len(texts)} units...{C_RESET}")
+    embeddings = get_embeddings_batch(texts)
+
+    # Store snapshot
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO snapshots (timestamp, file_hash, unit_count) VALUES (?, ?, ?)",
+        (now, file_hash, len(units)),
+    )
+    snapshot_id = cur.lastrowid
+
+    for unit, emb in zip(units, embeddings):
+        content_hash = hashlib.sha256(unit["content"].encode()).hexdigest()[:16]
+        conn.execute(
+            "INSERT INTO units (snapshot_id, unit_type, unit_key, content, content_hash, embedding) VALUES (?, ?, ?, ?, ?, ?)",
+            (snapshot_id, unit["type"], unit["key"], unit["content"], content_hash, pack_embedding(emb)),
+        )
+
+    conn.commit()
+
+    # Summary by type
+    type_counts = {}
+    for u in units:
+        type_counts[u["type"]] = type_counts.get(u["type"], 0) + 1
+
+    type_str = ", ".join(f"{v} {k}" for k, v in sorted(type_counts.items()))
+    print(f"{C_GREEN}✓{C_RESET} Snapshot #{snapshot_id} stored: {type_str}")
+    conn.close()
+    return 0
+
+
+def cmd_compare(args):
+    """Compare current MEMORY.md against latest snapshot."""
+    file_path = MEMORY_FILE
+    threshold_warn = THRESHOLD_WARNING
+    threshold_crit = THRESHOLD_CRITICAL
+
+    for i, a in enumerate(args):
+        if a == "--file" and i + 1 < len(args):
+            file_path = args[i + 1]
+        elif a == "--threshold" and i + 1 < len(args):
+            threshold_warn = float(args[i + 1])
+            threshold_crit = threshold_warn - 0.07  # Critical is always 7% below warning
+
+    if not os.path.exists(file_path):
+        print(f"{C_RED}File not found: {file_path}{C_RESET}")
+        return 1
+
+    conn = init_db()
+
+    # Get latest snapshot
+    snap = conn.execute(
+        "SELECT id, timestamp, unit_count FROM snapshots ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not snap:
+        print(f"{C_YELLOW}No snapshots found. Run 'drift-detect snapshot' first.{C_RESET}")
+        conn.close()
+        return 1
+
+    snap_id, snap_time, snap_count = snap
+    print(f"{C_DIM}Comparing against snapshot #{snap_id} ({snap_time[:19]}){C_RESET}")
+
+    # Get snapshot units
+    old_rows = conn.execute(
+        "SELECT unit_type, unit_key, content, embedding FROM units WHERE snapshot_id = ?",
+        (snap_id,),
+    ).fetchall()
+    old_units = {
+        row[1]: {"type": row[0], "key": row[1], "content": row[2], "embedding": row[3]}
+        for row in old_rows
+    }
+
+    # Parse current file
+    content = open(file_path).read()
+    new_units_list = parse_memory_units(content)
+    new_units = {u["key"]: u for u in new_units_list}
+
+    if not new_units_list:
+        print(f"{C_YELLOW}No parseable units in current file{C_RESET}")
+        conn.close()
+        return 1
+
+    # Embed new units
+    texts = [u["content"] for u in new_units_list]
+    print(f"{C_DIM}Embedding {len(texts)} current units...{C_RESET}")
+    new_embeddings = get_embeddings_batch(texts)
+    for unit, emb in zip(new_units_list, new_embeddings):
+        new_units[unit["key"]]["embedding"] = emb
+
+    # Store new snapshot (post-consolidation)
+    file_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO snapshots (timestamp, file_hash, unit_count, note) VALUES (?, ?, ?, ?)",
+        (now, file_hash, len(new_units_list), "post-compare"),
+    )
+    new_snap_id = cur.lastrowid
+    for unit, emb in zip(new_units_list, new_embeddings):
+        content_hash = hashlib.sha256(unit["content"].encode()).hexdigest()[:16]
+        conn.execute(
+            "INSERT INTO units (snapshot_id, unit_type, unit_key, content, content_hash, embedding) VALUES (?, ?, ?, ?, ?, ?)",
+            (new_snap_id, unit["type"], unit["key"], unit["content"], content_hash, pack_embedding(emb)),
+        )
+
+    # Compare
+    all_keys = set(old_units.keys()) | set(new_units.keys())
+    events = []
+
+    for key in sorted(all_keys):
+        old = old_units.get(key)
+        new = new_units.get(key)
+
+        if old and not new:
+            events.append({
+                "key": key,
+                "type": old["type"],
+                "event_type": "removed",
+                "similarity": None,
+                "old_content": old["content"],
+                "new_content": None,
+            })
+        elif new and not old:
+            events.append({
+                "key": key,
+                "type": new["type"],
+                "event_type": "added",
+                "similarity": None,
+                "old_content": None,
+                "new_content": new["content"],
+            })
+        else:
+            # Both exist — compare embeddings
+            old_emb = unpack_embedding(old["embedding"])
+            new_emb = new["embedding"]
+            if isinstance(new_emb, list):
+                import numpy as np
+                new_emb = np.array(new_emb, dtype=np.float32)
+
+            sim = cosine_similarity(old_emb, new_emb)
+
+            if sim < threshold_crit:
+                event_type = "drift_critical"
+            elif sim < threshold_warn:
+                event_type = "drift_warning"
+            else:
+                event_type = "stable"
+
+            events.append({
+                "key": key,
+                "type": old["type"],
+                "event_type": event_type,
+                "similarity": sim,
+                "old_content": old["content"],
+                "new_content": new["content"],
+            })
+
+    # Store drift events
+    for evt in events:
+        conn.execute(
+            """INSERT INTO drift_events 
+               (timestamp, snapshot_old_id, snapshot_new_id, unit_key, unit_type, 
+                similarity, old_content, new_content, event_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (now, snap_id, new_snap_id, evt["key"], evt["type"],
+             evt["similarity"], evt["old_content"], evt["new_content"], evt["event_type"]),
+        )
+    conn.commit()
+
+    # Report
+    print(f"\n{C_BOLD}Drift Report{C_RESET}")
+    print(f"{'─' * 60}")
+
+    stable = [e for e in events if e["event_type"] == "stable"]
+    warnings = [e for e in events if e["event_type"] == "drift_warning"]
+    criticals = [e for e in events if e["event_type"] == "drift_critical"]
+    removed = [e for e in events if e["event_type"] == "removed"]
+    added = [e for e in events if e["event_type"] == "added"]
+
+    if criticals:
+        print(f"\n{C_RED}{C_BOLD}🚨 CRITICAL DRIFT ({len(criticals)}):{C_RESET}")
+        for e in criticals:
+            print(f"  {C_RED}✗ [{e['type']}] {e['key']}: sim={e['similarity']:.4f}{C_RESET}")
+            _show_diff_preview(e["old_content"], e["new_content"])
+
+    if warnings:
+        print(f"\n{C_YELLOW}⚠ WARNING DRIFT ({len(warnings)}):{C_RESET}")
+        for e in warnings:
+            print(f"  {C_YELLOW}△ [{e['type']}] {e['key']}: sim={e['similarity']:.4f}{C_RESET}")
+            _show_diff_preview(e["old_content"], e["new_content"])
+
+    if removed:
+        print(f"\n{C_CYAN}🗑 REMOVED ({len(removed)}):{C_RESET}")
+        for e in removed:
+            preview = (e["old_content"] or "")[:80].replace("\n", " ")
+            print(f"  {C_DIM}  [{e['type']}] {e['key']}: {preview}...{C_RESET}")
+
+    if added:
+        print(f"\n{C_CYAN}+ ADDED ({len(added)}):{C_RESET}")
+        for e in added:
+            preview = (e["new_content"] or "")[:80].replace("\n", " ")
+            print(f"  {C_DIM}  [{e['type']}] {e['key']}: {preview}...{C_RESET}")
+
+    if stable:
+        # Show lowest-similarity stable items (potential future drift)
+        stable_sorted = sorted(stable, key=lambda e: e["similarity"])
+        watchlist = [s for s in stable_sorted if s["similarity"] < 0.96]
+        if watchlist:
+            print(f"\n{C_DIM}👁 WATCHLIST (stable but below 0.96):{C_RESET}")
+            for e in watchlist[:5]:
+                print(f"  {C_DIM}  [{e['type']}] {e['key']}: sim={e['similarity']:.4f}{C_RESET}")
+
+    # Summary
+    print(f"\n{'─' * 60}")
+    print(f"  {C_GREEN}Stable: {len(stable)}{C_RESET}  "
+          f"{C_YELLOW}Warning: {len(warnings)}{C_RESET}  "
+          f"{C_RED}Critical: {len(criticals)}{C_RESET}  "
+          f"{C_CYAN}Added: {len(added)} Removed: {len(removed)}{C_RESET}")
+
+    if stable:
+        sims = [e["similarity"] for e in stable]
+        avg_sim = sum(sims) / len(sims)
+        min_sim = min(sims)
+        print(f"  Avg similarity: {avg_sim:.4f}  Min: {min_sim:.4f}")
+
+    has_issues = len(criticals) + len(warnings)
+    if has_issues:
+        print(f"\n{C_YELLOW}⚠ {has_issues} drift issue(s) detected{C_RESET}")
+
+    conn.close()
+    return 1 if criticals else 0
+
+
+def _show_diff_preview(old_content: str, new_content: str, max_lines: int = 3):
+    """Show a short preview of what changed."""
+    if not old_content or not new_content:
+        return
+
+    old_lines = old_content.strip().split("\n")
+    new_lines = new_content.strip().split("\n")
+
+    # Find first differing line
+    shown = 0
+    for i, (o, n) in enumerate(zip(old_lines, new_lines)):
+        if o != n and shown < max_lines:
+            print(f"    {C_RED}- {o[:100]}{C_RESET}")
+            print(f"    {C_GREEN}+ {n[:100]}{C_RESET}")
+            shown += 1
+
+    if len(old_lines) != len(new_lines):
+        print(f"    {C_DIM}(line count: {len(old_lines)} → {len(new_lines)}){C_RESET}")
+
+
+def cmd_history(args):
+    """Show drift event history."""
+    limit = 20
+    for i, a in enumerate(args):
+        if a == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1])
+
+    conn = init_db()
+    rows = conn.execute("""
+        SELECT timestamp, unit_key, unit_type, similarity, event_type
+        FROM drift_events
+        WHERE event_type != 'stable'
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+
+    if not rows:
+        print(f"{C_DIM}No drift events recorded yet.{C_RESET}")
+        conn.close()
+        return 0
+
+    print(f"{C_BOLD}Drift Event History (last {limit}):{C_RESET}")
+    print(f"{'─' * 70}")
+
+    for ts, key, utype, sim, etype in rows:
+        ts_short = ts[:16].replace("T", " ")
+        sim_str = f"{sim:.4f}" if sim is not None else "  n/a "
+
+        if etype == "drift_critical":
+            color = C_RED
+            icon = "🚨"
+        elif etype == "drift_warning":
+            color = C_YELLOW
+            icon = "⚠ "
+        elif etype == "removed":
+            color = C_CYAN
+            icon = "🗑"
+        elif etype == "added":
+            color = C_CYAN
+            icon = "+ "
+        else:
+            color = C_DIM
+            icon = "  "
+
+        print(f"  {C_DIM}{ts_short}{C_RESET}  {color}{icon} [{utype}] {key} sim={sim_str}{C_RESET}")
+
+    # Show aggregate stats
+    total = conn.execute("SELECT COUNT(*) FROM drift_events").fetchone()[0]
+    critical_count = conn.execute(
+        "SELECT COUNT(*) FROM drift_events WHERE event_type = 'drift_critical'"
+    ).fetchone()[0]
+    warning_count = conn.execute(
+        "SELECT COUNT(*) FROM drift_events WHERE event_type = 'drift_warning'"
+    ).fetchone()[0]
+
+    print(f"\n{C_DIM}Total events: {total} | Critical: {critical_count} | Warning: {warning_count}{C_RESET}")
+    conn.close()
+    return 0
+
+
+def cmd_stats(args):
+    """Show overview of drift tracking data."""
+    conn = init_db()
+
+    snap_count = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+    unit_count = conn.execute("SELECT COUNT(*) FROM units").fetchone()[0]
+    event_count = conn.execute("SELECT COUNT(*) FROM drift_events").fetchone()[0]
+
+    print(f"{C_BOLD}Drift Detection Stats{C_RESET}")
+    print(f"{'─' * 40}")
+    print(f"  Snapshots:     {snap_count}")
+    print(f"  Units stored:  {unit_count}")
+    print(f"  Drift events:  {event_count}")
+
+    if snap_count > 0:
+        first = conn.execute("SELECT timestamp FROM snapshots ORDER BY id ASC LIMIT 1").fetchone()
+        last = conn.execute("SELECT timestamp FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        print(f"  First snapshot: {first[0][:19]}")
+        print(f"  Last snapshot:  {last[0][:19]}")
+
+    if event_count > 0:
+        # Average similarity of comparison events
+        avg = conn.execute(
+            "SELECT AVG(similarity) FROM drift_events WHERE similarity IS NOT NULL"
+        ).fetchone()[0]
+        if avg:
+            print(f"  Avg similarity: {avg:.4f}")
+
+        # Critical events
+        criticals = conn.execute(
+            "SELECT COUNT(*) FROM drift_events WHERE event_type = 'drift_critical'"
+        ).fetchone()[0]
+        warnings = conn.execute(
+            "SELECT COUNT(*) FROM drift_events WHERE event_type = 'drift_warning'"
+        ).fetchone()[0]
+        print(f"  Critical drifts: {criticals}")
+        print(f"  Warning drifts:  {warnings}")
+
+    conn.close()
+    return 0
+
+
+def cmd_test(args):
+    """Self-test: parse MEMORY.md, verify unit extraction, test embedding."""
+    print(f"{C_BOLD}drift-detect self-test{C_RESET}")
+    print(f"{'─' * 40}")
+
+    # Test 1: Parser
+    if not os.path.exists(MEMORY_FILE):
+        print(f"{C_RED}✗ MEMORY.md not found at {MEMORY_FILE}{C_RESET}")
+        return 1
+
+    content = open(MEMORY_FILE).read()
+    units = parse_memory_units(content)
+    print(f"  Parser: {len(units)} units extracted")
+
+    type_counts = {}
+    for u in units:
+        type_counts[u["type"]] = type_counts.get(u["type"], 0) + 1
+
+    for t, c in sorted(type_counts.items()):
+        print(f"    {t}: {c}")
+
+    if len(units) < 5:
+        print(f"{C_RED}✗ Too few units (expected ≥5){C_RESET}")
+        return 1
+    print(f"  {C_GREEN}✓ Parser OK{C_RESET}")
+
+    # Test 2: Key finding extraction
+    findings = [u for u in units if u["type"] == "key_finding"]
+    if findings:
+        print(f"\n  Key Findings ({len(findings)}):")
+        for f in findings[:3]:
+            print(f"    • {f['key'][:60]}")
+        # Check provenance preservation
+        with_prov = sum(1 for f in findings if "[" in f["content"] and "]" in f["content"])
+        print(f"    Provenance annotations: {with_prov}/{len(findings)}")
+    else:
+        print(f"  {C_YELLOW}⚠ No key findings found{C_RESET}")
+
+    # Test 3: Embedding (single unit)
+    print(f"\n  Embedding test...")
+    try:
+        emb = get_embedding(units[0]["content"])
+        assert len(emb) == EMBEDDING_DIM, f"Expected {EMBEDDING_DIM} dims, got {len(emb)}"
+        packed = pack_embedding(emb)
+        unpacked = unpack_embedding(packed)
+        assert len(unpacked) == EMBEDDING_DIM
+        print(f"  {C_GREEN}✓ Embedding OK ({EMBEDDING_DIM} dims){C_RESET}")
+    except Exception as e:
+        print(f"  {C_RED}✗ Embedding failed: {e}{C_RESET}")
+        return 1
+
+    # Test 4: Cosine similarity sanity
+    import numpy as np
+    emb_a = np.array(emb, dtype=np.float32)
+    sim_self = cosine_similarity(emb_a, emb_a)
+    assert abs(sim_self - 1.0) < 0.001, f"Self-similarity should be ~1.0, got {sim_self}"
+    print(f"  {C_GREEN}✓ Cosine similarity OK (self={sim_self:.4f}){C_RESET}")
+
+    # Test 5: DB operations
+    conn = init_db()
+    conn.execute("SELECT COUNT(*) FROM snapshots")
+    print(f"  {C_GREEN}✓ Database OK{C_RESET}")
+    conn.close()
+
+    print(f"\n{C_GREEN}All tests passed{C_RESET}")
+    return 0
+
+
+# ── Main ───────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    commands = {
+        "snapshot": cmd_snapshot,
+        "compare": cmd_compare,
+        "history": cmd_history,
+        "stats": cmd_stats,
+        "test": cmd_test,
+    }
+
+    if cmd not in commands:
+        print(f"Unknown command: {cmd}")
+        print(f"Available: {', '.join(commands.keys())}")
+        return 1
+
+    return commands[cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
