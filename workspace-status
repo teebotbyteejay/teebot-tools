@@ -23,7 +23,71 @@ warn() { echo -e "  ${C_YELLOW}⚡${C_RESET} $1"; }
 fail() { echo -e "  ${C_RED}✗${C_RESET} $1"; }
 info() { echo -e "  ${C_DIM}$1${C_RESET}"; }
 
+ACCEPT_CONSTITUTION=false
+for arg in "$@"; do
+  case "$arg" in
+    --accept-constitution|--accept) ACCEPT_CONSTITUTION=true ;;
+  esac
+done
+
 echo -e "${C_BOLD}🐣 workspace-status${C_RESET} — ${C_DIM}$NOW${C_RESET}"
+
+# === Constitution Integrity ===
+section "Constitution Integrity"
+CONSTITUTION_FILES=(SOUL.md HEARTBEAT.md AGENTS.md)
+HASH_FILE="$WORKSPACE/.constitution-hashes"
+CONSTITUTION_ALERT=false
+
+if [[ "$ACCEPT_CONSTITUTION" == "true" ]]; then
+  # Update known-good hashes
+  {
+    echo "# Constitution file hashes — known-good reference"
+    echo "# Updated manually or via: workspace-status --accept-constitution"
+    echo "# If any hash mismatches, the file was modified unexpectedly."
+    echo "# Last accepted: $NOW"
+    echo ""
+    for f in "${CONSTITUTION_FILES[@]}"; do
+      sha256sum "$WORKSPACE/$f" | sed "s|$WORKSPACE/||"
+    done
+  } > "$HASH_FILE"
+  ok "Constitution hashes updated"
+elif [[ -f "$HASH_FILE" ]]; then
+  for f in "${CONSTITUTION_FILES[@]}"; do
+    path="$WORKSPACE/$f"
+    if [[ ! -f "$path" ]]; then
+      fail "$f MISSING — constitution file deleted!"
+      CONSTITUTION_ALERT=true
+      continue
+    fi
+    current_hash=$(sha256sum "$path" | cut -d' ' -f1)
+    known_hash=$(grep "  $f\$" "$HASH_FILE" | cut -d' ' -f1)
+    if [[ -z "$known_hash" ]]; then
+      warn "$f — no known-good hash (run --accept-constitution)"
+    elif [[ "$current_hash" == "$known_hash" ]]; then
+      ok "$f — integrity verified"
+    else
+      fail "$f MODIFIED since last acceptance!"
+      CONSTITUTION_ALERT=true
+      # Show what changed using git diff
+      cd "$WORKSPACE"
+      _gdiff=$(git diff HEAD -- "$f" 2>/dev/null || true)
+      if [[ -n "$_gdiff" ]]; then
+        echo -e "    ${C_DIM}Uncommitted changes:${C_RESET}"
+        echo "$_gdiff" | head -10 | sed 's/^/    /'
+      else
+        # Changes are committed — show last commit that touched this file
+        _last_commit=$(git log -1 --format="%h %ar: %s" -- "$f" 2>/dev/null || echo "unknown")
+        echo -e "    ${C_DIM}Last commit: $_last_commit${C_RESET}"
+      fi
+    fi
+  done
+  if [[ "$CONSTITUTION_ALERT" == "true" ]]; then
+    echo -e "\n  ${C_RED}${C_BOLD}⚠ CONSTITUTION INTEGRITY VIOLATION${C_RESET}"
+    echo -e "  ${C_DIM}If this change was intentional: workspace-status --accept-constitution${C_RESET}"
+  fi
+else
+  warn "No constitution hash file — run: workspace-status --accept-constitution"
+fi
 
 # === Identity Files ===
 section "Identity"

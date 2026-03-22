@@ -621,7 +621,33 @@ test_infra() {
     fail "Disk" "critically low: ${avail_gb}GB"
   fi
 
-  # Test 7: Boot context size
+  # Test 7: Constitution integrity (SOUL.md, HEARTBEAT.md, AGENTS.md tamper detection)
+  local HASH_FILE="$WORKSPACE/.constitution-hashes"
+  if [[ -f "$HASH_FILE" ]]; then
+    local constitution_ok=true
+    for cf in SOUL.md HEARTBEAT.md AGENTS.md; do
+      local cf_path="$WORKSPACE/$cf"
+      if [[ ! -f "$cf_path" ]]; then
+        fail "constitution:$cf" "file missing!"
+        constitution_ok=false
+        continue
+      fi
+      local c_hash k_hash
+      c_hash=$(sha256sum "$cf_path" | cut -d' ' -f1)
+      k_hash=$(grep "  ${cf}\$" "$HASH_FILE" | cut -d' ' -f1)
+      if [[ -n "$k_hash" && "$c_hash" != "$k_hash" ]]; then
+        fail "constitution:$cf" "hash mismatch — modified since last acceptance"
+        constitution_ok=false
+      fi
+    done
+    if [[ "$constitution_ok" == "true" ]]; then
+      pass "Constitution integrity: all 3 files verified"
+    fi
+  else
+    fail "constitution" "no hash file — run: workspace-status --accept-constitution"
+  fi
+
+  # Test 8: Boot context size
   local total_boot=0
   for f in SOUL.md MEMORY.md HEARTBEAT.md CURRENT_STATE.md TOPICS.md AGENTS.md; do
     if [[ -f "$WORKSPACE/$f" ]]; then
