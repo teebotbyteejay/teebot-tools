@@ -29,8 +29,13 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIM = 1536
 
 # Thresholds for cosine similarity (1.0 = identical)
-THRESHOLD_WARNING = 0.92
-THRESHOLD_CRITICAL = 0.85
+# Key findings should be VERY stable; current items change legitimately.
+THRESHOLDS = {
+    "key_finding": {"warning": 0.94, "critical": 0.88},
+    "section":     {"warning": 0.90, "critical": 0.82},
+    "current_item": {"warning": 0.80, "critical": 0.70},  # Expected to change
+}
+DEFAULT_THRESHOLDS = {"warning": 0.92, "critical": 0.85}
 
 # Colors
 C_RESET = "\033[0m"
@@ -337,15 +342,13 @@ def cmd_snapshot(args):
 def cmd_compare(args):
     """Compare current MEMORY.md against latest snapshot."""
     file_path = MEMORY_FILE
-    threshold_warn = THRESHOLD_WARNING
-    threshold_crit = THRESHOLD_CRITICAL
+    custom_threshold = None
 
     for i, a in enumerate(args):
         if a == "--file" and i + 1 < len(args):
             file_path = args[i + 1]
         elif a == "--threshold" and i + 1 < len(args):
-            threshold_warn = float(args[i + 1])
-            threshold_crit = threshold_warn - 0.07  # Critical is always 7% below warning
+            custom_threshold = float(args[i + 1])
 
     if not os.path.exists(file_path):
         print(f"{C_RED}File not found: {file_path}{C_RESET}")
@@ -443,9 +446,18 @@ def cmd_compare(args):
 
             sim = cosine_similarity(old_emb, new_emb)
 
-            if sim < threshold_crit:
+            # Use type-specific thresholds (key findings = strict, current items = relaxed)
+            if custom_threshold is not None:
+                t_warn = custom_threshold
+                t_crit = custom_threshold - 0.07
+            else:
+                t = THRESHOLDS.get(old["type"], DEFAULT_THRESHOLDS)
+                t_warn = t["warning"]
+                t_crit = t["critical"]
+
+            if sim < t_crit:
                 event_type = "drift_critical"
-            elif sim < threshold_warn:
+            elif sim < t_warn:
                 event_type = "drift_warning"
             else:
                 event_type = "stable"
